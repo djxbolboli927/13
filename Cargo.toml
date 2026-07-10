@@ -76,5 +76,9 @@ dashmap = "6"
 yellowstone-grpc-client = "6.1"
 yellowstone-grpc-proto = "6.1"
 
+# ShredStream: entries served by jito-shredstream-proxy are a bincode-serialized
+# Vec<solana_entry::entry::Entry>; we deserialize and iterate their transactions.
+solana-entry = "2.2"
+
 [build-dependencies]
 tonic-build = "0.12"

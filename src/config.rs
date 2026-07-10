@@ -16,6 +16,129 @@ pub struct Config {
     pub jito_grpc: JitoGrpcConfig,
     #[serde(default)]
     pub template_cache: TemplateCacheConfig,
+    /// Legacy circular-scan strategy toggle.
+    #[serde(default)]
+    pub scanner: ScannerConfig,
+    /// ShredStream / Pump.fun ↔ Meteora arbitrage strategy.
+    #[serde(default)]
+    pub shred_arb: ShredArbConfig,
+}
+
+/// Toggle for the legacy Metis circular-scan strategy.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ScannerConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for ScannerConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// ShredStream-triggered arbitrage between Pump.fun AMM and Meteora DAMM v2.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ShredArbConfig {
+    /// Master on/off switch for the strategy.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Local jito-shredstream-proxy gRPC surface (SubscribeEntries).
+    #[serde(default = "default_shredstream_endpoint")]
+    pub shredstream_endpoint: String,
+    /// Yellowstone gRPC endpoint for live pool state (narrow account filter).
+    #[serde(default)]
+    pub pool_state_endpoint: String,
+    /// x-token for the pool-state gRPC endpoint.
+    #[serde(default)]
+    pub pool_state_x_token: String,
+    /// Shared Metis pool cache file — the bot reads the SAME pools as Metis.
+    #[serde(default = "default_mix_path")]
+    pub mix_cache_path: String,
+    /// Whitelisted ShredStream keypair (used by the proxy sidecar; recorded
+    /// here for reference/ops).
+    #[serde(default = "default_shred_keypair")]
+    #[allow(dead_code)]
+    pub shred_keypair: String,
+    /// Fixed Jito tip in test phase.
+    #[serde(default = "default_tip")]
+    pub tip_lamports: u64,
+    /// Network base fee.
+    #[serde(default = "default_net_fee")]
+    pub network_fee_lamports: u64,
+    /// Effective Meteora fee in bps (dynamic fee not yet modelled — verify).
+    #[serde(default = "default_meteora_fee_bps")]
+    pub meteora_fee_bps: u64,
+    /// Ignore observed Pump trades whose SOL-side arg is below this (SOL).
+    #[serde(default = "default_min_trigger_sol")]
+    pub min_trigger_sol: f64,
+    /// Lower bound of the input-size search (SOL).
+    #[serde(default = "default_min_amount_sol")]
+    pub min_amount_sol: f64,
+    /// Upper bound of the input-size search (SOL).
+    #[serde(default = "default_max_amount_sol")]
+    pub max_amount_sol: f64,
+    /// Per-pool cooldown between fires (ms).
+    #[serde(default = "default_cooldown_ms")]
+    pub cooldown_ms: u64,
+    /// Bounded signal channel capacity.
+    #[serde(default = "default_signal_buffer")]
+    pub signal_buffer: usize,
+}
+
+impl Default for ShredArbConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            shredstream_endpoint: default_shredstream_endpoint(),
+            pool_state_endpoint: String::new(),
+            pool_state_x_token: String::new(),
+            mix_cache_path: default_mix_path(),
+            shred_keypair: default_shred_keypair(),
+            tip_lamports: default_tip(),
+            network_fee_lamports: default_net_fee(),
+            meteora_fee_bps: default_meteora_fee_bps(),
+            min_trigger_sol: default_min_trigger_sol(),
+            min_amount_sol: default_min_amount_sol(),
+            max_amount_sol: default_max_amount_sol(),
+            cooldown_ms: default_cooldown_ms(),
+            signal_buffer: default_signal_buffer(),
+        }
+    }
+}
+
+fn default_shredstream_endpoint() -> String {
+    "http://127.0.0.1:9999".to_string()
+}
+fn default_mix_path() -> String {
+    "/root/g/metis/mix.json".to_string()
+}
+fn default_shred_keypair() -> String {
+    "/root/g/wallet/shred.json".to_string()
+}
+fn default_tip() -> u64 {
+    1600
+}
+fn default_net_fee() -> u64 {
+    5000
+}
+fn default_meteora_fee_bps() -> u64 {
+    25
+}
+fn default_min_trigger_sol() -> f64 {
+    1.0
+}
+fn default_min_amount_sol() -> f64 {
+    0.001
+}
+fn default_max_amount_sol() -> f64 {
+    0.05
+}
+fn default_cooldown_ms() -> u64 {
+    200
+}
+fn default_signal_buffer() -> usize {
+    1024
 }
 
 #[derive(Debug, Deserialize, Clone)]

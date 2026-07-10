@@ -5,15 +5,28 @@ mod arbitrage;
 mod blockhash_cache;
 mod config;
 mod dex_accounts;
+#[allow(dead_code)]
+mod dex_ids;
 mod jito;
 #[allow(dead_code)]
 mod jito_grpc;
 #[allow(dead_code)]
 mod litesvm_sim;
+mod mathutil;
 mod metis;
+#[allow(dead_code)]
+mod meteora_math;
 mod metrics;
+#[allow(dead_code)]
+mod pool_registry;
+#[allow(dead_code)]
+mod pool_state;
 mod program_registry;
+#[allow(dead_code)]
+mod pumpfun_math;
 mod rate_limiter;
+mod shred_arb;
+mod shred_stream;
 mod template_cache;
 mod token_metrics;
 mod tokens;
@@ -194,8 +207,8 @@ async fn async_main(config: config::Config) -> Result<()> {
         trading_keypair: trading_keypair.clone(),
         rpc_client: rpc_client.clone(),
         alt_cache: alt_cache.clone(),
-        jito: jito_client,
-        jito_grpc: jito_grpc_client,
+        jito: jito_client.clone(),
+        jito_grpc: jito_grpc_client.clone(),
         jito_limiter: jito_limiter.clone(),
         jito_grpc_limiter: jito_grpc_limiter.clone(),
         cu_limits: config.performance.cu_limits.clone(),
@@ -230,18 +243,149 @@ async fn async_main(config: config::Config) -> Result<()> {
         config.performance.max_concurrent_quotes.max(1),
     );
 
-    loop {
-        if let Err(e) = arbitrage::scan_all_tokens(
-            &token_mints,
+    // ── ShredStream / Pump.fun ↔ Meteora arbitrage strategy ──────────────────
+    if config.shred_arb.enabled {
+        if let Err(e) = spawn_shred_arb(
             &config,
-            &calc_ctx,
-            &pipeline,
-            &metrics,
-            &token_metrics,
-        )
-        .await
-        {
-            error!(error = %e, "scan cycle error");
+            metis.clone(),
+            blockhash_cache.clone(),
+            trading_keypair.clone(),
+            rpc_client.clone(),
+            alt_cache.clone(),
+            jito_client.clone(),
+            jito_grpc_client.clone(),
+            jito_limiter.clone(),
+            jito_grpc_limiter.clone(),
+        ) {
+            error!(error = %e, "failed to start shred-arb strategy");
         }
     }
+
+    // ── Legacy circular scanner (gated) ──────────────────────────────────────
+    if config.scanner.enabled {
+        loop {
+            if let Err(e) = arbitrage::scan_all_tokens(
+                &token_mints,
+                &config,
+                &calc_ctx,
+                &pipeline,
+                &metrics,
+                &token_metrics,
+            )
+            .await
+            {
+                error!(error = %e, "scan cycle error");
+            }
+        }
+    } else {
+        eprintln!("legacy circular scanner disabled (config.scanner.enabled=false)");
+        // Keep the process alive so background strategies keep running.
+        futures::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+/// Wire up and launch the ShredStream arbitrage strategy.
+#[allow(clippy::too_many_arguments)]
+fn spawn_shred_arb(
+    config: &config::Config,
+    metis: Arc<metis::MetisClient>,
+    blockhash_cache: Arc<BlockhashCache>,
+    trading_keypair: Arc<solana_sdk::signature::Keypair>,
+    rpc_client: Arc<RpcClient>,
+    alt_cache: AltCache,
+    jito_client: Arc<jito::JitoClient>,
+    jito_grpc_client: Option<Arc<jito_grpc::JitoGrpcClient>>,
+    jito_limiter: Arc<Mutex<RateLimiter>>,
+    jito_grpc_limiter: Option<Arc<Mutex<RateLimiter>>>,
+) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+
+    let sa = &config.shred_arb;
+    let pairs = pool_registry::load_pairs(&sa.mix_cache_path)?;
+    if pairs.is_empty() {
+        eprintln!("[shred-arb] no pairs in mix.json — strategy idle");
+    }
+
+    // Accounts to watch live: each Meteora pool + each Pump vault pair.
+    let mut accounts: Vec<solana_sdk::pubkey::Pubkey> = Vec::new();
+    for p in &pairs {
+        accounts.push(p.meteora.pool);
+        accounts.push(p.pump.token_vault());
+        accounts.push(p.pump.wsol_vault());
+    }
+    accounts.sort_unstable();
+    accounts.dedup();
+
+    let pool_state = pool_state::PoolStateCache::new();
+    pool_state.spawn_subscription(
+        sa.pool_state_endpoint.clone(),
+        sa.pool_state_x_token.clone(),
+        accounts,
+    );
+
+    // Preload (unfiltered) ALT contents for each Pump pool so the ShredStream
+    // consumer can resolve ALT-provided accounts without a hot-path RPC call.
+    let mut alt_map: HashMap<solana_sdk::pubkey::Pubkey, Vec<solana_sdk::pubkey::Pubkey>> =
+        HashMap::new();
+    let mut target_pools: HashSet<solana_sdk::pubkey::Pubkey> = HashSet::new();
+    for p in &pairs {
+        target_pools.insert(p.pump.pool);
+        if let Some(alt) = p.pump.alt {
+            if alt_map.contains_key(&alt) {
+                continue;
+            }
+            match rpc_client.get_account(&alt) {
+                Ok(acct) => match transaction::deserialize_alt_addresses(&acct.data) {
+                    Ok(addrs) => {
+                        alt_map.insert(alt, addrs);
+                    }
+                    Err(e) => eprintln!("[shred-arb] bad ALT {alt}: {e}"),
+                },
+                Err(e) => eprintln!("[shred-arb] failed to fetch ALT {alt}: {e}"),
+            }
+        }
+    }
+
+    let lamports = |sol: f64| (sol * 1_000_000_000.0) as u64;
+    let cu_limit = config.performance.cu_limits.first().copied().unwrap_or(200_000);
+    let params = shred_arb::ArbParams {
+        tip_lamports: sa.tip_lamports,
+        network_fee_lamports: sa.network_fee_lamports,
+        meteora_fee_bps: sa.meteora_fee_bps,
+        min_trigger_lamports: lamports(sa.min_trigger_sol),
+        min_amount_lamports: lamports(sa.min_amount_sol).max(1),
+        max_amount_lamports: lamports(sa.max_amount_sol).max(1),
+        cu_limit,
+        cooldown_ms: sa.cooldown_ms,
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel(sa.signal_buffer);
+    let consumer = Arc::new(shred_stream::ShredConsumer::new(
+        sa.shredstream_endpoint.clone(),
+        target_pools,
+        alt_map,
+    ));
+    consumer.spawn(tx);
+
+    let engine = Arc::new(shred_arb::ShredArbEngine::new(
+        metis,
+        blockhash_cache,
+        trading_keypair.clone(),
+        rpc_client,
+        alt_cache,
+        jito_client,
+        jito_grpc_client,
+        jito_limiter,
+        jito_grpc_limiter,
+        trading_keypair.pubkey().to_string(),
+        pool_state,
+        pairs,
+        params,
+    ));
+    engine.clone().spawn_reporter();
+    tokio::spawn(engine.run(rx));
+
+    eprintln!("[shred-arb] strategy started");
+    Ok(())
 }

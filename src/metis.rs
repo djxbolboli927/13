@@ -167,6 +167,53 @@ impl MetisClient {
         Ok(quote)
     }
 
+    /// Get a quote FORCED onto a single venue via the Metis `dexes=` filter.
+    ///
+    /// Used by the ShredStream arb strategy: each leg is locked to a specific
+    /// exchange (buy on one, sell on the other) so Metis builds exactly the
+    /// route we priced ourselves, instead of picking its own path. `dex_label`
+    /// is the exact, case-sensitive Metis label (e.g. `"Pump.fun Amm"`,
+    /// `"Meteora DAMM v2"`); spaces are encoded as `+`.
+    pub async fn get_quote_forced(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount_lamports: u64,
+        dex_label: &str,
+    ) -> Result<QuoteResponse> {
+        let dexes = dex_label.replace(' ', "+");
+        let url = format!(
+            "{}/quote?inputMint={}&outputMint={}&amount={}\
+             &slippageBps=0\
+             &maxAccounts=50\
+             &swapMode=ExactIn\
+             &forJitoBundle=true\
+             &onlyDirectRoutes=true\
+             &instructionVersion=V2\
+             &dexes={}",
+            self.base_url, input_mint, output_mint, amount_lamports, dexes
+        );
+
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("forced quote request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("forced quote failed: {} -- {}", status, body);
+        }
+
+        let quote: QuoteResponse = resp
+            .json()
+            .await
+            .context("failed to parse forced quote response")?;
+        Ok(quote)
+    }
+
     /// Merge two quotes into a single circular quote via Route Concatenation.
     ///
     /// Takes quote1 (WSOL->Token) and quote2 (Token->WSOL),

@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package shredstream;
+
+// Local gRPC surface exposed by jito-shredstream-proxy (--grpc-service-port).
+// The proxy authenticates to the Jito Block Engine with the whitelisted
+// keypair, deshreds the UDP shred stream, and serves reconstructed entries
+// here. The subscribe request carries NO filters — the whole cluster's entries
+// stream through and the client filters by program id itself.
+
+message SubscribeEntriesRequest {}
+
+message Entry {
+  uint64 slot = 1;
+  // bincode-serialized Vec<solana_entry::entry::Entry>
+  bytes entries = 2;
+}
+
+service ShredstreamProxy {
+  rpc SubscribeEntries(SubscribeEntriesRequest) returns (stream Entry) {}
+}
