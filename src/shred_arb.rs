@@ -165,9 +165,11 @@ impl ShredArbEngine {
         };
 
         // 2) Meteora state.
+        // config fallback fee is in bps; convert to the 1e9-denominated numerator.
+        let fallback_fee_numerator = self.params.meteora_fee_bps.saturating_mul(100_000);
         let meteora = match self
             .pool_state
-            .meteora_pool(&pair.meteora.pool, self.params.meteora_fee_bps)
+            .meteora_pool(&pair.meteora.pool, fallback_fee_numerator)
         {
             Some(m) => m,
             None => {
@@ -380,6 +382,7 @@ impl ShredArbEngine {
     pub fn spawn_reporter(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            let fallback_fee = self.params.meteora_fee_bps.saturating_mul(100_000);
             loop {
                 ticker.tick().await;
                 info!(
@@ -389,6 +392,35 @@ impl ShredArbEngine {
                     pool_slot = self.pool_state.slot(),
                     "shred-arb stats"
                 );
+                // Decoded-state snapshot for calibration: compare these prices
+                // against a live Metis quote for the same pool/size.
+                for pair in self.pairs.values().take(3) {
+                    let met = self
+                        .pool_state
+                        .meteora_pool(&pair.meteora.pool, fallback_fee);
+                    let pump = self
+                        .pool_state
+                        .pump_pool(&pair.pump.token_vault(), &pair.pump.wsol_vault());
+                    if let (Some(m), Some(p)) = (met, pump) {
+                        let met_price = m.token_price_in_sol(pair.meteora.token_is_a, 0, 0);
+                        let pump_price = if p.base_reserve == 0 {
+                            0.0
+                        } else {
+                            p.quote_reserve as f64 / p.base_reserve as f64
+                        };
+                        info!(
+                            token = %pair.token_mint,
+                            meteora_sqrt_price = m.sqrt_price,
+                            meteora_liquidity = m.liquidity,
+                            meteora_fee_num = m.fee_numerator,
+                            meteora_price = met_price,
+                            pump_base = p.base_reserve,
+                            pump_quote = p.quote_reserve,
+                            pump_price = pump_price,
+                            "pool snapshot"
+                        );
+                    }
+                }
             }
         });
     }

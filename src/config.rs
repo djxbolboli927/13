@@ -46,6 +46,30 @@ pub struct ShredArbConfig {
     /// Local jito-shredstream-proxy gRPC surface (SubscribeEntries).
     #[serde(default = "default_shredstream_endpoint")]
     pub shredstream_endpoint: String,
+    /// Auto-launch and supervise `jito-shredstream-proxy` as a child process so
+    /// everything comes up with the bot (operator only supplies the keypair).
+    /// Set false to run the proxy externally.
+    #[serde(default = "default_true")]
+    pub proxy_autostart: bool,
+    /// Proxy binary (name on PATH or absolute path).
+    #[serde(default = "default_proxy_bin")]
+    pub proxy_bin: String,
+    /// Jito Block Engine URL the proxy authenticates against.
+    #[serde(default = "default_block_engine_url")]
+    pub block_engine_url: String,
+    /// Comma-separated ShredStream regions (max 2).
+    #[serde(default = "default_desired_regions")]
+    pub desired_regions: String,
+    /// UDP fan-out target for raw shreds (required by the proxy; a local
+    /// throwaway is fine when only the gRPC entries path is consumed).
+    #[serde(default = "default_dest_ip_ports")]
+    pub proxy_dest_ip_ports: String,
+    /// Local UDP port the proxy binds to receive shreds.
+    #[serde(default = "default_src_bind_port")]
+    pub proxy_src_bind_port: u16,
+    /// Extra raw args passed through to the proxy verbatim.
+    #[serde(default)]
+    pub proxy_extra_args: Vec<String>,
     /// Yellowstone gRPC endpoint for live pool state (narrow account filter).
     #[serde(default)]
     pub pool_state_endpoint: String,
@@ -91,6 +115,13 @@ impl Default for ShredArbConfig {
         Self {
             enabled: false,
             shredstream_endpoint: default_shredstream_endpoint(),
+            proxy_autostart: true,
+            proxy_bin: default_proxy_bin(),
+            block_engine_url: default_block_engine_url(),
+            desired_regions: default_desired_regions(),
+            proxy_dest_ip_ports: default_dest_ip_ports(),
+            proxy_src_bind_port: default_src_bind_port(),
+            proxy_extra_args: Vec::new(),
             pool_state_endpoint: String::new(),
             pool_state_x_token: String::new(),
             mix_cache_path: default_mix_path(),
@@ -109,6 +140,21 @@ impl Default for ShredArbConfig {
 
 fn default_shredstream_endpoint() -> String {
     "http://127.0.0.1:9999".to_string()
+}
+fn default_proxy_bin() -> String {
+    "jito-shredstream-proxy".to_string()
+}
+fn default_block_engine_url() -> String {
+    "https://mainnet.block-engine.jito.wtf".to_string()
+}
+fn default_desired_regions() -> String {
+    "amsterdam,frankfurt".to_string()
+}
+fn default_dest_ip_ports() -> String {
+    "127.0.0.1:20001".to_string()
+}
+fn default_src_bind_port() -> u16 {
+    20000
 }
 fn default_mix_path() -> String {
     "/root/g/metis/mix.json".to_string()

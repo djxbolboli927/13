@@ -29,8 +29,14 @@ use crate::meteora_math::MeteoraPool;
 use crate::pumpfun_math::PumpPool;
 
 // Meteora DAMM v2 Pool account field offsets (bytes, discriminator included).
-// See meteora_math / research report. Verify against a live account if the
-// deployed layout drifts (the fee sub-struct size is the fragile part).
+// Validated against a live pool whose account is 1112 bytes (INIT_SPACE 1104 +
+// 8 discriminator), which matches this layout. The fee sub-struct size is the
+// fragile part if the deployed layout ever drifts.
+//
+// `pool_fees` is the first field (offset 8); its first member is
+// `base_fee.cliff_fee_numerator: u64`, i.e. the flat swap fee numerator
+// (denominator 1e9).
+const MET_OFF_CLIFF_FEE: usize = 8;
 const MET_OFF_LIQUIDITY: usize = 360;
 const MET_OFF_SQRT_MIN: usize = 424;
 const MET_OFF_SQRT_MAX: usize = 440;
@@ -71,17 +77,25 @@ impl PoolStateCache {
         self.inner.contains_key(pk)
     }
 
-    /// Decode a Meteora pool account into its pricing slice. `fee_bps` is the
-    /// effective fee supplied by config (dynamic fee not yet modelled).
-    pub fn meteora_pool(&self, pool: &Pubkey, fee_bps: u64) -> Option<MeteoraPool> {
+    /// Decode a Meteora pool account into its pricing slice. The fee is read
+    /// straight from the pool's `cliff_fee_numerator`; `fallback_fee_numerator`
+    /// (from config) is used only if that read looks implausible.
+    pub fn meteora_pool(&self, pool: &Pubkey, fallback_fee_numerator: u64) -> Option<MeteoraPool> {
         let entry = self.inner.get(pool)?;
         let data = entry.value();
+        let cliff = read_u64_le(data, MET_OFF_CLIFF_FEE).unwrap_or(0);
+        // Plausible static fee: (0, 50%]. Otherwise fall back to config.
+        let fee_numerator = if cliff > 0 && (cliff as u128) <= 500_000_000 {
+            cliff
+        } else {
+            fallback_fee_numerator
+        };
         Some(MeteoraPool {
             liquidity: read_u128_le(data, MET_OFF_LIQUIDITY)?,
             sqrt_min_price: read_u128_le(data, MET_OFF_SQRT_MIN)?,
             sqrt_max_price: read_u128_le(data, MET_OFF_SQRT_MAX)?,
             sqrt_price: read_u128_le(data, MET_OFF_SQRT_PRICE)?,
-            fee_bps,
+            fee_numerator,
         })
     }
 

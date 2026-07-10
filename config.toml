@@ -121,10 +121,23 @@ enabled = false
 # آربیتراژ با Meteora DAMM v2.
 enabled = true
 # پورت محلی gRPC که jito-shredstream-proxy روی آن entryها را سرو می‌کند.
-# پروکسی را با کیپر whitelist‌شده اجرا کنید:
-#   jito-shredstream-proxy --auth-keypair /root/g/wallet/shred.json \
-#     --desired-regions <r1>,<r2> --grpc-service-port 9999 ...
+# ربات خودش پروکسی را استارت و ناظر آن است (proxy_autostart=true)؛ فقط کافی است
+# باینری پروکسی روی سرور نصب باشد و کیپر whitelist‌شده را بگذارید.
 shredstream_endpoint = "http://127.0.0.1:9999"
+# استارت خودکار پروکسی ShredStream همراه با ربات (فقط متیس جدا استارت می‌شود).
+proxy_autostart = true
+# مسیر/نام باینری پروکسی (روی PATH یا مسیر کامل).
+proxy_bin = "jito-shredstream-proxy"
+# آدرس Block Engine جیتو که پروکسی با کیپر شما به آن auth می‌کند.
+block_engine_url = "https://mainnet.block-engine.jito.wtf"
+# ریجن‌های ShredStream (حداکثر ۲ تا).
+desired_regions = "amsterdam,frankfurt"
+# مقصد UDP برای شردهای خام (پروکسی الزام دارد؛ چون فقط مسیر gRPC را مصرف می‌کنیم
+# یک پورت محلی throwaway کافی است).
+proxy_dest_ip_ports = "127.0.0.1:20001"
+proxy_src_bind_port = 20000
+# آرگومان‌های اضافی که عیناً به پروکسی پاس داده می‌شوند (در صورت نیاز نسخه‌ی پروکسی).
+proxy_extra_args = []
 # منبع وضعیت زنده‌ی استخرها (فیلتر باریک فقط روی اکانت‌های همین استخرها).
 pool_state_endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
 pool_state_x_token = "cba491e2cd18e339c6517a51d4d497737cb04edd08d8915fc872c8a30cd5656a"

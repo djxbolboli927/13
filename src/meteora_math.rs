@@ -20,7 +20,8 @@ pub const MIN_SQRT_PRICE: u128 = 4_295_048_016;
 /// Upper bound of a valid sqrt-price.
 pub const MAX_SQRT_PRICE: u128 = 79_226_673_521_066_979_257_578_248_091;
 
-const BPS_DENOM: u128 = 10_000;
+/// DAMM v2 fee denominator: fee numerators are in billionths (1e9 = 100%).
+pub const FEE_DENOM: u128 = 1_000_000_000;
 
 #[inline]
 fn ceil_div(a: u128, b: u128) -> u128 {
@@ -38,8 +39,10 @@ pub struct MeteoraPool {
     pub liquidity: u128,
     pub sqrt_min_price: u128,
     pub sqrt_max_price: u128,
-    /// Effective total fee in bps applied on the input leg.
-    pub fee_bps: u64,
+    /// Effective fee numerator (denominator `FEE_DENOM` = 1e9), read from the
+    /// pool's `cliff_fee_numerator`. Dynamic (volatility) fee is negligible for
+    /// the tiny trades on these low-liquidity pools, so the base fee suffices.
+    pub fee_numerator: u64,
 }
 
 /// Result of a single-range exact-in swap.
@@ -83,7 +86,7 @@ impl MeteoraPool {
             return None;
         }
         // Fee on input (pool-favorable ceiling).
-        let fee = ceil_div(amount_in as u128 * self.fee_bps as u128, BPS_DENOM);
+        let fee = ceil_div(amount_in as u128 * self.fee_numerator as u128, FEE_DENOM);
         let net_in = (amount_in as u128).saturating_sub(fee);
         if net_in == 0 {
             return None;
@@ -150,7 +153,7 @@ mod tests {
             liquidity: 1u128 << 80,
             sqrt_min_price: MIN_SQRT_PRICE,
             sqrt_max_price: MAX_SQRT_PRICE,
-            fee_bps: 25,
+            fee_numerator: 2_500_000, // 0.25%
         }
     }
 

@@ -26,6 +26,8 @@ mod program_registry;
 mod pumpfun_math;
 mod rate_limiter;
 mod shred_arb;
+#[allow(dead_code)]
+mod shred_proxy;
 mod shred_stream;
 mod template_cache;
 mod token_metrics;
@@ -305,6 +307,23 @@ fn spawn_shred_arb(
     let pairs = pool_registry::load_pairs(&sa.mix_cache_path)?;
     if pairs.is_empty() {
         eprintln!("[shred-arb] no pairs in mix.json — strategy idle");
+    }
+
+    // Auto-launch the ShredStream proxy so the operator only starts the bot.
+    if sa.proxy_autostart {
+        let grpc_port = shred_proxy::parse_grpc_port(&sa.shredstream_endpoint, 9999);
+        shred_proxy::spawn_supervised(shred_proxy::ProxyConfig {
+            bin: sa.proxy_bin.clone(),
+            block_engine_url: sa.block_engine_url.clone(),
+            auth_keypair: sa.shred_keypair.clone(),
+            desired_regions: sa.desired_regions.clone(),
+            dest_ip_ports: sa.proxy_dest_ip_ports.clone(),
+            src_bind_port: sa.proxy_src_bind_port,
+            grpc_service_port: grpc_port,
+            extra_args: sa.proxy_extra_args.clone(),
+        });
+    } else {
+        eprintln!("[shred-arb] proxy_autostart=false — expecting an external shredstream proxy");
     }
 
     // Accounts to watch live: each Meteora pool + each Pump vault pair.
