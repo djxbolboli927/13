@@ -3,9 +3,9 @@ url = "http://127.0.0.1:8080"
 binary_key = "5b945476-f95d-4403-a2b5-156db4ee3212"
 
 [trading]
-min_amount_sol = 0.001
-max_amount_sol = 0.05
-step_sol = 0.0002
+min_amount_sol = 0.0000001
+max_amount_sol = 0.005
+step_sol = 0.0000001
 # حداقل سود ناخالص (lamport) برای عبور از Stage 1.
 # فقط روی تعداد profitable و ارسال به swap_instructions تأثیر دارد.
 # خروجی نهایی on-chain همچنان ورودی + 10000 لمپرت باقی می‌ماند.
@@ -30,7 +30,7 @@ urls = [
     "https://tokyo.mainnet.block-engine.jito.wtf",
 ]
 uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
-trading_keypair = "/root/c/wallet/wallet.json"
+trading_keypair = "/root/g/wallet/wallet.json"
 tip_min_lamports = 1000
 tip_max_lamports = 1000000
 tip_profit_percent = 0.50
@@ -39,7 +39,7 @@ tip_profit_percent = 0.50
 max_bundles_per_second = 5
 
 [rpc]
-url = "https://rpc.fra.shyft.to?api_key=farYqEW-7r1vxqok"
+url = "https://rpc.fra.shyft.to?api_key=B3iwa4mECQr5C9eW"
 
 [yellowstone_grpc]
 endpoint = "https://grpc.fra.shyft.to"
@@ -76,7 +76,7 @@ bot_cpu_cores = [12,13,14,15,28,29,30,31]
 # منبع داده‌ی sim = همان gRPC شیفت که Metis هم می‌خواند (یک اتصال جدا،
 # هیچ سربار متقابلی با Metis ندارد).
 enabled = false
-so_dir = "/root/c/so"
+so_dir = "/root/g/so"
 # fail_closed=true  (امن)  : اگر sim خطا داد ⇒ ارسال نکن
 # fail_closed=false (رول‌اوت) : اگر sim خطا داد ⇒ فقط log بزن و بفرست
 fail_closed = true
@@ -109,7 +109,7 @@ endpoints = [
 ]
 # این ولت توسط جیتو whitelist شده — هیچ دارایی‌ای نگه نمی‌دارد و هیچ
 # تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
-auth_keypair = "/root/c/wallet/grpc.json"
+auth_keypair = "/root/g/wallet/grpc.json"
 max_bundles_per_second = 5
 
 [scanner]
@@ -163,6 +163,6 @@ signal_buffer = 1024
 # Tier-1: route_signature دقیق → patch amounts → بدون Metis call
 # Tier-2: hop-pair index (هر دو pool دیده شده) → patch amounts → بدون Metis call
 # Tier-3: fallback به /swap-instructions + ذخیره template برای دفعات بعد
-save_new = true
-serve_route = true
+save_new = false
+serve_route = false
 serve_from_metis = true
