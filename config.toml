@@ -127,7 +127,7 @@ shredstream_endpoint = "http://127.0.0.1:9999"
 # استارت خودکار پروکسی ShredStream همراه با ربات (فقط متیس جدا استارت می‌شود).
 proxy_autostart = true
 # مسیر/نام باینری پروکسی (روی PATH یا مسیر کامل).
-proxy_bin = "jito-shredstream-proxy"
+proxy_bin = "/root/g/jito-tools/jito-shredstream-proxy"
 # آدرس Block Engine جیتو که پروکسی با کیپر شما به آن auth می‌کند.
 block_engine_url = "https://mainnet.block-engine.jito.wtf"
 # ریجن‌های ShredStream (حداکثر ۲ تا).
