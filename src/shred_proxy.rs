@@ -30,6 +30,9 @@ pub struct ProxyConfig {
 impl ProxyConfig {
     fn to_args(&self) -> Vec<String> {
         let mut a = vec![
+            // This proxy version dispatches on a subcommand; "shredstream"
+            // requests shreds from Jito and forwards to local consumers.
+            "shredstream".to_string(),
             "--block-engine-url".to_string(),
             self.block_engine_url.clone(),
             "--auth-keypair".to_string(),
