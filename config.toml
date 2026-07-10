@@ -153,10 +153,10 @@ meteora_fee_bps = 25
 # نادیده‌گرفتن تریدهای کوچک پامپ (سمت SOL کمتر از این مقدار).
 min_trigger_sol = 1.0
 # بازه‌ی جست‌وجوی مقدار ورودی بهینه.
-min_amount_sol = 0.001
+min_amount_sol = 0.0000001
 max_amount_sol = 0.05
 # فاصله‌ی حداقلی بین دو شلیک روی یک استخر (ms).
-cooldown_ms = 200
+cooldown_ms = 100
 signal_buffer = 1024
 
 [template_cache]
