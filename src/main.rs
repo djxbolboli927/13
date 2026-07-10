@@ -336,12 +336,27 @@ fn spawn_shred_arb(
     accounts.sort_unstable();
     accounts.dedup();
 
+    // Log the loaded pairs so mix.json parsing is verifiable at a glance.
+    for p in &pairs {
+        eprintln!(
+            "[shred-arb] pair token={} | pump_pool={} vaults=({},{}) | meteora_pool={}",
+            p.token_mint, p.pump.pool, p.pump.token_vault(), p.pump.wsol_vault(), p.meteora.pool,
+        );
+    }
+
     let pool_state = pool_state::PoolStateCache::new();
-    pool_state.spawn_subscription(
-        sa.pool_state_endpoint.clone(),
-        sa.pool_state_x_token.clone(),
-        accounts,
-    );
+    if accounts.is_empty() {
+        eprintln!("[shred-arb] WARNING: no accounts to watch (0 pairs) — pool-state stream skipped");
+    } else {
+        // Seed initial state via RPC so low-activity pools (e.g. a rarely-traded
+        // Meteora pool) are present before their first live update.
+        pool_state.prefetch(&rpc_client, &accounts);
+        pool_state.spawn_subscription(
+            sa.pool_state_endpoint.clone(),
+            sa.pool_state_x_token.clone(),
+            accounts,
+        );
+    }
 
     // Preload (unfiltered) ALT contents for each Pump pool so the ShredStream
     // consumer can resolve ALT-provided accounts without a hot-path RPC call.
@@ -385,6 +400,7 @@ fn spawn_shred_arb(
         target_pools,
         alt_map,
     ));
+    let shred_metrics = consumer.metrics.clone();
     consumer.spawn(tx);
 
     let engine = Arc::new(shred_arb::ShredArbEngine::new(
@@ -401,6 +417,7 @@ fn spawn_shred_arb(
         pool_state,
         pairs,
         params,
+        shred_metrics,
     ));
     engine.clone().spawn_reporter();
     tokio::spawn(engine.run(rx));

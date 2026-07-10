@@ -13,6 +13,7 @@
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
+use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,6 +50,8 @@ const SPL_AMOUNT_OFFSET: usize = 64;
 pub struct PoolStateCache {
     inner: Arc<DashMap<Pubkey, Vec<u8>>>,
     slot: Arc<AtomicU64>,
+    /// Total account updates received (for diagnostics).
+    updates: Arc<AtomicU64>,
 }
 
 fn read_u128_le(data: &[u8], off: usize) -> Option<u128> {
@@ -66,6 +69,7 @@ impl PoolStateCache {
         Self {
             inner: Arc::new(DashMap::with_capacity(256)),
             slot: Arc::new(AtomicU64::new(0)),
+            updates: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -73,8 +77,36 @@ impl PoolStateCache {
         self.slot.load(Ordering::Relaxed)
     }
 
+    /// Total account updates received since start.
+    pub fn updates(&self) -> u64 {
+        self.updates.load(Ordering::Relaxed)
+    }
+
+    /// Number of distinct accounts currently cached.
+    pub fn cache_size(&self) -> usize {
+        self.inner.len()
+    }
+
     pub fn has(&self, pk: &Pubkey) -> bool {
         self.inner.contains_key(pk)
+    }
+
+    /// RPC-fetch initial state for every account so we have a baseline even for
+    /// low-activity pools (Yellowstone only pushes on CHANGE — a rarely-traded
+    /// Meteora pool would otherwise never appear). Live updates then keep it
+    /// fresh. Runs synchronously at startup.
+    pub fn prefetch(&self, rpc: &RpcClient, accounts: &[Pubkey]) {
+        let mut ok = 0usize;
+        for pk in accounts {
+            match rpc.get_account(pk) {
+                Ok(acct) => {
+                    self.inner.insert(*pk, acct.data);
+                    ok += 1;
+                }
+                Err(e) => warn!(account = %pk, error = %e, "pool-state prefetch miss"),
+            }
+        }
+        info!(requested = accounts.len(), fetched = ok, "pool-state prefetch complete");
     }
 
     /// Decode a Meteora pool account into its pricing slice. The fee is read
@@ -121,10 +153,11 @@ impl PoolStateCache {
     ) {
         let inner = self.inner.clone();
         let slot = self.slot.clone();
+        let updates = self.updates.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
             loop {
-                match run_stream(&endpoint, &x_token, &accounts, &inner, &slot).await {
+                match run_stream(&endpoint, &x_token, &accounts, &inner, &slot, &updates).await {
                     Ok(()) => warn!("pool-state stream ended cleanly, reconnecting"),
                     Err(e) => warn!(error = %e, "pool-state stream error, reconnecting"),
                 }
@@ -141,6 +174,7 @@ async fn run_stream(
     accounts: &[Pubkey],
     cache: &Arc<DashMap<Pubkey, Vec<u8>>>,
     slot: &Arc<AtomicU64>,
+    updates: &Arc<AtomicU64>,
 ) -> Result<()> {
     let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
         .x_token(Some(x_token.to_string()))?
@@ -182,6 +216,7 @@ async fn run_stream(
                 if let Some(info) = a.account {
                     if let Ok(pk) = Pubkey::try_from(info.pubkey.as_slice()) {
                         cache.insert(pk, info.data);
+                        updates.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }

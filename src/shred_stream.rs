@@ -49,6 +49,10 @@ pub struct ShredMetrics {
     pub pump_txns: AtomicU64,
     pub matched: AtomicU64,
     pub unresolved_pool: AtomicU64,
+    pub signals_sent: AtomicU64,
+    pub signals_dropped: AtomicU64,
+    /// Number of target Pump pools being watched (set once at startup).
+    pub watched_pools: AtomicU64,
 }
 
 pub struct ShredConsumer {
@@ -68,12 +72,16 @@ impl ShredConsumer {
         target_pools: HashSet<Pubkey>,
         alt_map: HashMap<Pubkey, Vec<Pubkey>>,
     ) -> Self {
+        let metrics = Arc::new(ShredMetrics::default());
+        metrics
+            .watched_pools
+            .store(target_pools.len() as u64, Ordering::Relaxed);
         Self {
             endpoint,
             target_pools,
             alt_map,
             pumpfun: pumpfun_program(),
-            metrics: Arc::new(ShredMetrics::default()),
+            metrics,
         }
     }
 
@@ -183,7 +191,10 @@ impl ShredConsumer {
             };
             // Non-blocking: if the engine is busy, drop (staleness makes an old
             // signal worthless anyway).
-            let _ = tx.try_send(signal);
+            match tx.try_send(signal) {
+                Ok(()) => self.metrics.signals_sent.fetch_add(1, Ordering::Relaxed),
+                Err(_) => self.metrics.signals_dropped.fetch_add(1, Ordering::Relaxed),
+            };
         }
     }
 

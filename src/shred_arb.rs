@@ -66,10 +66,20 @@ pub struct ShredArbEngine {
     /// Keyed by Pump.fun pool pubkey (what the signal carries).
     pub pairs: HashMap<solana_sdk::pubkey::Pubkey, ArbPair>,
     pub params: ArbParams,
+    pub shred_metrics: Arc<crate::shred_stream::ShredMetrics>,
     last_fired: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
-    pub sent: AtomicU64,
-    pub evaluated: AtomicU64,
-    pub profitable: AtomicU64,
+    // ── diagnostics ──
+    signals_received: AtomicU64,
+    skip_min_trigger: AtomicU64,
+    skip_no_pair: AtomicU64,
+    skip_cooldown: AtomicU64,
+    skip_no_pump_state: AtomicU64,
+    skip_no_meteora_state: AtomicU64,
+    skip_bad_price: AtomicU64,
+    evaluated: AtomicU64,
+    profitable: AtomicU64,
+    not_profitable: AtomicU64,
+    sent: AtomicU64,
 }
 
 /// Which venue we buy on (and therefore which we sell on).
@@ -95,6 +105,7 @@ impl ShredArbEngine {
         pool_state: PoolStateCache,
         pairs: Vec<ArbPair>,
         params: ArbParams,
+        shred_metrics: Arc<crate::shred_stream::ShredMetrics>,
     ) -> Self {
         let map = pairs.into_iter().map(|p| (p.pump.pool, p)).collect();
         Self {
@@ -111,10 +122,19 @@ impl ShredArbEngine {
             pool_state,
             pairs: map,
             params,
+            shred_metrics,
             last_fired: dashmap::DashMap::new(),
-            sent: AtomicU64::new(0),
+            signals_received: AtomicU64::new(0),
+            skip_min_trigger: AtomicU64::new(0),
+            skip_no_pair: AtomicU64::new(0),
+            skip_cooldown: AtomicU64::new(0),
+            skip_no_pump_state: AtomicU64::new(0),
+            skip_no_meteora_state: AtomicU64::new(0),
+            skip_bad_price: AtomicU64::new(0),
             evaluated: AtomicU64::new(0),
             profitable: AtomicU64::new(0),
+            not_profitable: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
         }
     }
 
@@ -130,17 +150,23 @@ impl ShredArbEngine {
     }
 
     async fn handle(&self, sig: PumpSwapSignal) {
+        self.signals_received.fetch_add(1, Ordering::Relaxed);
         if sig.quote_amount < self.params.min_trigger_lamports {
+            self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let pair = match self.pairs.get(&sig.pool) {
             Some(p) => p.clone(),
-            None => return,
+            None => {
+                self.skip_no_pair.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         };
 
         // Cooldown per pool.
         if let Some(prev) = self.last_fired.get(&sig.pool) {
             if prev.elapsed() < Duration::from_millis(self.params.cooldown_ms) {
+                self.skip_cooldown.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
@@ -154,6 +180,7 @@ impl ShredArbEngine {
         {
             Some(p) => p,
             None => {
+                self.skip_no_pump_state.fetch_add(1, Ordering::Relaxed);
                 debug!(pool = %sig.pool, "pump reserves not cached yet");
                 return;
             }
@@ -173,6 +200,7 @@ impl ShredArbEngine {
         {
             Some(m) => m,
             None => {
+                self.skip_no_meteora_state.fetch_add(1, Ordering::Relaxed);
                 debug!(pool = %pair.meteora.pool, "meteora state not cached yet");
                 return;
             }
@@ -180,12 +208,14 @@ impl ShredArbEngine {
 
         // 3) Direction: compare raw price (WSOL-raw per token-raw) on both.
         let pump_price = if pump_after.base_reserve == 0 {
+            self.skip_bad_price.fetch_add(1, Ordering::Relaxed);
             return;
         } else {
             pump_after.quote_reserve as f64 / pump_after.base_reserve as f64
         };
         let met_price = meteora.token_price_in_sol(pair.meteora.token_is_a, 0, 0);
         if met_price <= 0.0 {
+            self.skip_bad_price.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let buy_on = if pump_price < met_price {
@@ -225,10 +255,14 @@ impl ShredArbEngine {
 
         let best_out = match best_out {
             Some(o) => o,
-            None => return,
+            None => {
+                self.not_profitable.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         };
         let floor = best_x + required_extra;
         if best_out <= floor {
+            self.not_profitable.fetch_add(1, Ordering::Relaxed);
             return; // not profitable after fixed costs
         }
         self.profitable.fetch_add(1, Ordering::Relaxed);
@@ -381,19 +415,67 @@ impl ShredArbEngine {
 
     pub fn spawn_reporter(self: Arc<Self>) {
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
             let fallback_fee = self.params.meteora_fee_bps.saturating_mul(100_000);
+            // Snapshot of window-start counters for per-30s deltas.
+            let m = &self.shred_metrics;
+            let mut prev_entries = 0u64;
+            let mut prev_txns = 0u64;
+            let mut prev_pump = 0u64;
+            let mut prev_matched = 0u64;
+            let mut prev_updates = 0u64;
+            let mut prev_eval = 0u64;
             loop {
                 ticker.tick().await;
-                info!(
-                    evaluated = self.evaluated.load(Ordering::Relaxed),
-                    profitable = self.profitable.load(Ordering::Relaxed),
-                    sent = self.sent.load(Ordering::Relaxed),
-                    pool_slot = self.pool_state.slot(),
-                    "shred-arb stats"
+                let entries = m.entries.load(Ordering::Relaxed);
+                let txns = m.txns.load(Ordering::Relaxed);
+                let pump = m.pump_txns.load(Ordering::Relaxed);
+                let matched = m.matched.load(Ordering::Relaxed);
+                let updates = self.pool_state.updates();
+                let eval = self.evaluated.load(Ordering::Relaxed);
+
+                // Everything below is per-30s-window (delta), plus lifetime totals.
+                eprintln!(
+                    "\n[shred-arb 30s] watching_pump_pools={} subscribed_cache={} pool_updates={} (Δ)\n\
+                     SHRED   : entriesΔ={} txnsΔ={} pumpfun_txnsΔ={} matched_our_poolsΔ={} unresolved={} signals_sent={} signals_dropped={}\n\
+                     ENGINE  : signals_recv={} evaluatedΔ={} | skip[min_trig={} no_pair={} cooldown={} no_pump_state={} no_meteora_state={} bad_price={}]\n\
+                     RESULT  : profitable={} not_profitable={} sent={} | pool_slot={}",
+                    m.watched_pools.load(Ordering::Relaxed),
+                    self.pool_state.cache_size(),
+                    updates.saturating_sub(prev_updates),
+                    entries.saturating_sub(prev_entries),
+                    txns.saturating_sub(prev_txns),
+                    pump.saturating_sub(prev_pump),
+                    matched.saturating_sub(prev_matched),
+                    m.unresolved_pool.load(Ordering::Relaxed),
+                    m.signals_sent.load(Ordering::Relaxed),
+                    m.signals_dropped.load(Ordering::Relaxed),
+                    self.signals_received.load(Ordering::Relaxed),
+                    eval.saturating_sub(prev_eval),
+                    self.skip_min_trigger.load(Ordering::Relaxed),
+                    self.skip_no_pair.load(Ordering::Relaxed),
+                    self.skip_cooldown.load(Ordering::Relaxed),
+                    self.skip_no_pump_state.load(Ordering::Relaxed),
+                    self.skip_no_meteora_state.load(Ordering::Relaxed),
+                    self.skip_bad_price.load(Ordering::Relaxed),
+                    self.profitable.load(Ordering::Relaxed),
+                    self.not_profitable.load(Ordering::Relaxed),
+                    self.sent.load(Ordering::Relaxed),
+                    self.pool_state.slot(),
                 );
-                // Decoded-state snapshot for calibration: compare these prices
-                // against a live Metis quote for the same pool/size.
+                prev_entries = entries;
+                prev_txns = txns;
+                prev_pump = pump;
+                prev_matched = matched;
+                prev_updates = updates;
+                prev_eval = eval;
+
+                // Decoded-state snapshot for calibration & diagnosis. Always
+                // printed so a missing side is visible (compare the prices
+                // against a live Metis quote for the same pool/size).
+                if self.pairs.is_empty() {
+                    eprintln!("  SNAPSHOT: no pairs loaded from mix.json — nothing to trade!");
+                }
                 for pair in self.pairs.values().take(3) {
                     let met = self
                         .pool_state
@@ -401,24 +483,38 @@ impl ShredArbEngine {
                     let pump = self
                         .pool_state
                         .pump_pool(&pair.pump.token_vault(), &pair.pump.wsol_vault());
-                    if let (Some(m), Some(p)) = (met, pump) {
-                        let met_price = m.token_price_in_sol(pair.meteora.token_is_a, 0, 0);
-                        let pump_price = if p.base_reserve == 0 {
-                            0.0
-                        } else {
-                            p.quote_reserve as f64 / p.base_reserve as f64
-                        };
-                        info!(
-                            token = %pair.token_mint,
-                            meteora_sqrt_price = m.sqrt_price,
-                            meteora_liquidity = m.liquidity,
-                            meteora_fee_num = m.fee_numerator,
-                            meteora_price = met_price,
-                            pump_base = p.base_reserve,
-                            pump_quote = p.quote_reserve,
-                            pump_price = pump_price,
-                            "pool snapshot"
-                        );
+                    match (met, pump) {
+                        (Some(m), Some(p)) => {
+                            let met_price = m.token_price_in_sol(pair.meteora.token_is_a, 0, 0);
+                            let pump_price = if p.base_reserve == 0 {
+                                0.0
+                            } else {
+                                p.quote_reserve as f64 / p.base_reserve as f64
+                            };
+                            let diff_pct = if met_price > 0.0 {
+                                (pump_price - met_price) / met_price * 100.0
+                            } else {
+                                0.0
+                            };
+                            eprintln!(
+                                "  SNAPSHOT {}: meteora[sqrtP={} L={} fee_num={} price={:.6e}] \
+                                 pump[base={} quote={} price={:.6e}] diff={:.3}%",
+                                pair.token_mint, m.sqrt_price, m.liquidity, m.fee_numerator,
+                                met_price, p.base_reserve, p.quote_reserve, pump_price, diff_pct,
+                            );
+                        }
+                        (met_o, pump_o) => {
+                            eprintln!(
+                                "  SNAPSHOT {}: meteora_cached={} pump_cached={} \
+                                 (meteora_pool={} token_vault={} wsol_vault={})",
+                                pair.token_mint,
+                                met_o.is_some(),
+                                pump_o.is_some(),
+                                pair.meteora.pool,
+                                pair.pump.token_vault(),
+                                pair.pump.wsol_vault(),
+                            );
+                        }
                     }
                 }
             }
