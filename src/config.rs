@@ -108,8 +108,8 @@ pub struct ShredArbConfig {
     /// Bounded signal channel capacity.
     #[serde(default = "default_signal_buffer")]
     pub signal_buffer: usize,
-    /// Cap the buy-leg price impact (percent). Keeps trade size tiny on
-    /// low-liquidity pools. Default 1%.
+    /// Size ceiling as a percent of the BUY pool's WSOL reserve. The optimizer
+    /// finds the net-maximizing size within this ceiling. Default 100%.
     #[serde(default = "default_max_price_impact_pct")]
     pub max_price_impact_pct: f64,
     /// Enter this percent below the computed optimum for slippage headroom.
@@ -153,7 +153,7 @@ impl Default for ShredArbConfig {
 }
 
 fn default_max_price_impact_pct() -> f64 {
-    1.0
+    100.0
 }
 fn default_size_safety_margin_pct() -> f64 {
     3.0

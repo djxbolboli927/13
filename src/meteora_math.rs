@@ -13,7 +13,7 @@
 //! `fee_bps` to the pool's effective fee and verify against a live quote before
 //! trusting profit near the break-even line.
 
-use crate::mathutil::{mul_div_ceil, mul_div_floor, Q64};
+use crate::mathutil::{div_wide, mul_div_ceil, mul_div_floor, mul_wide, Q64};
 
 /// Lower bound of a valid sqrt-price (from the on-chain program constants).
 pub const MIN_SQRT_PRICE: u128 = 4_295_048_016;
@@ -95,31 +95,40 @@ impl MeteoraPool {
         let sqrt = self.sqrt_price;
         let l = self.liquidity;
 
+        // CRITICAL scaling: on-chain `liquidity` is itself Q64.64 (L = L_real·2^64),
+        // exactly like `sqrt_price`. So the reserve/delta relations carry a 2^128
+        // factor, not 2^64:
+        //   reserve_B = L·√P / 2^128 ,  reserve_A = L / √P
+        //   1/√P' − 1/√P = Δa / L     (A in, price down)
+        //   √P' − √P     = Δb·2^128 / L   (B in, price up)
+
         if a_to_b {
-            // Δa in, price down: √P' = √P·L / (L + Δa·√P/2^64), round up.
-            let term = mul_div_floor(net_in, sqrt, Q64)?;
-            let denom = l.checked_add(term)?;
+            // Δa (token A) in, price down.
+            //   √P' = √P·L / (L + Δa·√P)   [round up]
+            let da_sqrt = (net_in).checked_mul(sqrt)?; // Δa·√P
+            let denom = l.checked_add(da_sqrt)?;
             let sqrt_next = mul_div_ceil(sqrt, l, denom)?;
             if sqrt_next < self.sqrt_min_price || sqrt_next >= sqrt {
                 return None;
             }
-            // out_b = L·(√P − √P') / 2^64, round down.
-            let out = mul_div_floor(l, sqrt - sqrt_next, Q64)?;
+            // out_b = L·(√P − √P') / 2^128  → high 128 bits of the 256-bit product.
+            let (hi, _lo) = mul_wide(l, sqrt - sqrt_next);
             Some(SwapOut {
-                amount_out: out.min(u64::MAX as u128) as u64,
+                amount_out: hi.min(u64::MAX as u128) as u64,
                 next_sqrt_price: sqrt_next,
             })
         } else {
-            // Δb in, price up: √P' = √P + Δb·2^64 / L, round down.
-            let bump = mul_div_floor(net_in, Q64, l)?;
+            // Δb (token B) in, price up.
+            //   √P' = √P + Δb·2^128 / L   [round down]
+            let (bump, _r) = div_wide(net_in, 0, l)?; // (Δb << 128) / L
             let sqrt_next = sqrt.checked_add(bump)?;
             if sqrt_next > self.sqrt_max_price || sqrt_next <= sqrt {
                 return None;
             }
-            // out_a = L·2^64·(√P'−√P) / (√P·√P'), staged to stay within u128.
+            // out_a = L·(√P'−√P) / (√P·√P'), staged to stay within u128.
             let diff = sqrt_next - sqrt;
-            let inner = mul_div_floor(l, diff, sqrt)?;
-            let out = mul_div_floor(inner, Q64, sqrt_next)?;
+            let inner = mul_div_floor(l, diff, sqrt)?; // L·diff/√P
+            let out = inner / sqrt_next; // /√P'
             Some(SwapOut {
                 amount_out: out.min(u64::MAX as u128) as u64,
                 next_sqrt_price: sqrt_next,
@@ -133,18 +142,19 @@ impl MeteoraPool {
     pub fn wsol_reserve(&self, token_is_a: bool) -> u64 {
         let l = self.liquidity;
         let sqrt = self.sqrt_price;
-        let out = if token_is_a {
-            // WSOL is token B: reserve_B = L·(√P − √P_min) / 2^64.
-            mul_div_floor(l, sqrt.saturating_sub(self.sqrt_min_price), Q64)
+        let out: u128 = if token_is_a {
+            // WSOL is token B: reserve_B = L·(√P − √P_min) / 2^128.
+            let (hi, _lo) = mul_wide(l, sqrt.saturating_sub(self.sqrt_min_price));
+            hi
         } else {
-            // WSOL is token A: reserve_A = L·2^64·(√P_max − √P) / (√P·√P_max).
+            // WSOL is token A: reserve_A = L·(√P_max − √P) / (√P·√P_max).
             let diff = self.sqrt_max_price.saturating_sub(sqrt);
             match mul_div_floor(l, diff, sqrt) {
-                Some(inner) => mul_div_floor(inner, Q64, self.sqrt_max_price),
-                None => None,
+                Some(inner) => inner / self.sqrt_max_price,
+                None => 0,
             }
         };
-        out.unwrap_or(0).min(u64::MAX as u128) as u64
+        out.min(u64::MAX as u128) as u64
     }
 
     /// Convenience: buy the token with WSOL. Returns token amount out.

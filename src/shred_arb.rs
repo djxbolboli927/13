@@ -15,7 +15,7 @@
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::signature::Keypair;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -90,6 +90,9 @@ pub struct ShredArbEngine {
     profitable: AtomicU64,
     not_profitable: AtomicU64,
     sent: AtomicU64,
+    /// Best (max) net lamports the optimizer found in the current window,
+    /// including negatives — shows how close we get when nothing is profitable.
+    best_net_seen: AtomicI64,
 }
 
 /// Which venue we buy on (and therefore which we sell on).
@@ -146,6 +149,7 @@ impl ShredArbEngine {
             profitable: AtomicU64::new(0),
             not_profitable: AtomicU64::new(0),
             sent: AtomicU64::new(0),
+            best_net_seen: AtomicI64::new(i64::MIN),
         }
     }
 
@@ -258,26 +262,34 @@ impl ShredArbEngine {
 
         let required_extra = self.params.tip_lamports + self.params.network_fee_lamports;
 
-        // Bound the search by the BUY-leg pool's WSOL depth so a low-liquidity
-        // pool is never moved by more than `max_price_impact`. This is what
-        // keeps trade size tiny and precise.
+        // Ceiling on trade size: never add more WSOL than a fraction of the
+        // BUY pool's current WSOL reserve (keeps the swap in a valid range and
+        // slippage sane). `max_price_impact` is that fraction (default 1.0).
+        // The optimizer then finds the net-maximizing size WITHIN this range —
+        // that size already balances the price gap against slippage, which is
+        // the real "optimal volume".
         let buy_wsol_reserve = match buy_on {
             BuyOn::Pump => pump_after.quote_reserve,
             BuyOn::Meteora => meteora.wsol_reserve(token_is_a),
         };
-        let impact_cap =
-            ((buy_wsol_reserve as f64) * self.params.max_price_impact).floor() as u64;
+        let liq_ceiling = ((buy_wsol_reserve as f64) * self.params.max_price_impact) as u64;
         let hi = self
             .params
             .max_amount_lamports
-            .min(impact_cap.max(self.params.min_amount_lamports));
+            .min(liq_ceiling)
+            .max(self.params.min_amount_lamports);
 
-        let (opt_x, _) = ternary_search_best(
-            self.params.min_amount_lamports,
-            hi,
-            required_extra,
-            &eval,
-        );
+        let (opt_x, opt_net) =
+            optimize_size(self.params.min_amount_lamports, hi, required_extra, &eval);
+
+        // Track how close we get, even when nothing is profitable, for tuning.
+        self.best_net_seen
+            .fetch_max(opt_net.clamp(i64::MIN as i128, i64::MAX as i128) as i64, Ordering::Relaxed);
+
+        if opt_net <= 0 {
+            self.not_profitable.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
 
         // Enter slightly below the optimum for slippage headroom.
         let best_x = (((opt_x as f64) * (1.0 - self.params.size_safety_margin)) as u64)
@@ -479,7 +491,7 @@ impl ShredArbEngine {
                     "\n[shred-arb 30s] watching_pump_pools={} subscribed_cache={} pool_updates={} (Δ)\n\
                      SHRED   : entriesΔ={} txnsΔ={} pumpfun_txnsΔ={} matched_our_poolsΔ={} unresolved={} signals_sent={} signals_dropped={}\n\
                      ENGINE  : signals_recv={} evaluatedΔ={} | skip[min_trig={} no_pair={} cooldown={} no_pump_state={} no_meteora_state={} bad_price={} implausible={}]\n\
-                     RESULT  : profitable={} not_profitable={} sent={} | pool_slot={}",
+                     RESULT  : profitable={} not_profitable={} sent={} best_net_lamports_window={} | pool_slot={}",
                     m.watched_pools.load(Ordering::Relaxed),
                     self.pool_state.cache_size(),
                     updates.saturating_sub(prev_updates),
@@ -502,6 +514,10 @@ impl ShredArbEngine {
                     self.profitable.load(Ordering::Relaxed),
                     self.not_profitable.load(Ordering::Relaxed),
                     self.sent.load(Ordering::Relaxed),
+                    {
+                        let v = self.best_net_seen.swap(i64::MIN, Ordering::Relaxed);
+                        if v == i64::MIN { 0 } else { v }
+                    },
                     self.pool_state.slot(),
                 );
                 prev_entries = entries;
@@ -570,43 +586,52 @@ fn buy_kind_label(k: DexKind) -> &'static str {
     }
 }
 
-/// Unimodal ternary search for the input that maximizes `eval(x) - x`.
-/// Returns the best `(x, eval(x))`. `required_extra` is only used to bias the
-/// objective toward net profit (it is a constant, so it doesn't change the
-/// argmax, but keeps the comparison in profit space).
-fn ternary_search_best<F: Fn(u64) -> Option<u64>>(
+/// Find the input that maximizes net profit `eval(x) - x - required_extra`.
+///
+/// The objective is not guaranteed unimodal (the swap can return `None` for
+/// oversized trades that cross a range bound), so a plain ternary search can
+/// get stuck. We instead sweep a GEOMETRIC grid across `[lo, hi]` — which is
+/// dense at the small sizes these low-liquidity pools actually want — then
+/// refine linearly around the best grid point. Returns `(best_x, best_net)`.
+fn optimize_size<F: Fn(u64) -> Option<u64>>(
     lo: u64,
     hi: u64,
     required_extra: u64,
     eval: &F,
-) -> (u64, Option<u64>) {
-    if hi <= lo {
-        return (lo, eval(lo));
-    }
-    // Objective in signed profit space.
+) -> (u64, i128) {
     let net = |x: u64| -> i128 {
         match eval(x) {
             Some(out) => out as i128 - x as i128 - required_extra as i128,
             None => i128::MIN,
         }
     };
-    let mut a = lo;
-    let mut b = hi;
-    for _ in 0..64 {
-        if b - a < 3 {
-            break;
-        }
-        let m1 = a + (b - a) / 3;
-        let m2 = b - (b - a) / 3;
-        if net(m1) < net(m2) {
-            a = m1;
-        } else {
-            b = m2;
-        }
+    let lo = lo.max(1);
+    if hi <= lo {
+        return (lo, net(lo));
     }
-    // Scan the small remaining window for the exact best.
-    let mut best_x = a;
-    let mut best_net = net(a);
+
+    // Geometric sweep.
+    const STEPS: usize = 240;
+    let lo_f = lo as f64;
+    let ratio = (hi as f64 / lo_f).powf(1.0 / STEPS as f64);
+    let mut best_x = lo;
+    let mut best_net = net(lo);
+    let mut xf = lo_f;
+    for _ in 0..=STEPS {
+        let x = xf as u64;
+        let n = net(x);
+        if n > best_net {
+            best_net = n;
+            best_x = x;
+        }
+        xf *= ratio;
+    }
+
+    // Linear refinement around the best grid point.
+    let span = (best_x / 10).max(1);
+    let a = best_x.saturating_sub(span).max(lo);
+    let b = best_x.saturating_add(span).min(hi);
+    let step = ((b - a) / 50).max(1);
     let mut x = a;
     while x <= b {
         let n = net(x);
@@ -614,7 +639,7 @@ fn ternary_search_best<F: Fn(u64) -> Option<u64>>(
             best_net = n;
             best_x = x;
         }
-        x += 1;
+        x = x.saturating_add(step);
     }
-    (best_x, eval(best_x))
+    (best_x, best_net)
 }
