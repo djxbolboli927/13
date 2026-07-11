@@ -26,7 +26,7 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeRequestFilterAccounts, SubscribeRequestPing,
 };
 
-use crate::meteora_math::MeteoraPool;
+use crate::meteora_math::{MeteoraPool, MAX_SQRT_PRICE, MIN_SQRT_PRICE};
 use crate::pumpfun_math::PumpPool;
 
 // Meteora DAMM v2 Pool account field offsets (bytes, discriminator included).
@@ -112,6 +112,10 @@ impl PoolStateCache {
     /// Decode a Meteora pool account into its pricing slice. The fee is read
     /// straight from the pool's `cliff_fee_numerator`; `fallback_fee_numerator`
     /// (from config) is used only if that read looks implausible.
+    ///
+    /// Returns `None` if the decoded state is not tradeable — a drained pool
+    /// (`liquidity == 0`), a sqrt-price outside the on-chain valid range, or a
+    /// mangled/partial read — so the engine never sizes a trade off garbage.
     pub fn meteora_pool(&self, pool: &Pubkey, fallback_fee_numerator: u64) -> Option<MeteoraPool> {
         let entry = self.inner.get(pool)?;
         let data = entry.value();
@@ -122,13 +126,26 @@ impl PoolStateCache {
         } else {
             fallback_fee_numerator
         };
-        Some(MeteoraPool {
+        let p = MeteoraPool {
             liquidity: read_u128_le(data, MET_OFF_LIQUIDITY)?,
             sqrt_min_price: read_u128_le(data, MET_OFF_SQRT_MIN)?,
             sqrt_max_price: read_u128_le(data, MET_OFF_SQRT_MAX)?,
             sqrt_price: read_u128_le(data, MET_OFF_SQRT_PRICE)?,
             fee_numerator,
-        })
+        };
+        // Validity gate: reject drained / out-of-range / garbage state.
+        if p.liquidity == 0
+            || p.sqrt_price < MIN_SQRT_PRICE
+            || p.sqrt_price > MAX_SQRT_PRICE
+            || p.sqrt_min_price < MIN_SQRT_PRICE
+            || p.sqrt_max_price > MAX_SQRT_PRICE
+            || p.sqrt_min_price >= p.sqrt_max_price
+            || p.sqrt_price < p.sqrt_min_price
+            || p.sqrt_price > p.sqrt_max_price
+        {
+            return None;
+        }
+        Some(p)
     }
 
     /// SPL token amount of a vault account.
