@@ -29,7 +29,7 @@ urls = [
     "https://singapore.mainnet.block-engine.jito.wtf",
     "https://tokyo.mainnet.block-engine.jito.wtf",
 ]
-uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
+uuid = "b12fdfb6-f487-4de5-99d8-c601b1ab548a"
 trading_keypair = "/root/g/wallet/wallet.json"
 tip_min_lamports = 1000
 tip_max_lamports = 1000000
