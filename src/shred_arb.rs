@@ -286,6 +286,35 @@ impl ShredArbEngine {
         self.best_net_seen
             .fetch_max(opt_net.clamp(i64::MIN as i128, i64::MAX as i128) as i64, Ordering::Relaxed);
 
+        // Detailed per-evaluation trace (only a few fire per 30s) so we can see
+        // exactly where the math lands: direction, predicted gap, liquidity, and
+        // net at several candidate sizes (None = swap infeasible at that size).
+        let pump_now_price = if pump_now.base_reserve > 0 {
+            pump_now.quote_reserve as f64 / pump_now.base_reserve as f64
+        } else {
+            0.0
+        };
+        let sample = |x: u64| -> Option<i64> {
+            eval(x).map(|o| o as i64 - x as i64 - required_extra as i64)
+        };
+        info!(
+            token = %pair.token_mint,
+            buy = if buy_on == BuyOn::Pump { "Pump" } else { "Meteora" },
+            gap_pct = (pump_price - met_price) / met_price * 100.0,
+            pump_now_price,
+            pump_after_price = pump_price,
+            met_price,
+            buy_wsol_reserve,
+            hi,
+            opt_x,
+            opt_net = opt_net as i64,
+            net_1k = ?sample(1_000),
+            net_10k = ?sample(10_000),
+            net_100k = ?sample(100_000),
+            net_500k = ?sample(500_000),
+            "eval-detail"
+        );
+
         if opt_net <= 0 {
             self.not_profitable.fetch_add(1, Ordering::Relaxed);
             return;

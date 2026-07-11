@@ -305,15 +305,11 @@ fn spawn_shred_arb(
     jito_limiter: Arc<Mutex<RateLimiter>>,
     jito_grpc_limiter: Option<Arc<Mutex<RateLimiter>>>,
 ) -> Result<()> {
-    use std::collections::{HashMap, HashSet};
+    let sa = config.shred_arb.clone();
+    let cu_limit = config.performance.cu_limits.first().copied().unwrap_or(200_000);
 
-    let sa = &config.shred_arb;
-    let pairs = pool_registry::load_pairs(&sa.mix_cache_path)?;
-    if pairs.is_empty() {
-        eprintln!("[shred-arb] no pairs in mix.json — strategy idle");
-    }
-
-    // Auto-launch the ShredStream proxy so the operator only starts the bot.
+    // Auto-launch the ShredStream proxy immediately — it does not depend on
+    // mix.json, and the entries feed can warm up while we wait for the pools.
     if sa.proxy_autostart {
         let grpc_port = shred_proxy::parse_grpc_port(&sa.shredstream_endpoint, 9999);
         shred_proxy::spawn_supervised(shred_proxy::ProxyConfig {
@@ -330,63 +326,7 @@ fn spawn_shred_arb(
         eprintln!("[shred-arb] proxy_autostart=false — expecting an external shredstream proxy");
     }
 
-    // Accounts to watch live: each Meteora pool + each Pump vault pair.
-    let mut accounts: Vec<solana_sdk::pubkey::Pubkey> = Vec::new();
-    for p in &pairs {
-        accounts.push(p.meteora.pool);
-        accounts.push(p.pump.token_vault());
-        accounts.push(p.pump.wsol_vault());
-    }
-    accounts.sort_unstable();
-    accounts.dedup();
-
-    // Log the loaded pairs so mix.json parsing is verifiable at a glance.
-    for p in &pairs {
-        eprintln!(
-            "[shred-arb] pair token={} | pump_pool={} vaults=({},{}) | meteora_pool={}",
-            p.token_mint, p.pump.pool, p.pump.token_vault(), p.pump.wsol_vault(), p.meteora.pool,
-        );
-    }
-
-    let pool_state = pool_state::PoolStateCache::new();
-    if accounts.is_empty() {
-        eprintln!("[shred-arb] WARNING: no accounts to watch (0 pairs) — pool-state stream skipped");
-    } else {
-        // Seed initial state via RPC so low-activity pools (e.g. a rarely-traded
-        // Meteora pool) are present before their first live update.
-        pool_state.prefetch(&rpc_client, &accounts);
-        pool_state.spawn_subscription(
-            sa.pool_state_endpoint.clone(),
-            sa.pool_state_x_token.clone(),
-            accounts,
-        );
-    }
-
-    // Preload (unfiltered) ALT contents for each Pump pool so the ShredStream
-    // consumer can resolve ALT-provided accounts without a hot-path RPC call.
-    let mut alt_map: HashMap<solana_sdk::pubkey::Pubkey, Vec<solana_sdk::pubkey::Pubkey>> =
-        HashMap::new();
-    let mut target_pools: HashSet<solana_sdk::pubkey::Pubkey> = HashSet::new();
-    for p in &pairs {
-        target_pools.insert(p.pump.pool);
-        if let Some(alt) = p.pump.alt {
-            if alt_map.contains_key(&alt) {
-                continue;
-            }
-            match rpc_client.get_account(&alt) {
-                Ok(acct) => match transaction::deserialize_alt_addresses(&acct.data) {
-                    Ok(addrs) => {
-                        alt_map.insert(alt, addrs);
-                    }
-                    Err(e) => eprintln!("[shred-arb] bad ALT {alt}: {e}"),
-                },
-                Err(e) => eprintln!("[shred-arb] failed to fetch ALT {alt}: {e}"),
-            }
-        }
-    }
-
     let lamports = |sol: f64| (sol * 1_000_000_000.0) as u64;
-    let cu_limit = config.performance.cu_limits.first().copied().unwrap_or(200_000);
     let params = shred_arb::ArbParams {
         tip_lamports: sa.tip_lamports,
         network_fee_lamports: sa.network_fee_lamports,
@@ -401,34 +341,104 @@ fn spawn_shred_arb(
         max_profit_fraction: sa.max_profit_fraction_pct / 100.0,
     };
 
-    let (tx, rx) = tokio::sync::mpsc::channel(sa.signal_buffer);
-    let consumer = Arc::new(shred_stream::ShredConsumer::new(
-        sa.shredstream_endpoint.clone(),
-        target_pools,
-        alt_map,
-    ));
-    let shred_metrics = consumer.metrics.clone();
-    consumer.spawn(tx);
+    // Load pools and run the strategy in a background task that RETRIES the
+    // mix.json read — if Metis hasn't written it yet (or is restarting) the bot
+    // waits instead of giving up and parking.
+    tokio::spawn(async move {
+        use std::collections::{HashMap, HashSet};
 
-    let engine = Arc::new(shred_arb::ShredArbEngine::new(
-        metis,
-        blockhash_cache,
-        trading_keypair.clone(),
-        rpc_client,
-        alt_cache,
-        jito_client,
-        jito_grpc_client,
-        jito_limiter,
-        jito_grpc_limiter,
-        trading_keypair.pubkey().to_string(),
-        pool_state,
-        pairs,
-        params,
-        shred_metrics,
-    ));
-    engine.clone().spawn_reporter();
-    tokio::spawn(engine.run(rx));
+        let pairs = loop {
+            match pool_registry::load_pairs(&sa.mix_cache_path) {
+                Ok(p) if !p.is_empty() => break p,
+                Ok(_) => eprintln!(
+                    "[shred-arb] mix.json has 0 usable Pump↔Meteora pairs — retrying in 5s"
+                ),
+                Err(e) => eprintln!(
+                    "[shred-arb] cannot read {} ({e}) — retrying in 5s (is Metis running?)",
+                    sa.mix_cache_path
+                ),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        };
 
-    eprintln!("[shred-arb] strategy started");
+        for p in &pairs {
+            eprintln!(
+                "[shred-arb] pair token={} | pump_pool={} vaults=({},{}) | meteora_pool={}",
+                p.token_mint, p.pump.pool, p.pump.token_vault(), p.pump.wsol_vault(), p.meteora.pool,
+            );
+        }
+
+        // Accounts to watch live: each Meteora pool + each Pump vault pair.
+        let mut accounts: Vec<solana_sdk::pubkey::Pubkey> = Vec::new();
+        for p in &pairs {
+            accounts.push(p.meteora.pool);
+            accounts.push(p.pump.token_vault());
+            accounts.push(p.pump.wsol_vault());
+        }
+        accounts.sort_unstable();
+        accounts.dedup();
+
+        let pool_state = pool_state::PoolStateCache::new();
+        pool_state.prefetch(&rpc_client, &accounts);
+        pool_state.spawn_subscription(
+            sa.pool_state_endpoint.clone(),
+            sa.pool_state_x_token.clone(),
+            accounts,
+        );
+
+        // Preload (unfiltered) ALT contents for each Pump pool so the consumer
+        // can resolve ALT-provided accounts without a hot-path RPC call.
+        let mut alt_map: HashMap<solana_sdk::pubkey::Pubkey, Vec<solana_sdk::pubkey::Pubkey>> =
+            HashMap::new();
+        let mut target_pools: HashSet<solana_sdk::pubkey::Pubkey> = HashSet::new();
+        for p in &pairs {
+            target_pools.insert(p.pump.pool);
+            if let Some(alt) = p.pump.alt {
+                if alt_map.contains_key(&alt) {
+                    continue;
+                }
+                match rpc_client.get_account(&alt) {
+                    Ok(acct) => match transaction::deserialize_alt_addresses(&acct.data) {
+                        Ok(addrs) => {
+                            alt_map.insert(alt, addrs);
+                        }
+                        Err(e) => eprintln!("[shred-arb] bad ALT {alt}: {e}"),
+                    },
+                    Err(e) => eprintln!("[shred-arb] failed to fetch ALT {alt}: {e}"),
+                }
+            }
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(sa.signal_buffer);
+        let consumer = Arc::new(shred_stream::ShredConsumer::new(
+            sa.shredstream_endpoint.clone(),
+            target_pools,
+            alt_map,
+        ));
+        let shred_metrics = consumer.metrics.clone();
+        consumer.spawn(tx);
+
+        let user_pubkey = trading_keypair.pubkey().to_string();
+        let engine = Arc::new(shred_arb::ShredArbEngine::new(
+            metis,
+            blockhash_cache,
+            trading_keypair,
+            rpc_client,
+            alt_cache,
+            jito_client,
+            jito_grpc_client,
+            jito_limiter,
+            jito_grpc_limiter,
+            user_pubkey,
+            pool_state,
+            pairs,
+            params,
+            shred_metrics,
+        ));
+        engine.clone().spawn_reporter();
+        eprintln!("[shred-arb] strategy started");
+        engine.run(rx).await;
+    });
+
     Ok(())
 }
