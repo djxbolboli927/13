@@ -110,10 +110,14 @@ async fn async_main(config: config::Config) -> Result<()> {
     }
 
     let metrics = metrics::Metrics::new();
-    metrics.spawn_reporter(config.performance.queue_max_age_ms, template_store.clone());
-
     let token_metrics = token_metrics::TokenMetrics::new(&token_mints);
-    token_metrics.spawn_reporter();
+    // The legacy circular-scan reporters only make sense when that scanner runs.
+    // With it disabled they print an all-zero funnel that is easily mistaken for
+    // the new strategy's Metis activity — so gate them.
+    if config.scanner.enabled {
+        metrics.spawn_reporter(config.performance.queue_max_age_ms, template_store.clone());
+        token_metrics.spawn_reporter();
+    }
 
     let blockhash_cache = Arc::new(BlockhashCache::new(rpc_client.clone()));
 
@@ -392,6 +396,9 @@ fn spawn_shred_arb(
         max_amount_lamports: lamports(sa.max_amount_sol).max(1),
         cu_limit,
         cooldown_ms: sa.cooldown_ms,
+        max_price_impact: sa.max_price_impact_pct / 100.0,
+        size_safety_margin: sa.size_safety_margin_pct / 100.0,
+        max_profit_fraction: sa.max_profit_fraction_pct / 100.0,
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel(sa.signal_buffer);

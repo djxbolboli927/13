@@ -49,6 +49,15 @@ pub struct ArbParams {
     pub cu_limit: u32,
     /// Per-pool cooldown to avoid firing repeatedly on a burst of shreds.
     pub cooldown_ms: u64,
+    /// Cap the BUY-leg size so its price impact stays under this fraction
+    /// (e.g. 0.01 = 1%). This is what keeps trades tiny on low-liquidity pools.
+    pub max_price_impact: f64,
+    /// Enter slightly below the computed optimum for slippage headroom
+    /// (e.g. 0.03 = 3% smaller).
+    pub size_safety_margin: f64,
+    /// Reject opportunities whose predicted net profit exceeds this fraction of
+    /// the input (e.g. 0.5 = 50%) — always a mispricing on a dead pool.
+    pub max_profit_fraction: f64,
 }
 
 pub struct ShredArbEngine {
@@ -76,6 +85,7 @@ pub struct ShredArbEngine {
     skip_no_pump_state: AtomicU64,
     skip_no_meteora_state: AtomicU64,
     skip_bad_price: AtomicU64,
+    skip_implausible: AtomicU64,
     evaluated: AtomicU64,
     profitable: AtomicU64,
     not_profitable: AtomicU64,
@@ -131,6 +141,7 @@ impl ShredArbEngine {
             skip_no_pump_state: AtomicU64::new(0),
             skip_no_meteora_state: AtomicU64::new(0),
             skip_bad_price: AtomicU64::new(0),
+            skip_implausible: AtomicU64::new(0),
             evaluated: AtomicU64::new(0),
             profitable: AtomicU64::new(0),
             not_profitable: AtomicU64::new(0),
@@ -246,14 +257,32 @@ impl ShredArbEngine {
         };
 
         let required_extra = self.params.tip_lamports + self.params.network_fee_lamports;
-        let (best_x, best_out) = ternary_search_best(
+
+        // Bound the search by the BUY-leg pool's WSOL depth so a low-liquidity
+        // pool is never moved by more than `max_price_impact`. This is what
+        // keeps trade size tiny and precise.
+        let buy_wsol_reserve = match buy_on {
+            BuyOn::Pump => pump_after.quote_reserve,
+            BuyOn::Meteora => meteora.wsol_reserve(token_is_a),
+        };
+        let impact_cap =
+            ((buy_wsol_reserve as f64) * self.params.max_price_impact).floor() as u64;
+        let hi = self
+            .params
+            .max_amount_lamports
+            .min(impact_cap.max(self.params.min_amount_lamports));
+
+        let (opt_x, _) = ternary_search_best(
             self.params.min_amount_lamports,
-            self.params.max_amount_lamports,
+            hi,
             required_extra,
             &eval,
         );
 
-        let best_out = match best_out {
+        // Enter slightly below the optimum for slippage headroom.
+        let best_x = (((opt_x as f64) * (1.0 - self.params.size_safety_margin)) as u64)
+            .max(self.params.min_amount_lamports);
+        let best_out = match eval(best_x) {
             Some(o) => o,
             None => {
                 self.not_profitable.fetch_add(1, Ordering::Relaxed);
@@ -265,8 +294,19 @@ impl ShredArbEngine {
             self.not_profitable.fetch_add(1, Ordering::Relaxed);
             return; // not profitable after fixed costs
         }
-        self.profitable.fetch_add(1, Ordering::Relaxed);
         let net = best_out - floor;
+
+        // Plausibility guard: a real cross-pool gap is small. A predicted net
+        // above `max_profit_fraction` of the input is always a dead-pool
+        // mispricing — refuse to send garbage.
+        if net as f64 > best_x as f64 * self.params.max_profit_fraction {
+            self.skip_implausible.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                pool = %sig.pool, input = best_x, net, "skip implausible profit (mispriced pool)"
+            );
+            return;
+        }
+        self.profitable.fetch_add(1, Ordering::Relaxed);
 
         let (buy_kind, sell_kind) = match buy_on {
             BuyOn::Pump => (DexKind::PumpFunAmm, DexKind::MeteoraDammV2),
@@ -438,7 +478,7 @@ impl ShredArbEngine {
                 eprintln!(
                     "\n[shred-arb 30s] watching_pump_pools={} subscribed_cache={} pool_updates={} (Δ)\n\
                      SHRED   : entriesΔ={} txnsΔ={} pumpfun_txnsΔ={} matched_our_poolsΔ={} unresolved={} signals_sent={} signals_dropped={}\n\
-                     ENGINE  : signals_recv={} evaluatedΔ={} | skip[min_trig={} no_pair={} cooldown={} no_pump_state={} no_meteora_state={} bad_price={}]\n\
+                     ENGINE  : signals_recv={} evaluatedΔ={} | skip[min_trig={} no_pair={} cooldown={} no_pump_state={} no_meteora_state={} bad_price={} implausible={}]\n\
                      RESULT  : profitable={} not_profitable={} sent={} | pool_slot={}",
                     m.watched_pools.load(Ordering::Relaxed),
                     self.pool_state.cache_size(),
@@ -458,6 +498,7 @@ impl ShredArbEngine {
                     self.skip_no_pump_state.load(Ordering::Relaxed),
                     self.skip_no_meteora_state.load(Ordering::Relaxed),
                     self.skip_bad_price.load(Ordering::Relaxed),
+                    self.skip_implausible.load(Ordering::Relaxed),
                     self.profitable.load(Ordering::Relaxed),
                     self.not_profitable.load(Ordering::Relaxed),
                     self.sent.load(Ordering::Relaxed),

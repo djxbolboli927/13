@@ -108,6 +108,17 @@ pub struct ShredArbConfig {
     /// Bounded signal channel capacity.
     #[serde(default = "default_signal_buffer")]
     pub signal_buffer: usize,
+    /// Cap the buy-leg price impact (percent). Keeps trade size tiny on
+    /// low-liquidity pools. Default 1%.
+    #[serde(default = "default_max_price_impact_pct")]
+    pub max_price_impact_pct: f64,
+    /// Enter this percent below the computed optimum for slippage headroom.
+    #[serde(default = "default_size_safety_margin_pct")]
+    pub size_safety_margin_pct: f64,
+    /// Reject opportunities whose predicted net exceeds this percent of the
+    /// input — a dead-pool mispricing. Default 50%.
+    #[serde(default = "default_max_profit_fraction_pct")]
+    pub max_profit_fraction_pct: f64,
 }
 
 impl Default for ShredArbConfig {
@@ -134,8 +145,21 @@ impl Default for ShredArbConfig {
             max_amount_sol: default_max_amount_sol(),
             cooldown_ms: default_cooldown_ms(),
             signal_buffer: default_signal_buffer(),
+            max_price_impact_pct: default_max_price_impact_pct(),
+            size_safety_margin_pct: default_size_safety_margin_pct(),
+            max_profit_fraction_pct: default_max_profit_fraction_pct(),
         }
     }
+}
+
+fn default_max_price_impact_pct() -> f64 {
+    1.0
+}
+fn default_size_safety_margin_pct() -> f64 {
+    3.0
+}
+fn default_max_profit_fraction_pct() -> f64 {
+    50.0
 }
 
 fn default_shredstream_endpoint() -> String {

@@ -127,6 +127,26 @@ impl MeteoraPool {
         }
     }
 
+    /// Current WSOL reserve held in the pool, used to bound trade size so we
+    /// never try to move a low-liquidity pool by more than a small fraction.
+    /// `token_is_a` says which side the token sits on (WSOL is the other side).
+    pub fn wsol_reserve(&self, token_is_a: bool) -> u64 {
+        let l = self.liquidity;
+        let sqrt = self.sqrt_price;
+        let out = if token_is_a {
+            // WSOL is token B: reserve_B = L·(√P − √P_min) / 2^64.
+            mul_div_floor(l, sqrt.saturating_sub(self.sqrt_min_price), Q64)
+        } else {
+            // WSOL is token A: reserve_A = L·2^64·(√P_max − √P) / (√P·√P_max).
+            let diff = self.sqrt_max_price.saturating_sub(sqrt);
+            match mul_div_floor(l, diff, sqrt) {
+                Some(inner) => mul_div_floor(inner, Q64, self.sqrt_max_price),
+                None => None,
+            }
+        };
+        out.unwrap_or(0).min(u64::MAX as u128) as u64
+    }
+
     /// Convenience: buy the token with WSOL. Returns token amount out.
     /// `token_is_a` maps the WSOL-in leg to the correct swap direction.
     pub fn buy_token_with_wsol(&self, wsol_in: u64, token_is_a: bool) -> Option<u64> {
