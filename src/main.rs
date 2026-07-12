@@ -339,6 +339,7 @@ fn spawn_shred_arb(
         max_price_impact: sa.max_price_impact_pct / 100.0,
         size_safety_margin: sa.size_safety_margin_pct / 100.0,
         max_profit_fraction: sa.max_profit_fraction_pct / 100.0,
+        force_send_test: sa.force_send_test,
     };
 
     // Load pools and run the strategy in a background task that RETRIES the

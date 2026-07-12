@@ -58,6 +58,12 @@ pub struct ArbParams {
     /// Reject opportunities whose predicted net profit exceeds this fraction of
     /// the input (e.g. 0.5 = 50%) — always a mispricing on a dead pool.
     pub max_profit_fraction: f64,
+    /// TEST MODE: gate and on-chain floor become `input + 1` instead of
+    /// `input + tip + fee`. Sends whenever predicted output exceeds input by a
+    /// single lamport — used only to verify the send path actually fires and
+    /// lands. The tip (1600) and network fee (5000) still apply to the tx, so
+    /// these trades are expected to lose the fee; do not run in production.
+    pub force_send_test: bool,
 }
 
 pub struct ShredArbEngine {
@@ -260,7 +266,15 @@ impl ShredArbEngine {
             }
         };
 
-        let required_extra = self.params.tip_lamports + self.params.network_fee_lamports;
+        // Normal: require output to cover input + tip + fee. TEST MODE: require
+        // only input + 1 lamport, so any nominally-positive trade is sent (to
+        // verify the send path lands). This same value becomes the on-chain
+        // floor passed to merge_quotes, so the tx's min-out is input + 1.
+        let required_extra = if self.params.force_send_test {
+            1
+        } else {
+            self.params.tip_lamports + self.params.network_fee_lamports
+        };
 
         // Ceiling on trade size: never add more WSOL than a fraction of the
         // BUY pool's current WSOL reserve (keeps the swap in a valid range and

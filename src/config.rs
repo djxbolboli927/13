@@ -119,6 +119,10 @@ pub struct ShredArbConfig {
     /// input — a dead-pool mispricing. Default 50%.
     #[serde(default = "default_max_profit_fraction_pct")]
     pub max_profit_fraction_pct: f64,
+    /// TEST MODE: gate + on-chain floor become input+1 lamport (send whenever
+    /// output > input, ignoring profit). Tip/fee still apply. Default false.
+    #[serde(default)]
+    pub force_send_test: bool,
 }
 
 impl Default for ShredArbConfig {
@@ -148,6 +152,7 @@ impl Default for ShredArbConfig {
             max_price_impact_pct: default_max_price_impact_pct(),
             size_safety_margin_pct: default_size_safety_margin_pct(),
             max_profit_fraction_pct: default_max_profit_fraction_pct(),
+            force_send_test: false,
         }
     }
 }
