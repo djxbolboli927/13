@@ -142,7 +142,7 @@ proxy_extra_args = []
 pool_state_endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
 pool_state_x_token = "cba491e2cd18e339c6517a51d4d497737cb04edd08d8915fc872c8a30cd5656a"
 # فایل کش مشترک با متیس — ربات و متیس دقیقاً از یک لیست استخر استفاده می‌کنند.
-mix_cache_path = "/root/g/metis/mix.json"
+mix_cache_path = "/root/g/metis/1/mix.json"
 # کیپر whitelist‌شده‌ی ShredStream (توسط پروکسی استفاده می‌شود؛ اینجا برای مرجع).
 shred_keypair = "/root/g/wallet/shred.json"
 # ثابت‌های فاز تست.
