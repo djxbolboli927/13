@@ -174,6 +174,14 @@ impl PoolStateCache {
         Some(p)
     }
 
+    /// Raw `liquidity` field of a Meteora pool (no validity gating). `Some(0)`
+    /// means the pool has been fully drained (rug) — used by the rug monitor,
+    /// which must distinguish "drained" from "not yet cached".
+    pub fn meteora_raw_liquidity(&self, pool: &Pubkey) -> Option<u128> {
+        let entry = self.inner.get(pool)?;
+        read_u128_le(entry.value(), MET_OFF_LIQUIDITY)
+    }
+
     /// SPL token amount of a vault account.
     pub fn spl_amount(&self, vault: &Pubkey) -> Option<u64> {
         let entry = self.inner.get(vault)?;

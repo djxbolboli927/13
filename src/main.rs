@@ -9,6 +9,8 @@ mod config;
 mod dex_accounts;
 #[allow(dead_code)]
 mod dex_ids;
+#[allow(dead_code)]
+mod discovery;
 mod jito;
 #[allow(dead_code)]
 mod jito_grpc;
@@ -479,9 +481,29 @@ fn spawn_shred_arb(
                 }
             });
         }
-        // `pool_manager` is retained for the discovery pipeline (Phase 3), which
-        // will call `add_pair`/`remove_pair` at runtime.
-        let _pool_manager = pool_manager;
+        // Rug monitor: drop pools whose liquidity has been pulled and close
+        // their ATAs. Confirm over 3 consecutive sweeps to avoid false removals.
+        pool_manager
+            .clone()
+            .spawn_rug_monitor(std::time::Duration::from_secs(2), 3);
+
+        // Auto-discovery: poll public APIs for new shared Pump/Meteora pools and
+        // add them at runtime via the pool manager.
+        if sa.discovery_enabled {
+            let disc = discovery::Discovery::new(
+                discovery::DiscoveryConfig {
+                    interval: std::time::Duration::from_secs(
+                        sa.discovery_interval_secs.max(1),
+                    ),
+                    new_pools_url: sa.discovery_new_pools_url.clone(),
+                    token_pairs_url: sa.discovery_token_pairs_url.clone(),
+                },
+                pool_manager.clone(),
+                rpc_client.clone(),
+            );
+            disc.spawn();
+        }
+        drop(pool_manager);
 
         let user_pubkey = trading_keypair.pubkey().to_string();
         let engine = Arc::new(shred_arb::ShredArbEngine::new(

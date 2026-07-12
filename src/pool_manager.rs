@@ -22,6 +22,7 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::ata;
@@ -135,6 +136,49 @@ impl PoolManager {
         // 5. Register with the engine.
         self.registry.insert(pair.pump.pool, pair);
         Ok(())
+    }
+
+    /// Periodically sweep tracked pools and tear down any that have been
+    /// drained (rug): Meteora `liquidity == 0`, or a Pump vault emptied. A pool
+    /// must read as drained on `confirm_ticks` consecutive sweeps before we act,
+    /// so a transient zero/garbage read never triggers a false removal.
+    pub fn spawn_rug_monitor(self: Arc<Self>, interval: Duration, confirm_ticks: u32) {
+        tokio::spawn(async move {
+            let mut strikes: std::collections::HashMap<Pubkey, u32> =
+                std::collections::HashMap::new();
+            loop {
+                tokio::time::sleep(interval).await;
+                let mut drained: Vec<Pubkey> = Vec::new();
+                for entry in self.registry.iter() {
+                    let pair = entry.value();
+                    if self.is_drained(pair) {
+                        let c = strikes.entry(pair.pump.pool).or_insert(0);
+                        *c += 1;
+                        if *c >= confirm_ticks {
+                            drained.push(pair.pump.pool);
+                        }
+                    } else {
+                        strikes.remove(&pair.pump.pool);
+                    }
+                }
+                for pool in drained {
+                    strikes.remove(&pool);
+                    self.remove_pair(&pool);
+                }
+            }
+        });
+    }
+
+    /// True if either leg of the pair reads as fully drained. Requires the state
+    /// to be present in the cache (a missing read is "unknown", not drained).
+    fn is_drained(&self, pair: &ArbPair) -> bool {
+        let meteora_dead = matches!(
+            self.pool_state.meteora_raw_liquidity(&pair.meteora.pool),
+            Some(0)
+        );
+        let pump_dead = matches!(self.pool_state.spl_amount(&pair.pump.token_vault()), Some(0))
+            || matches!(self.pool_state.spl_amount(&pair.pump.wsol_vault()), Some(0));
+        meteora_dead || pump_dead
     }
 
     /// Tear down a rugged/dead pool: stop trading it, unwatch it, reclaim rent.

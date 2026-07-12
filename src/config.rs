@@ -123,6 +123,20 @@ pub struct ShredArbConfig {
     /// output > input, ignoring profit). Tip/fee still apply. Default false.
     #[serde(default)]
     pub force_send_test: bool,
+    /// Auto-discover new shared Pump.fun/Meteora pools via public APIs and add
+    /// them to the strategy at runtime. Default true.
+    #[serde(default = "default_true")]
+    pub discovery_enabled: bool,
+    /// Discovery poll interval (seconds). Latency-tolerant — arb, not sniper.
+    #[serde(default = "default_discovery_interval")]
+    pub discovery_interval_secs: u64,
+    /// GeckoTerminal "new pools" feed (the new-token source).
+    #[serde(default = "default_gecko_new_pools_url")]
+    pub discovery_new_pools_url: String,
+    /// DexScreener token→pairs endpoint (the cross-DEX resolver); `{mint}` is
+    /// substituted with the token mint.
+    #[serde(default = "default_dexscreener_token_url")]
+    pub discovery_token_pairs_url: String,
 }
 
 impl Default for ShredArbConfig {
@@ -153,8 +167,22 @@ impl Default for ShredArbConfig {
             size_safety_margin_pct: default_size_safety_margin_pct(),
             max_profit_fraction_pct: default_max_profit_fraction_pct(),
             force_send_test: false,
+            discovery_enabled: true,
+            discovery_interval_secs: default_discovery_interval(),
+            discovery_new_pools_url: default_gecko_new_pools_url(),
+            discovery_token_pairs_url: default_dexscreener_token_url(),
         }
     }
+}
+
+fn default_discovery_interval() -> u64 {
+    5
+}
+fn default_gecko_new_pools_url() -> String {
+    "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1".to_string()
+}
+fn default_dexscreener_token_url() -> String {
+    "https://api.dexscreener.com/latest/dex/tokens/{mint}".to_string()
 }
 
 fn default_max_price_impact_pct() -> f64 {
