@@ -14,7 +14,6 @@
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::signature::Keypair;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -78,8 +77,9 @@ pub struct ShredArbEngine {
     pub jito_grpc_limiter: Option<Arc<Mutex<RateLimiter>>>,
     pub user_pubkey: String,
     pub pool_state: PoolStateCache,
-    /// Keyed by Pump.fun pool pubkey (what the signal carries).
-    pub pairs: HashMap<solana_sdk::pubkey::Pubkey, ArbPair>,
+    /// Keyed by Pump.fun pool pubkey (what the signal carries). Shared, mutable
+    /// registry so pools can be added/removed at runtime.
+    pub registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, ArbPair>>,
     pub params: ArbParams,
     pub shred_metrics: Arc<crate::shred_stream::ShredMetrics>,
     last_fired: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
@@ -122,11 +122,10 @@ impl ShredArbEngine {
         jito_grpc_limiter: Option<Arc<Mutex<RateLimiter>>>,
         user_pubkey: String,
         pool_state: PoolStateCache,
-        pairs: Vec<ArbPair>,
+        registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, ArbPair>>,
         params: ArbParams,
         shred_metrics: Arc<crate::shred_stream::ShredMetrics>,
     ) -> Self {
-        let map = pairs.into_iter().map(|p| (p.pump.pool, p)).collect();
         Self {
             metis,
             blockhash_cache,
@@ -139,7 +138,7 @@ impl ShredArbEngine {
             jito_grpc_limiter,
             user_pubkey,
             pool_state,
-            pairs: map,
+            registry,
             params,
             shred_metrics,
             last_fired: dashmap::DashMap::new(),
@@ -161,7 +160,7 @@ impl ShredArbEngine {
 
     /// Consume signals forever.
     pub async fn run(self: Arc<Self>, mut rx: mpsc::Receiver<PumpSwapSignal>) {
-        info!(pairs = self.pairs.len(), "shred-arb engine running");
+        info!(pairs = self.registry.len(), "shred-arb engine running");
         while let Some(sig) = rx.recv().await {
             let me = self.clone();
             tokio::spawn(async move {
@@ -176,7 +175,7 @@ impl ShredArbEngine {
             self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let pair = match self.pairs.get(&sig.pool) {
+        let pair = match self.registry.get(&sig.pool) {
             Some(p) => p.clone(),
             None => {
                 self.skip_no_pair.fetch_add(1, Ordering::Relaxed);
@@ -576,10 +575,11 @@ impl ShredArbEngine {
                 // Decoded-state snapshot for calibration & diagnosis. Always
                 // printed so a missing side is visible (compare the prices
                 // against a live Metis quote for the same pool/size).
-                if self.pairs.is_empty() {
-                    eprintln!("  SNAPSHOT: no pairs loaded from mix.json — nothing to trade!");
+                if self.registry.is_empty() {
+                    eprintln!("  SNAPSHOT: no pairs registered yet — waiting for discovery/mix.json");
                 }
-                for pair in self.pairs.values().take(3) {
+                for entry in self.registry.iter().take(3) {
+                    let pair = entry.value();
                     let met = self
                         .pool_state
                         .meteora_pool(&pair.meteora.pool, fallback_fee);

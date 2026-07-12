@@ -2,6 +2,8 @@
 mod account_cache;
 mod alt_cache;
 mod arbitrage;
+#[allow(dead_code)]
+mod ata;
 mod blockhash_cache;
 mod config;
 mod dex_accounts;
@@ -17,6 +19,8 @@ mod metis;
 #[allow(dead_code)]
 mod meteora_math;
 mod metrics;
+#[allow(dead_code)]
+mod pool_manager;
 #[allow(dead_code)]
 mod pool_registry;
 #[allow(dead_code)]
@@ -437,7 +441,47 @@ fn spawn_shred_arb(
             alt_map,
         ));
         let shred_metrics = consumer.metrics.clone();
-        consumer.spawn(tx);
+        consumer.clone().spawn(tx);
+
+        // Shared, mutable pool registry (seeded from mix.json; discovery adds more).
+        let registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, pool_registry::ArbPair>> =
+            Arc::new(dashmap::DashMap::new());
+        for p in pairs {
+            registry.insert(p.pump.pool, p);
+        }
+
+        // Automatic pool manager: add-market to Metis, extend the gRPC/shred
+        // subscriptions, and manage ATAs — all at runtime, no restart. It holds
+        // clones so the engine can still own its handles below.
+        let pool_manager = Arc::new(pool_manager::PoolManager::new(
+            registry.clone(),
+            pool_state.clone(),
+            consumer.clone(),
+            metis.clone(),
+            rpc_client.clone(),
+            trading_keypair.clone(),
+        ));
+
+        // Ensure ATAs exist for the initial mix.json tokens (background so we
+        // don't block strategy startup on RPC round-trips).
+        {
+            let rpc = rpc_client.clone();
+            let kp = trading_keypair.clone();
+            let initial: Vec<solana_sdk::pubkey::Pubkey> = registry
+                .iter()
+                .map(|e| e.value().token_mint)
+                .collect();
+            tokio::spawn(async move {
+                for mint in initial {
+                    if let Err(e) = ata::ensure_ata(&rpc, &kp, &mint) {
+                        tracing::warn!(token = %mint, error = %e, "initial ensure_ata failed");
+                    }
+                }
+            });
+        }
+        // `pool_manager` is retained for the discovery pipeline (Phase 3), which
+        // will call `add_pair`/`remove_pair` at runtime.
+        let _pool_manager = pool_manager;
 
         let user_pubkey = trading_keypair.pubkey().to_string();
         let engine = Arc::new(shred_arb::ShredArbEngine::new(
@@ -452,7 +496,7 @@ fn spawn_shred_arb(
             jito_grpc_limiter,
             user_pubkey,
             pool_state,
-            pairs,
+            registry,
             params,
             shred_metrics,
         ));

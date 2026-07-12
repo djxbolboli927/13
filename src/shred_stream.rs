@@ -57,11 +57,12 @@ pub struct ShredMetrics {
 
 pub struct ShredConsumer {
     endpoint: String,
-    /// Pool pubkeys we care about (Pump.fun side of each arb pair).
-    target_pools: HashSet<Pubkey>,
+    /// Pool pubkeys we care about (Pump.fun side of each arb pair). Mutable at
+    /// runtime so newly-discovered pools can be added without a restart.
+    target_pools: std::sync::RwLock<HashSet<Pubkey>>,
     /// Preloaded, UNFILTERED address-lookup-table contents for our pools, so we
     /// can resolve ALT-provided accounts without an RPC call on the hot path.
-    alt_map: HashMap<Pubkey, Vec<Pubkey>>,
+    alt_map: std::sync::RwLock<HashMap<Pubkey, Vec<Pubkey>>>,
     pumpfun: Pubkey,
     pub metrics: Arc<ShredMetrics>,
 }
@@ -78,10 +79,34 @@ impl ShredConsumer {
             .store(target_pools.len() as u64, Ordering::Relaxed);
         Self {
             endpoint,
-            target_pools,
-            alt_map,
+            target_pools: std::sync::RwLock::new(target_pools),
+            alt_map: std::sync::RwLock::new(alt_map),
             pumpfun: pumpfun_program(),
             metrics,
+        }
+    }
+
+    /// Add a Pump.fun pool to the watch set at runtime (and optionally its ALT
+    /// contents for account resolution). Takes effect on the next shred.
+    pub fn add_target(&self, pool: Pubkey, alt: Option<(Pubkey, Vec<Pubkey>)>) {
+        let mut set = self.target_pools.write().unwrap();
+        if set.insert(pool) {
+            self.metrics
+                .watched_pools
+                .store(set.len() as u64, Ordering::Relaxed);
+        }
+        if let Some((alt_key, addrs)) = alt {
+            self.alt_map.write().unwrap().insert(alt_key, addrs);
+        }
+    }
+
+    /// Remove a pool from the watch set (dead/rugged pool).
+    pub fn remove_target(&self, pool: &Pubkey) {
+        let mut set = self.target_pools.write().unwrap();
+        if set.remove(pool) {
+            self.metrics
+                .watched_pools
+                .store(set.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -175,7 +200,7 @@ impl ShredConsumer {
                 self.metrics.unresolved_pool.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if !self.target_pools.contains(&pool) {
+            if !self.target_pools.read().unwrap().contains(&pool) {
                 continue;
             }
 
@@ -203,8 +228,9 @@ impl ShredConsumer {
         if let Some(lookups) = msg.address_table_lookups() {
             let mut writable = Vec::new();
             let mut readonly = Vec::new();
+            let alt_map = self.alt_map.read().unwrap();
             for lookup in lookups {
-                let alt = self.alt_map.get(&lookup.account_key);
+                let alt = alt_map.get(&lookup.account_key);
                 for &i in &lookup.writable_indexes {
                     writable.push(
                         alt.and_then(|a| a.get(i as usize)).copied().unwrap_or_default(),

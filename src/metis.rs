@@ -167,6 +167,47 @@ impl MetisClient {
         Ok(quote)
     }
 
+    /// Hot-add a market/pool to the running Metis instance (no restart).
+    /// Requires Metis started with `--enable-add-market`. Metis fetches the
+    /// pool's accounts itself, so only address + owner (program id) + optional
+    /// ALT are needed. Idempotent enough to call for pools already present.
+    pub async fn add_market(
+        &self,
+        address: &str,
+        owner: &str,
+        address_lookup_table_address: Option<&str>,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AddMarketRequest<'a> {
+            address: &'a str,
+            owner: &'a str,
+            address_lookup_table_address: Option<&'a str>,
+        }
+        let url = format!("{}/add-market", self.base_url);
+        let body = AddMarketRequest {
+            address,
+            owner,
+            address_lookup_table_address,
+        };
+        // Metis may do RPC fetches to load the market, so allow more time than
+        // the tight quote timeout.
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .context("add-market request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("add-market failed: {} -- {}", status, text);
+        }
+        Ok(())
+    }
+
     /// Get a quote FORCED onto a single venue via the Metis `dexes=` filter.
     ///
     /// Used by the ShredStream arb strategy: each leg is locked to a specific

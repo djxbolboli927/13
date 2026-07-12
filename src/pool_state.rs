@@ -52,6 +52,10 @@ pub struct PoolStateCache {
     slot: Arc<AtomicU64>,
     /// Total account updates received (for diagnostics).
     updates: Arc<AtomicU64>,
+    /// The full set of accounts we currently subscribe to. Adding to this set
+    /// and pinging `change` re-sends the (overwriting) SubscribeRequest live.
+    accounts: Arc<std::sync::Mutex<Vec<Pubkey>>>,
+    change: Arc<tokio::sync::Notify>,
 }
 
 fn read_u128_le(data: &[u8], off: usize) -> Option<u128> {
@@ -70,7 +74,29 @@ impl PoolStateCache {
             inner: Arc::new(DashMap::with_capacity(256)),
             slot: Arc::new(AtomicU64::new(0)),
             updates: Arc::new(AtomicU64::new(0)),
+            accounts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            change: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Add accounts to the live subscription at runtime. Extends the tracked
+    /// set (dedup) and signals the stream task to re-send the full filter — no
+    /// reconnect. Also seeds their state once via RPC so they're usable
+    /// immediately (Yellowstone only pushes on change).
+    pub fn add_accounts(&self, rpc: &RpcClient, new: &[Pubkey]) {
+        {
+            let mut set = self.accounts.lock().unwrap();
+            let before = set.len();
+            set.extend_from_slice(new);
+            set.sort_unstable();
+            set.dedup();
+            if set.len() == before {
+                return; // nothing new
+            }
+        }
+        self.prefetch(rpc, new);
+        self.change.notify_one();
+        info!(added = new.len(), "pool-state accounts added to live subscription");
     }
 
     pub fn slot(&self) -> u64 {
@@ -161,20 +187,31 @@ impl PoolStateCache {
         Some(PumpPool::new(base, quote))
     }
 
-    /// Spawn the subscription task with reconnect/backoff.
+    /// Spawn the subscription task with reconnect/backoff. `accounts` seeds the
+    /// initial set; more can be added later via [`add_accounts`].
     pub fn spawn_subscription(
         &self,
         endpoint: String,
         x_token: String,
         accounts: Vec<Pubkey>,
     ) {
+        {
+            let mut set = self.accounts.lock().unwrap();
+            *set = accounts;
+            set.sort_unstable();
+            set.dedup();
+        }
         let inner = self.inner.clone();
         let slot = self.slot.clone();
         let updates = self.updates.clone();
+        let acct_set = self.accounts.clone();
+        let change = self.change.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
             loop {
-                match run_stream(&endpoint, &x_token, &accounts, &inner, &slot, &updates).await {
+                match run_stream(&endpoint, &x_token, &acct_set, &change, &inner, &slot, &updates)
+                    .await
+                {
                     Ok(()) => warn!("pool-state stream ended cleanly, reconnecting"),
                     Err(e) => warn!(error = %e, "pool-state stream error, reconnecting"),
                 }
@@ -185,10 +222,29 @@ impl PoolStateCache {
     }
 }
 
+fn build_request(accounts: &[Pubkey]) -> SubscribeRequest {
+    let mut accounts_filter: HashMap<String, SubscribeRequestFilterAccounts> = HashMap::new();
+    accounts_filter.insert(
+        "arb_pools".to_string(),
+        SubscribeRequestFilterAccounts {
+            account: accounts.iter().map(|p| p.to_string()).collect(),
+            owner: vec![],
+            filters: vec![],
+            nonempty_txn_signature: None,
+        },
+    );
+    SubscribeRequest {
+        accounts: accounts_filter,
+        commitment: Some(CommitmentLevel::Processed as i32),
+        ..Default::default()
+    }
+}
+
 async fn run_stream(
     endpoint: &str,
     x_token: &str,
-    accounts: &[Pubkey],
+    acct_set: &Arc<std::sync::Mutex<Vec<Pubkey>>>,
+    change: &Arc<tokio::sync::Notify>,
     cache: &Arc<DashMap<Pubkey, Vec<u8>>>,
     slot: &Arc<AtomicU64>,
     updates: &Arc<AtomicU64>,
@@ -201,32 +257,33 @@ async fn run_stream(
         .await
         .context("pool-state gRPC connect failed")?;
 
-    let mut accounts_filter: HashMap<String, SubscribeRequestFilterAccounts> = HashMap::new();
-    accounts_filter.insert(
-        "arb_pools".to_string(),
-        SubscribeRequestFilterAccounts {
-            account: accounts.iter().map(|p| p.to_string()).collect(),
-            owner: vec![],
-            filters: vec![],
-            nonempty_txn_signature: None,
-        },
-    );
-
-    let request = SubscribeRequest {
-        accounts: accounts_filter,
-        commitment: Some(CommitmentLevel::Processed as i32),
-        ..Default::default()
-    };
+    let request = build_request(&acct_set.lock().unwrap().clone());
 
     let (mut tx, mut stream) = client
         .subscribe_with_request(Some(request))
         .await
         .context("pool-state gRPC subscribe failed")?;
 
-    info!(accounts = accounts.len(), "pool-state subscription active");
+    info!(
+        accounts = acct_set.lock().unwrap().len(),
+        "pool-state subscription active"
+    );
 
-    while let Some(msg) = stream.next().await {
-        let msg = msg.context("pool-state stream yielded error")?;
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = change.notified() => {
+                // Account set changed — re-send the full (overwriting) filter.
+                let req = build_request(&acct_set.lock().unwrap().clone());
+                tx.send(req).await.context("pool-state re-subscribe send failed")?;
+                info!(accounts = acct_set.lock().unwrap().len(), "pool-state re-subscribed");
+                continue;
+            }
+            m = stream.next() => match m {
+                Some(m) => m.context("pool-state stream yielded error")?,
+                None => return Ok(()),
+            },
+        };
         match msg.update_oneof {
             Some(UpdateOneof::Account(a)) => {
                 slot.store(a.slot, Ordering::Relaxed);
@@ -248,5 +305,4 @@ async fn run_stream(
             _ => {}
         }
     }
-    Ok(())
 }
