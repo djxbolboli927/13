@@ -342,6 +342,26 @@ fn spawn_shred_arb(
         force_send_test: sa.force_send_test,
     };
 
+    // ── Build self-test ──────────────────────────────────────────────────────
+    // Runs the exact Meteora math on real pool numbers seen in the logs. A fresh
+    // binary MUST print wsol_reserve=3762681 and swap_buy_1000=Some(31617697).
+    // If it prints u64::MAX / None, you are running a STALE binary (rebuild with
+    // `cargo clean && cargo build --release`).
+    {
+        let t = meteora_math::MeteoraPool {
+            sqrt_price: 103_676_349_798_172_274,
+            liquidity: 12_349_724_641_806_170_141_067_834_768,
+            sqrt_min_price: meteora_math::MIN_SQRT_PRICE,
+            sqrt_max_price: meteora_math::MAX_SQRT_PRICE,
+            fee_numerator: 1_000_000,
+        };
+        let r = t.wsol_reserve(true);
+        let s = t.swap_exact_in(1000, false).map(|o| o.amount_out);
+        eprintln!(
+            "[selftest] meteora wsol_reserve={r} (expect 3762681) swap_buy_1000={s:?} (expect Some(31617697))"
+        );
+    }
+
     // Load pools and run the strategy in a background task that RETRIES the
     // mix.json read — if Metis hasn't written it yet (or is restarting) the bot
     // waits instead of giving up and parking.
