@@ -114,6 +114,11 @@ pub struct ShredArbEngine {
     /// route on Metis (effectively single-sided / rugged) — closes their ATA too.
     pub manager: Option<Arc<crate::pool_manager::PoolManager>>,
     last_fired: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
+    /// Last time we actually SENT a tx for a pool — de-dupes the spam of
+    /// re-firing the same standing gap every 100ms.
+    last_sent: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
+    /// On-chain fate of sent txs.
+    sent_stats: Arc<SentStats>,
     /// Consecutive forced-quote route failures per pool. A pool that can't be
     /// routed on both venues repeatedly is dropped (see `ROUTE_FAIL_LIMIT`).
     route_fail: dashmap::DashMap<solana_sdk::pubkey::Pubkey, u32>,
@@ -147,6 +152,26 @@ enum BuyOn {
     Pump,
     Meteora,
 }
+
+/// On-chain fate of the direct-sent transactions (checked a few seconds after
+/// send via `getSignatureStatuses`).
+#[derive(Default)]
+struct SentStats {
+    /// Landed and succeeded.
+    landed_ok: AtomicU64,
+    /// Landed but the transaction reverted (has an on-chain error).
+    landed_err: AtomicU64,
+    /// Never found on-chain — dropped / never landed.
+    dropped: AtomicU64,
+}
+
+/// Don't re-send the same pool more often than this — a persistent gap fires
+/// every cooldown (100ms), which would otherwise blast dozens of identical txs
+/// before the first even lands.
+const SEND_DEDUP: Duration = Duration::from_millis(1200);
+
+/// Seconds to wait before checking a sent tx's on-chain fate.
+const STATUS_CHECK_DELAY_SECS: u64 = 12;
 
 impl ShredArbEngine {
     #[allow(clippy::too_many_arguments)]
@@ -184,6 +209,8 @@ impl ShredArbEngine {
             shred_metrics,
             manager,
             last_fired: dashmap::DashMap::new(),
+            last_sent: dashmap::DashMap::new(),
+            sent_stats: Arc::new(SentStats::default()),
             route_fail: dashmap::DashMap::new(),
             signals_received: AtomicU64::new(0),
             skip_min_trigger: AtomicU64::new(0),
@@ -518,6 +545,14 @@ impl ShredArbEngine {
         amount_in: u64,
         floor: u64,
     ) {
+        // De-dupe: don't blast the same pool with identical txs while an earlier
+        // one is still unconfirmed (a standing gap fires every ~100ms).
+        if let Some(prev) = self.last_sent.get(&pool) {
+            if prev.elapsed() < SEND_DEDUP {
+                return;
+            }
+        }
+
         let token = pair.token_mint.to_string();
         let buy_label = self.label_for(buy_kind);
         let sell_label = self.label_for(sell_kind);
@@ -644,7 +679,37 @@ impl ShredArbEngine {
             match send_res {
                 Ok(Ok(sig)) => {
                     self.sent.fetch_add(1, Ordering::Relaxed);
+                    self.last_sent.insert(pool, Instant::now());
                     info!(signature = %sig, input = amount_in, "shred-arb tx sent (direct)");
+                    // Check its on-chain fate a few seconds later so we actually
+                    // KNOW what happens to our txs (landed / reverted / dropped).
+                    let rpc3 = self.rpc_client.clone();
+                    let stats = self.sent_stats.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(STATUS_CHECK_DELAY_SECS)).await;
+                        let r = tokio::task::spawn_blocking(move || {
+                            rpc3.get_signature_statuses(&[sig])
+                        })
+                        .await;
+                        match r {
+                            Ok(Ok(resp)) => match resp.value.into_iter().next().flatten() {
+                                Some(st) => {
+                                    if let Some(err) = st.err {
+                                        stats.landed_err.fetch_add(1, Ordering::Relaxed);
+                                        warn!(%sig, error = ?err, "sent tx LANDED but REVERTED");
+                                    } else {
+                                        stats.landed_ok.fetch_add(1, Ordering::Relaxed);
+                                        info!(%sig, "sent tx landed OK ✅");
+                                    }
+                                }
+                                None => {
+                                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+                                    warn!(%sig, "sent tx NOT FOUND on-chain (dropped/never landed)");
+                                }
+                            },
+                            _ => {}
+                        }
+                    });
                 }
                 Ok(Err(e)) => warn!(error = %e, "direct send failed"),
                 Err(e) => warn!(error = %e, "direct send task join failed"),
@@ -793,7 +858,7 @@ impl ShredArbEngine {
                     "\n[shred-arb 30s] watching_pump_pools={} subscribed_cache={} pool_updates={} (Δ)\n\
                      SHRED   : entriesΔ={} txnsΔ={} pumpfun_txnsΔ={} matched_our_poolsΔ={} unresolved={} signals_sent={} signals_dropped={}\n\
                      ENGINE  : signals_recv={} evaluatedΔ={} | skip[min_trig={} no_pair={} cooldown={} no_pump_state={} no_meteora_state={} bad_price={} implausible={}]\n\
-                     RESULT  : profitable={} not_profitable={} (uncrossable={}) sent={} best_net_lamports_window={} | pool_slot={}",
+                     RESULT  : profitable={} not_profitable={} (uncrossable={}) sent={} [landed_ok={} reverted={} dropped={}] best_net_lamports_window={} | pool_slot={}",
                     m.watched_pools.load(Ordering::Relaxed),
                     self.pool_state.cache_size(),
                     updates.saturating_sub(prev_updates),
@@ -817,6 +882,9 @@ impl ShredArbEngine {
                     self.not_profitable.load(Ordering::Relaxed),
                     self.skip_uncrossable.load(Ordering::Relaxed),
                     self.sent.load(Ordering::Relaxed),
+                    self.sent_stats.landed_ok.load(Ordering::Relaxed),
+                    self.sent_stats.landed_err.load(Ordering::Relaxed),
+                    self.sent_stats.dropped.load(Ordering::Relaxed),
                     {
                         let v = self.best_net_seen.swap(i64::MIN, Ordering::Relaxed);
                         if v == i64::MIN { 0 } else { v }
