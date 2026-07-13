@@ -531,7 +531,7 @@ fn spawn_shred_arb(
                     token_pairs_url: sa.discovery_token_pairs_url.clone(),
                     seed_urls: sa.discovery_seed_urls.clone(),
                     bootstrap_max: sa.discovery_bootstrap_max,
-                    max_age_secs: sa.discovery_max_age_hours.saturating_mul(3600),
+                    min_h1_volume_usd: sa.discovery_min_h1_volume_usd,
                     min_pump_wsol_lamports: sa.discovery_min_pump_wsol_lamports,
                 },
                 pool_manager.clone(),

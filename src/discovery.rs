@@ -58,8 +58,8 @@ pub struct DiscoveryConfig {
     pub seed_urls: Vec<String>,
     /// Max tokens resolved during the startup bootstrap.
     pub bootstrap_max: usize,
-    /// Only accept pools created within this many seconds (0 = no age filter).
-    pub max_age_secs: u64,
+    /// Minimum 1-hour USD volume for a candidate pool (0 = no activity filter).
+    pub min_h1_volume_usd: f64,
     /// Minimum Pump-side WSOL reserve (lamports) to add a token (0 = disabled).
     pub min_pump_wsol_lamports: u64,
 }
@@ -81,23 +81,24 @@ fn read_pk(data: &[u8], off: usize) -> Option<Pubkey> {
 
 /// Extract base+quote token mints from a GeckoTerminal-shaped pools response
 /// (`data[].relationships.{base,quote}_token.data.id == "solana_<mint>"`).
-/// WSOL is skipped. `max_age_secs > 0` drops pools whose `pool_created_at` is
-/// older than that (freshness filter); a pool with no timestamp is kept.
-fn extract_mints(body: &Value, max_age_secs: u64) -> Vec<Pubkey> {
-    let now = unix_now();
+/// WSOL is skipped. `min_h1_volume_usd > 0` keeps only pools with at least that
+/// much trading volume in the last hour (the "hot/active" signal); a pool with
+/// no volume field is kept (fail-open).
+fn extract_mints(body: &Value, min_h1_volume_usd: f64) -> Vec<Pubkey> {
     let mut out = Vec::new();
     if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
         for item in arr {
-            // Freshness filter.
-            if max_age_secs > 0 {
-                if let Some(created) = item
+            // Activity filter: 1-hour USD volume.
+            if min_h1_volume_usd > 0.0 {
+                let h1 = item
                     .get("attributes")
-                    .and_then(|a| a.get("pool_created_at"))
+                    .and_then(|a| a.get("volume_usd"))
+                    .and_then(|v| v.get("h1"))
                     .and_then(|s| s.as_str())
-                    .and_then(iso8601_to_unix)
-                {
-                    if now.saturating_sub(created) > max_age_secs as i64 {
-                        continue; // too old
+                    .and_then(|s| s.parse::<f64>().ok());
+                if let Some(v) = h1 {
+                    if v < min_h1_volume_usd {
+                        continue; // too quiet
                     }
                 }
             }
@@ -120,34 +121,6 @@ fn extract_mints(body: &Value, max_age_secs: u64) -> Vec<Pubkey> {
         }
     }
     out
-}
-
-/// Current unix time (seconds).
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// Parse an `YYYY-MM-DDTHH:MM:SSZ` (RFC3339, UTC) timestamp to a unix epoch.
-/// Minimal — ignores fractional seconds and non-Z offsets (treats as UTC).
-fn iso8601_to_unix(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    if b.len() < 19 {
-        return None;
-    }
-    let num = |a: usize, z: usize| -> Option<i64> { s.get(a..z)?.parse().ok() };
-    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
-    let (h, mi, se) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    // days from civil (Howard Hinnant's algorithm).
-    let y = if mo <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    Some(days * 86400 + h * 3600 + mi * 60 + se)
 }
 
 /// Build a `PoolInfo` from a WSOL-paired pool given its mints and vaults.
@@ -268,13 +241,13 @@ impl Discovery {
             .await?
             .json()
             .await?;
-        Ok(extract_mints(&body, self.cfg.max_age_secs))
+        Ok(extract_mints(&body, self.cfg.min_h1_volume_usd))
     }
 
     /// Fetch candidate token mints from a single GeckoTerminal-shaped feed.
     async fn fetch_mints_from(&self, url: &str) -> Result<Vec<Pubkey>> {
         let body: Value = self.http.get(url).send().await?.json().await?;
-        Ok(extract_mints(&body, self.cfg.max_age_secs))
+        Ok(extract_mints(&body, self.cfg.min_h1_volume_usd))
     }
 
     /// One-time startup bootstrap: scan every seed URL for hot/top/trending

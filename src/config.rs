@@ -176,11 +176,12 @@ pub struct ShredArbConfig {
     /// Max tokens to resolve during the startup bootstrap (caps API/RPC work).
     #[serde(default = "default_bootstrap_max")]
     pub discovery_bootstrap_max: usize,
-    /// Only consider pools created within this many hours (freshness filter for
-    /// bootstrap/discovery). We want hot recently-launched tokens, not stale
-    /// ones whose last trade was a day ago. Default 2.
-    #[serde(default = "default_discovery_max_age_hours")]
-    pub discovery_max_age_hours: u64,
+    /// Minimum 1-hour USD volume for a token to be considered "hot" and added.
+    /// This — not pool age — is the real freshness signal: a token actively
+    /// traded in the last hour, even if its pool is older. Filters out the
+    /// stale ones whose last trade was many hours ago. Default 200. 0 disables.
+    #[serde(default = "default_min_h1_volume_usd")]
+    pub discovery_min_h1_volume_usd: f64,
     /// Minimum Pump.fun-side WSOL reserve (lamports) for a token to be added.
     /// Liquidity matters mostly on the Pump side; a pool below this is too thin
     /// (or rugged) to bother with. Default 0.05 SOL. 0 disables the check.
@@ -236,7 +237,7 @@ impl Default for ShredArbConfig {
             discovery_token_pairs_url: default_dexscreener_token_url(),
             discovery_seed_urls: default_discovery_seed_urls(),
             discovery_bootstrap_max: default_bootstrap_max(),
-            discovery_max_age_hours: default_discovery_max_age_hours(),
+            discovery_min_h1_volume_usd: default_min_h1_volume_usd(),
             discovery_min_pump_wsol_lamports: default_min_pump_wsol(),
             pool_idle_close_secs: default_pool_idle_close_secs(),
             min_trigger_reserve_frac: 0.0,
@@ -249,8 +250,8 @@ impl Default for ShredArbConfig {
 fn default_metis_max_accounts() -> u64 {
     32
 }
-fn default_discovery_max_age_hours() -> u64 {
-    2
+fn default_min_h1_volume_usd() -> f64 {
+    200.0
 }
 fn default_min_pump_wsol() -> u64 {
     50_000_000
@@ -261,12 +262,13 @@ fn default_pool_idle_close_secs() -> u64 {
 
 fn default_discovery_seed_urls() -> Vec<String> {
     vec![
-        // Freshly-created pools (newest first) + trending — the age filter then
-        // keeps only recent ones. On-chain owner check keeps Pump/Meteora tokens
-        // present on both venues. These are hot NEW launches, not day-old tokens.
+        // Trending (actively traded RIGHT NOW) first, then newest pools. The
+        // 1-hour-volume filter keeps only hot tokens; the on-chain owner check
+        // keeps those on BOTH Pump.fun and Meteora.
+        "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1".to_string(),
+        "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=2".to_string(),
         "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1".to_string(),
         "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2".to_string(),
-        "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1".to_string(),
     ]
 }
 fn default_bootstrap_max() -> usize {
