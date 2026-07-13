@@ -182,9 +182,9 @@ impl MetisClient {
         struct AddMarketRequest<'a> {
             address: &'a str,
             owner: &'a str,
-            // Omit entirely when we don't have an ALT — some Metis builds reject
-            // a null value here and fail to load the market.
-            #[serde(skip_serializing_if = "Option::is_none")]
+            // Metis REQUIRES this field to be present (it 422s "missing field
+            // addressLookupTableAddress" otherwise), so always send it — null
+            // when we have no ALT.
             address_lookup_table_address: Option<&'a str>,
         }
         let url = format!("{}/add-market", self.base_url);

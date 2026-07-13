@@ -84,6 +84,10 @@ pub struct ShredArbConfig {
     #[serde(default = "default_shred_keypair")]
     #[allow(dead_code)]
     pub shred_keypair: String,
+    /// Compute-unit limit for the 2-hop arb tx. Competitor arb txs use ~178k
+    /// CU, so keep headroom. Default 300000.
+    #[serde(default = "default_shred_cu_limit")]
+    pub cu_limit: u32,
     /// Fixed Jito tip in test phase.
     #[serde(default = "default_tip")]
     pub tip_lamports: u64,
@@ -230,6 +234,7 @@ impl Default for ShredArbConfig {
             pool_state_x_token: String::new(),
             mix_cache_path: default_mix_path(),
             shred_keypair: default_shred_keypair(),
+            cu_limit: default_shred_cu_limit(),
             tip_lamports: default_tip(),
             network_fee_lamports: default_net_fee(),
             meteora_fee_bps: default_meteora_fee_bps(),
@@ -266,7 +271,7 @@ impl Default for ShredArbConfig {
 }
 
 fn default_metis_max_accounts() -> u64 {
-    32
+    50
 }
 fn default_pump_label() -> String {
     "Pump.fun Amm".to_string()
@@ -360,6 +365,9 @@ fn default_shred_keypair() -> String {
 }
 fn default_tip() -> u64 {
     1600
+}
+fn default_shred_cu_limit() -> u32 {
+    300_000
 }
 fn default_net_fee() -> u64 {
     5000

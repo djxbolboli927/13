@@ -145,6 +145,9 @@ pool_state_x_token = "cba491e2cd18e339c6517a51d4d497737cb04edd08d8915fc872c8a30c
 mix_cache_path = "/root/g/metis/1/mix.json"
 # کیپر whitelist‌شده‌ی ShredStream (توسط پروکسی استفاده می‌شود؛ اینجا برای مرجع).
 shred_keypair = "/root/g/wallet/shred.json"
+# سقف CU برای تراکنش دو-هاپ. تراکنش‌های آربیتراژ رقبا ~178k CU مصرف می‌کنند، پس
+# 170k قدیمی کم بود و تراکنش می‌ترکید. 300000 با حاشیه‌ی امن.
+cu_limit = 300000
 # ثابت‌های فاز تست.
 tip_lamports = 1600
 network_fee_lamports = 5000
@@ -227,7 +230,7 @@ metis_meteora_label = "Meteora DAMM v2"
 # maxAccounts که از متیس برای هر لگ می‌خواهیم. کمتر = اکانت کمتر = تراکنش کوچکتر
 # (سولانا سقف 1232 بایت خام دارد). 32 برای دو-هاپ امن است. اگر خطای «too large»
 # دیدید این را کمتر کنید (مثلاً 24).
-metis_max_accounts = 32
+metis_max_accounts = 50
 # اینستراکشن SetLoadedAccountsDataSizeLimit — ربات خودش به تراکنش اضافه می‌کند
 # (نیازی به تغییر در متیس نیست؛ فرستنده این را می‌گذارد، نه متیس). مقدار = سقف
 # بایت داده‌ی اکانت‌های بارگذاری‌شده. پیش‌فرض شبکه 64MB است؛ با گذاشتن یک عدد

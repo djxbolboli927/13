@@ -312,7 +312,10 @@ fn spawn_shred_arb(
     jito_grpc_limiter: Option<Arc<Mutex<RateLimiter>>>,
 ) -> Result<()> {
     let sa = config.shred_arb.clone();
-    let cu_limit = config.performance.cu_limits.first().copied().unwrap_or(200_000);
+    // Dedicated CU limit for the 2-hop Pump↔Meteora tx. Competitor arb txs
+    // consume ~178k CU, so the legacy 170k default would run out — use a
+    // roomier value (configurable).
+    let cu_limit = sa.cu_limit;
 
     // Auto-launch the ShredStream proxy immediately — it does not depend on
     // mix.json, and the entries feed can warm up while we wait for the pools.
@@ -572,6 +575,9 @@ fn spawn_shred_arb(
             Some(pool_manager),
         ));
         engine.clone().spawn_reporter();
+        // Second opportunity source: re-assess all pairs from current state
+        // every 200ms, not only when a Pump shred fires.
+        engine.clone().spawn_state_evaluator(200);
         eprintln!("[shred-arb] strategy started");
         engine.run(rx).await;
     });

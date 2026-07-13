@@ -119,6 +119,10 @@ pub struct ShredArbEngine {
     skip_no_meteora_state: AtomicU64,
     skip_bad_price: AtomicU64,
     skip_implausible: AtomicU64,
+    /// Not profitable because the Meteora swap is INFEASIBLE at any size (range
+    /// exhausted / would cross a bound) — a real price gap that can't be
+    /// crossed. Distinguishes "no route in the pool" from "gap too small".
+    skip_uncrossable: AtomicU64,
     evaluated: AtomicU64,
     profitable: AtomicU64,
     not_profitable: AtomicU64,
@@ -180,6 +184,7 @@ impl ShredArbEngine {
             skip_no_meteora_state: AtomicU64::new(0),
             skip_bad_price: AtomicU64::new(0),
             skip_implausible: AtomicU64::new(0),
+            skip_uncrossable: AtomicU64::new(0),
             evaluated: AtomicU64::new(0),
             profitable: AtomicU64::new(0),
             not_profitable: AtomicU64::new(0),
@@ -199,6 +204,37 @@ impl ShredArbEngine {
         }
     }
 
+    /// Second opportunity source: on a timer, re-assess EVERY tracked pair from
+    /// its CURRENT pool state (no shred trigger). ShredStream only fires on a
+    /// Pump trade, so a gap that opens from a Meteora-side move (or between Pump
+    /// trades) would otherwise be missed until the next Pump swap. This catches
+    /// those. Cheap — the calc is microseconds and only profitable pairs hit
+    /// Metis.
+    pub fn spawn_state_evaluator(self: Arc<Self>, interval_ms: u64) {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms.max(50)));
+            loop {
+                ticker.tick().await;
+                let pairs: Vec<(solana_sdk::pubkey::Pubkey, ArbPair)> = self
+                    .registry
+                    .iter()
+                    .map(|e| (*e.key(), e.value().clone()))
+                    .collect();
+                for (pool, pair) in pairs {
+                    let pump_now = match self
+                        .pool_state
+                        .pump_pool(&pair.pump.token_vault(), &pair.pump.wsol_vault())
+                    {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    // No prediction — price against the current Pump state.
+                    self.assess(&pair, pool, pump_now, pump_now).await;
+                }
+            }
+        });
+    }
+
     async fn handle(&self, sig: PumpSwapSignal) {
         self.signals_received.fetch_add(1, Ordering::Relaxed);
         if sig.quote_amount < self.params.min_trigger_lamports {
@@ -212,16 +248,6 @@ impl ShredArbEngine {
                 return;
             }
         };
-
-        // Cooldown per pool.
-        if let Some(prev) = self.last_fired.get(&sig.pool) {
-            if prev.elapsed() < Duration::from_millis(self.params.cooldown_ms) {
-                self.skip_cooldown.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        }
-
-        self.evaluated.fetch_add(1, Ordering::Relaxed);
 
         // 1) Current Pump reserves → predicted post-trade reserves.
         let pump_now = match self
@@ -246,12 +272,35 @@ impl ShredArbEngine {
                 return;
             }
         }
-
+        // Predicted post-trade Pump reserves — we are ahead of Metis/chain.
         let pump_after = if sig.is_buy {
             pump_now.after_observed_buy(sig.base_amount)
         } else {
             pump_now.after_observed_sell(sig.base_amount)
         };
+        self.assess(&pair, sig.pool, pump_now, pump_after).await;
+    }
+
+    /// Shared assessment core: read Meteora, choose direction, size the trade,
+    /// and execute if it clears the profit gate. `pump_after` is the Pump state
+    /// to price/quote against — predicted post-trade reserves for a shred
+    /// trigger, or the current reserves for a pool-state-update trigger.
+    async fn assess(
+        &self,
+        pair: &ArbPair,
+        pool: solana_sdk::pubkey::Pubkey,
+        pump_now: PumpPool,
+        pump_after: PumpPool,
+    ) {
+        // Cooldown per pool — applies only after a fire, so the state evaluator
+        // can keep re-checking a not-yet-profitable pool every tick.
+        if let Some(prev) = self.last_fired.get(&pool) {
+            if prev.elapsed() < Duration::from_millis(self.params.cooldown_ms) {
+                self.skip_cooldown.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        self.evaluated.fetch_add(1, Ordering::Relaxed);
 
         // 2) Meteora state.
         // config fallback fee is in bps; convert to the 1e9-denominated numerator.
@@ -372,6 +421,12 @@ impl ShredArbEngine {
         );
 
         if opt_net <= 0 {
+            // Diagnose: if even a tiny buy is infeasible, the Meteora side is
+            // range-exhausted (a real gap we simply cannot cross) rather than
+            // the gap being too small.
+            if eval(self.params.min_amount_lamports.max(1_000)).is_none() {
+                self.skip_uncrossable.fetch_add(1, Ordering::Relaxed);
+            }
             self.not_profitable.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -399,7 +454,7 @@ impl ShredArbEngine {
         if net as f64 > best_x as f64 * self.params.max_profit_fraction {
             self.skip_implausible.fetch_add(1, Ordering::Relaxed);
             debug!(
-                pool = %sig.pool, input = best_x, net, "skip implausible profit (mispriced pool)"
+                pool = %pool, input = best_x, net, "skip implausible profit (mispriced pool)"
             );
             return;
         }
@@ -410,7 +465,7 @@ impl ShredArbEngine {
             BuyOn::Meteora => (DexKind::MeteoraDammV2, DexKind::PumpFunAmm),
         };
         info!(
-            pool = %sig.pool,
+            pool = %pool,
             token = %pair.token_mint,
             buy = ?buy_kind_label(buy_kind),
             input = best_x,
@@ -419,13 +474,13 @@ impl ShredArbEngine {
             "shred-arb opportunity"
         );
 
-        self.last_fired.insert(sig.pool, Instant::now());
+        self.last_fired.insert(pool, Instant::now());
         // On-chain minimum output = exactly the input (break-even). The tx then
         // reverts only if the trade would actually lose lamports; any realized
         // price still at/above break-even lands and captures whatever profit
         // exists at execution time.
         let onchain_floor = best_x;
-        self.execute(&pair, sig.pool, buy_kind, sell_kind, best_x, onchain_floor)
+        self.execute(pair, pool, buy_kind, sell_kind, best_x, onchain_floor)
             .await;
     }
 
@@ -714,7 +769,7 @@ impl ShredArbEngine {
                     "\n[shred-arb 30s] watching_pump_pools={} subscribed_cache={} pool_updates={} (Δ)\n\
                      SHRED   : entriesΔ={} txnsΔ={} pumpfun_txnsΔ={} matched_our_poolsΔ={} unresolved={} signals_sent={} signals_dropped={}\n\
                      ENGINE  : signals_recv={} evaluatedΔ={} | skip[min_trig={} no_pair={} cooldown={} no_pump_state={} no_meteora_state={} bad_price={} implausible={}]\n\
-                     RESULT  : profitable={} not_profitable={} sent={} best_net_lamports_window={} | pool_slot={}",
+                     RESULT  : profitable={} not_profitable={} (uncrossable={}) sent={} best_net_lamports_window={} | pool_slot={}",
                     m.watched_pools.load(Ordering::Relaxed),
                     self.pool_state.cache_size(),
                     updates.saturating_sub(prev_updates),
@@ -736,6 +791,7 @@ impl ShredArbEngine {
                     self.skip_implausible.load(Ordering::Relaxed),
                     self.profitable.load(Ordering::Relaxed),
                     self.not_profitable.load(Ordering::Relaxed),
+                    self.skip_uncrossable.load(Ordering::Relaxed),
                     self.sent.load(Ordering::Relaxed),
                     {
                         let v = self.best_net_seen.swap(i64::MIN, Ordering::Relaxed);
