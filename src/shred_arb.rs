@@ -38,6 +38,13 @@ use crate::transaction;
 /// effectively single-sided / rugged (no route on one of the two venues).
 const ROUTE_FAIL_LIMIT: u32 = 5;
 
+/// A raw price gap larger than this is never a real arb — it's a decode
+/// artifact or a one-sided dead pool. Real cross-pool gaps are a few percent.
+const MAX_PLAUSIBLE_GAP_PCT: f64 = 300.0;
+
+/// Log at most 1 in this many `eval-detail` traces (profitable ones always log).
+const EVAL_LOG_SAMPLE: u64 = 50;
+
 /// Tunables sourced from `[shred_arb]` config.
 #[derive(Clone)]
 pub struct ArbParams {
@@ -119,6 +126,8 @@ pub struct ShredArbEngine {
     skip_no_meteora_state: AtomicU64,
     skip_bad_price: AtomicU64,
     skip_implausible: AtomicU64,
+    /// Rolling counter to sample the (very chatty) eval-detail trace.
+    eval_log_counter: AtomicU64,
     /// Not profitable because the Meteora swap is INFEASIBLE at any size (range
     /// exhausted / would cross a bound) — a real price gap that can't be
     /// crossed. Distinguishes "no route in the pool" from "gap too small".
@@ -184,6 +193,7 @@ impl ShredArbEngine {
             skip_no_meteora_state: AtomicU64::new(0),
             skip_bad_price: AtomicU64::new(0),
             skip_implausible: AtomicU64::new(0),
+            eval_log_counter: AtomicU64::new(0),
             skip_uncrossable: AtomicU64::new(0),
             evaluated: AtomicU64::new(0),
             profitable: AtomicU64::new(0),
@@ -213,6 +223,10 @@ impl ShredArbEngine {
     pub fn spawn_state_evaluator(self: Arc<Self>, interval_ms: u64) {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms.max(50)));
+            // Only re-assess a pool whose Meteora pool OR Pump vaults changed in
+            // the last `fresh` window — so we don't burn cycles (and flood logs)
+            // re-simulating dead pools where nothing has happened for hours.
+            let fresh = Duration::from_millis(interval_ms.saturating_mul(4).max(800));
             loop {
                 ticker.tick().await;
                 let pairs: Vec<(solana_sdk::pubkey::Pubkey, ArbPair)> = self
@@ -221,6 +235,18 @@ impl ShredArbEngine {
                     .map(|e| (*e.key(), e.value().clone()))
                     .collect();
                 for (pool, pair) in pairs {
+                    // Freshness: did any relevant account update recently?
+                    let recent = [
+                        pair.meteora.pool,
+                        pair.pump.token_vault(),
+                        pair.pump.wsol_vault(),
+                    ]
+                    .iter()
+                    .filter_map(|a| self.pool_state.last_update_age(a))
+                    .any(|age| age <= fresh);
+                    if !recent {
+                        continue; // nothing changed → no new opportunity
+                    }
                     let pump_now = match self
                         .pool_state
                         .pump_pool(&pair.pump.token_vault(), &pair.pump.wsol_vault())
@@ -229,7 +255,7 @@ impl ShredArbEngine {
                         None => continue,
                     };
                     // No prediction — price against the current Pump state.
-                    self.assess(&pair, pool, pump_now, pump_now).await;
+                    self.assess(&pair, pool, pump_now).await;
                 }
             }
         });
@@ -278,20 +304,14 @@ impl ShredArbEngine {
         } else {
             pump_now.after_observed_sell(sig.base_amount)
         };
-        self.assess(&pair, sig.pool, pump_now, pump_after).await;
+        self.assess(&pair, sig.pool, pump_after).await;
     }
 
     /// Shared assessment core: read Meteora, choose direction, size the trade,
     /// and execute if it clears the profit gate. `pump_after` is the Pump state
     /// to price/quote against — predicted post-trade reserves for a shred
     /// trigger, or the current reserves for a pool-state-update trigger.
-    async fn assess(
-        &self,
-        pair: &ArbPair,
-        pool: solana_sdk::pubkey::Pubkey,
-        pump_now: PumpPool,
-        pump_after: PumpPool,
-    ) {
+    async fn assess(&self, pair: &ArbPair, pool: solana_sdk::pubkey::Pubkey, pump_after: PumpPool) {
         // Cooldown per pool — applies only after a fire, so the state evaluator
         // can keep re-checking a not-yet-profitable pool every tick.
         if let Some(prev) = self.last_fired.get(&pool) {
@@ -374,6 +394,16 @@ impl ShredArbEngine {
             BuyOn::Pump => pump_after.quote_reserve,
             BuyOn::Meteora => meteora.wsol_reserve(token_is_a),
         };
+        // Dead-pool guards — skip empty/broken pools early (they were flooding
+        // the logs and wasting cycles): the BUY side must hold real WSOL depth,
+        // and the price gap must be plausible. A real cross-pool gap is small
+        // (competitors trade ~0.2%); a 100%+ "gap" is a decode artifact or a
+        // one-sided dead pool, never an executable arb.
+        let gap_pct = (pump_price - met_price) / met_price * 100.0;
+        if buy_wsol_reserve < 5_000 || gap_pct.abs() > MAX_PLAUSIBLE_GAP_PCT {
+            self.skip_bad_price.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let liq_ceiling = ((buy_wsol_reserve as f64) * self.params.max_price_impact) as u64;
         let hi = self
             .params
@@ -388,37 +418,31 @@ impl ShredArbEngine {
         self.best_net_seen
             .fetch_max(opt_net.clamp(i64::MIN as i128, i64::MAX as i128) as i64, Ordering::Relaxed);
 
-        // Detailed per-evaluation trace (only a few fire per 30s) so we can see
-        // exactly where the math lands: direction, predicted gap, liquidity, and
-        // net at several candidate sizes (None = swap infeasible at that size).
-        let pump_now_price = if pump_now.base_reserve > 0 {
-            pump_now.quote_reserve as f64 / pump_now.base_reserve as f64
-        } else {
-            0.0
-        };
-        let sample = |x: u64| -> Option<i64> {
-            eval(x).map(|o| o as i64 - x as i64 - required_extra as i64)
-        };
-        info!(
-            token = %pair.token_mint,
-            buy = if buy_on == BuyOn::Pump { "Pump" } else { "Meteora" },
-            gap_pct = (pump_price - met_price) / met_price * 100.0,
-            pump_now_price,
-            pump_after_price = pump_price,
-            met_price,
-            met_sqrt = meteora.sqrt_price,
-            met_liq = meteora.liquidity,
-            met_wsol_depth = meteora.wsol_reserve(token_is_a),
-            buy_wsol_reserve,
-            hi,
-            opt_x,
-            opt_net = opt_net as i64,
-            net_1k = ?sample(1_000),
-            net_10k = ?sample(10_000),
-            net_100k = ?sample(100_000),
-            net_500k = ?sample(500_000),
-            "eval-detail"
-        );
+        // Detailed per-evaluation trace — SAMPLED (1 in EVAL_LOG_SAMPLE) so it
+        // doesn't flood the terminal; profitable evaluations always print.
+        let log_this = opt_net > 0
+            || self.eval_log_counter.fetch_add(1, Ordering::Relaxed) % EVAL_LOG_SAMPLE == 0;
+        if log_this {
+            let sample = |x: u64| -> Option<i64> {
+                eval(x).map(|o| o as i64 - x as i64 - required_extra as i64)
+            };
+            info!(
+                token = %pair.token_mint,
+                buy = if buy_on == BuyOn::Pump { "Pump" } else { "Meteora" },
+                gap_pct,
+                pump_after_price = pump_price,
+                met_price,
+                met_wsol_depth = meteora.wsol_reserve(token_is_a),
+                buy_wsol_reserve,
+                hi,
+                opt_x,
+                opt_net = opt_net as i64,
+                net_1k = ?sample(1_000),
+                net_10k = ?sample(10_000),
+                net_100k = ?sample(100_000),
+                "eval-detail"
+            );
+        }
 
         if opt_net <= 0 {
             // Diagnose: if even a tiny buy is infeasible, the Meteora side is
