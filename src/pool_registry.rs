@@ -124,6 +124,33 @@ fn entry_to_pool(entry: &Value) -> Option<PoolInfo> {
     })
 }
 
+/// Collect EVERY non-WSOL token mint referenced by any pool in `mix.json`
+/// (both Pump.fun and Meteora entries), deduplicated. Used at startup to make
+/// sure the trading wallet has an ATA for each token it might hold — without
+/// any RPC call to discover which token a pool trades (the mints are right
+/// there in each pool's `params`).
+pub fn load_all_token_mints(path: &str) -> Result<Vec<Pubkey>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read mix cache file {path}"))?;
+    let root: Value =
+        serde_json::from_str(&content).with_context(|| format!("invalid JSON in {path}"))?;
+    let mut raw = Vec::new();
+    collect_entries(&root, &mut raw);
+
+    let wsol = wsol_mint();
+    let mut mints = Vec::new();
+    for e in raw {
+        if let Some(p) = entry_to_pool(e) {
+            if p.token_mint != wsol {
+                mints.push(p.token_mint);
+            }
+        }
+    }
+    mints.sort_unstable();
+    mints.dedup();
+    Ok(mints)
+}
+
 /// Load `mix.json` and return the paired Pump.fun / Meteora pools.
 pub fn load_pairs(path: &str) -> Result<Vec<ArbPair>> {
     let content = std::fs::read_to_string(path)

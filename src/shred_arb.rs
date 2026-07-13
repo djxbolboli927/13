@@ -34,10 +34,17 @@ use crate::shred_stream::PumpSwapSignal;
 use crate::tokens::WSOL_MINT;
 use crate::transaction;
 
+/// Consecutive forced-quote route failures after which a pool is dropped as
+/// effectively single-sided / rugged (no route on one of the two venues).
+const ROUTE_FAIL_LIMIT: u32 = 5;
+
 /// Tunables sourced from `[shred_arb]` config.
 #[derive(Clone)]
 pub struct ArbParams {
     pub tip_lamports: u64,
+    /// Retained for the legacy Jito path / reference; profit gating now uses
+    /// `min_net_profit_lamports`.
+    #[allow(dead_code)]
     pub network_fee_lamports: u64,
     pub meteora_fee_bps: u64,
     /// Ignore observed trades whose SOL-side arg is below this (small trades
@@ -57,12 +64,16 @@ pub struct ArbParams {
     /// Reject opportunities whose predicted net profit exceeds this fraction of
     /// the input (e.g. 0.5 = 50%) — always a mispricing on a dead pool.
     pub max_profit_fraction: f64,
-    /// TEST MODE: gate and on-chain floor become `input + 1` instead of
-    /// `input + tip + fee`. Sends whenever predicted output exceeds input by a
-    /// single lamport — used only to verify the send path actually fires and
-    /// lands. The tip (1600) and network fee (5000) still apply to the tx, so
-    /// these trades are expected to lose the fee; do not run in production.
-    pub force_send_test: bool,
+    /// Minimum predicted NET profit (lamports, above the network fee) required
+    /// before we fetch instructions and send. Production default 5000. This is
+    /// the profit GATE; the on-chain minimum output is set separately to exactly
+    /// the input (break-even floor) so any trade that clears the gate at predict
+    /// time still lands on-chain as long as it doesn't lose money.
+    pub min_net_profit_lamports: u64,
+    /// Send directly to the network via RPC instead of Jito bundles.
+    pub direct_send: bool,
+    /// Priority fee (micro-lamports/CU) for direct sends (0 = none).
+    pub direct_priority_fee_microlamports: u64,
 }
 
 pub struct ShredArbEngine {
@@ -82,7 +93,13 @@ pub struct ShredArbEngine {
     pub registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, ArbPair>>,
     pub params: ArbParams,
     pub shred_metrics: Arc<crate::shred_stream::ShredMetrics>,
+    /// Optional pool manager, used to auto-drop pools that consistently fail to
+    /// route on Metis (effectively single-sided / rugged) — closes their ATA too.
+    pub manager: Option<Arc<crate::pool_manager::PoolManager>>,
     last_fired: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
+    /// Consecutive forced-quote route failures per pool. A pool that can't be
+    /// routed on both venues repeatedly is dropped (see `ROUTE_FAIL_LIMIT`).
+    route_fail: dashmap::DashMap<solana_sdk::pubkey::Pubkey, u32>,
     // ── diagnostics ──
     signals_received: AtomicU64,
     skip_min_trigger: AtomicU64,
@@ -125,6 +142,7 @@ impl ShredArbEngine {
         registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, ArbPair>>,
         params: ArbParams,
         shred_metrics: Arc<crate::shred_stream::ShredMetrics>,
+        manager: Option<Arc<crate::pool_manager::PoolManager>>,
     ) -> Self {
         Self {
             metis,
@@ -141,7 +159,9 @@ impl ShredArbEngine {
             registry,
             params,
             shred_metrics,
+            manager,
             last_fired: dashmap::DashMap::new(),
+            route_fail: dashmap::DashMap::new(),
             signals_received: AtomicU64::new(0),
             skip_min_trigger: AtomicU64::new(0),
             skip_no_pair: AtomicU64::new(0),
@@ -265,15 +285,13 @@ impl ShredArbEngine {
             }
         };
 
-        // Normal: require output to cover input + tip + fee. TEST MODE: require
-        // only input + 1 lamport, so any nominally-positive trade is sent (to
-        // verify the send path lands). This same value becomes the on-chain
-        // floor passed to merge_quotes, so the tx's min-out is input + 1.
-        let required_extra = if self.params.force_send_test {
-            1
-        } else {
-            self.params.tip_lamports + self.params.network_fee_lamports
-        };
+        // Profit GATE: the optimizer maximizes `out - x - required_extra`, where
+        // `required_extra` is the minimum profit we insist on (default 5000 =
+        // one network base fee). Direct sends pay only that fee, no Jito tip.
+        // NOTE: this is only the gate — the on-chain minimum output is set to
+        // exactly the input (break-even) at send time, so a trade that clears
+        // the gate at predict time still lands as long as it doesn't lose money.
+        let required_extra = self.params.min_net_profit_lamports;
 
         // Ceiling on trade size: never add more WSOL than a fraction of the
         // BUY pool's current WSOL reserve (keeps the swap in a valid range and
@@ -346,12 +364,12 @@ impl ShredArbEngine {
                 return;
             }
         };
-        let floor = best_x + required_extra;
-        if best_out <= floor {
+        let profit_floor = best_x + required_extra;
+        if best_out <= profit_floor {
             self.not_profitable.fetch_add(1, Ordering::Relaxed);
-            return; // not profitable after fixed costs
+            return; // predicted profit below the minimum gate
         }
-        let net = best_out - floor;
+        let net = best_out - profit_floor;
 
         // Plausibility guard: a real cross-pool gap is small. A predicted net
         // above `max_profit_fraction` of the input is always a dead-pool
@@ -380,12 +398,20 @@ impl ShredArbEngine {
         );
 
         self.last_fired.insert(sig.pool, Instant::now());
-        self.execute(&pair, buy_kind, sell_kind, best_x, floor).await;
+        // On-chain minimum output = exactly the input (break-even). The tx then
+        // reverts only if the trade would actually lose lamports; any realized
+        // price still at/above break-even lands and captures whatever profit
+        // exists at execution time.
+        let onchain_floor = best_x;
+        self.execute(&pair, sig.pool, buy_kind, sell_kind, best_x, onchain_floor)
+            .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
         pair: &ArbPair,
+        pool: solana_sdk::pubkey::Pubkey,
         buy_kind: DexKind,
         sell_kind: DexKind,
         amount_in: u64,
@@ -402,6 +428,7 @@ impl ShredArbEngine {
             Ok(q) => q,
             Err(e) => {
                 warn!(error = %e, "forced buy quote failed");
+                self.note_route_failure(pool);
                 return;
             }
         };
@@ -419,12 +446,15 @@ impl ShredArbEngine {
             Ok(q) => q,
             Err(e) => {
                 warn!(error = %e, "forced sell quote failed");
+                self.note_route_failure(pool);
                 return;
             }
         };
+        // Both legs routed — this pool is genuinely two-sided; clear any strikes.
+        self.note_route_success(pool);
 
-        // Override the on-chain floor to input + tip + fee regardless of what
-        // Metis quoted (our data is ahead of Metis).
+        // Set the on-chain floor to exactly the input (break-even) regardless of
+        // what Metis quoted (our data is ahead of Metis).
         let merged = match MetisClient::merge_quotes(&q1, &q2, floor) {
             Ok(m) => m,
             Err(e) => {
@@ -445,7 +475,65 @@ impl ShredArbEngine {
             }
         };
 
-        // Rate-limit: prefer REST, fall back to gRPC.
+        let recent_blockhash = self.blockhash_cache.get();
+        let keypair = self.trading_keypair.clone();
+        let alt = self.alt_cache.clone();
+        let rpc = self.rpc_client.clone();
+        let cu = self.params.cu_limit;
+
+        // ── Direct-to-RPC send (default): no Jito, no tip, minimal latency ──
+        if self.params.direct_send {
+            let prio = self.params.direct_priority_fee_microlamports;
+            let tx = match tokio::task::spawn_blocking(move || {
+                transaction::build_direct_transaction(
+                    &swap_ixs,
+                    &keypair,
+                    cu,
+                    prio,
+                    recent_blockhash,
+                    &alt,
+                    &rpc,
+                )
+            })
+            .await
+            {
+                Ok(Ok(tx)) => tx,
+                _ => {
+                    warn!("build_direct_transaction failed");
+                    return;
+                }
+            };
+
+            if transaction::account_lock_count(&tx) > 64 {
+                warn!("direct arb tx exceeds 64 account locks, dropping");
+                return;
+            }
+
+            let rpc2 = self.rpc_client.clone();
+            let send_res = tokio::task::spawn_blocking(move || {
+                use solana_client::rpc_config::RpcSendTransactionConfig;
+                rpc2.send_transaction_with_config(
+                    &tx,
+                    RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        max_retries: Some(0),
+                        ..Default::default()
+                    },
+                )
+            })
+            .await;
+            match send_res {
+                Ok(Ok(sig)) => {
+                    self.sent.fetch_add(1, Ordering::Relaxed);
+                    info!(signature = %sig, input = amount_in, "shred-arb tx sent (direct)");
+                }
+                Ok(Err(e)) => warn!(error = %e, "direct send failed"),
+                Err(e) => warn!(error = %e, "direct send task join failed"),
+            }
+            return;
+        }
+
+        // ── Jito bundle path (legacy, direct_send = false) ──
         let use_grpc = if self.jito_limiter.lock().unwrap().try_acquire() {
             false
         } else if self
@@ -460,13 +548,7 @@ impl ShredArbEngine {
             return;
         };
 
-        let recent_blockhash = self.blockhash_cache.get();
-        let keypair = self.trading_keypair.clone();
-        let alt = self.alt_cache.clone();
-        let rpc = self.rpc_client.clone();
         let tip = self.params.tip_lamports;
-        let cu = self.params.cu_limit;
-
         let tx = match tokio::task::spawn_blocking(move || {
             transaction::build_arb_transaction(
                 &swap_ixs,
@@ -507,6 +589,35 @@ impl ShredArbEngine {
                 info!(bundle = %id, input = amount_in, "shred-arb bundle sent");
             }
             Err(e) => warn!(error = %e, "shred-arb bundle send failed"),
+        }
+    }
+
+    /// Record a forced-quote route failure for `pool`. Once a pool accrues
+    /// `ROUTE_FAIL_LIMIT` consecutive failures it is effectively single-sided
+    /// (or rugged) on Metis, so we drop it (and close its ATA) via the manager.
+    fn note_route_failure(&self, pool: solana_sdk::pubkey::Pubkey) {
+        let n = {
+            let mut e = self.route_fail.entry(pool).or_insert(0);
+            *e += 1;
+            *e
+        };
+        if n >= ROUTE_FAIL_LIMIT {
+            self.route_fail.remove(&pool);
+            warn!(%pool, "dropping pool after repeated Metis route failures (single-sided/rugged)");
+            if let Some(mgr) = &self.manager {
+                // close_ata inside remove_pair does blocking RPC — offload it.
+                let mgr = mgr.clone();
+                tokio::task::spawn_blocking(move || mgr.remove_pair(&pool));
+            } else {
+                self.registry.remove(&pool);
+            }
+        }
+    }
+
+    /// Reset the route-failure strike count for `pool` after a successful route.
+    fn note_route_success(&self, pool: solana_sdk::pubkey::Pubkey) {
+        if self.route_fail.contains_key(&pool) {
+            self.route_fail.remove(&pool);
         }
     }
 

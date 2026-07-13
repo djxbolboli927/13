@@ -148,6 +148,79 @@ pub fn build_arb_transaction(
     Ok(tx)
 }
 
+/// Build a versioned transaction for a DIRECT-to-RPC send (no Jito tip):
+///
+/// #1 - Compute Budget: SetComputeUnitLimit
+/// #2 - Compute Budget: SetComputeUnitPrice (only if `priority_fee_microlamports > 0`)
+/// #3 - Jupiter Aggregator: route_v2 (entire circular arb)
+///
+/// Identical to [`build_arb_transaction`] but with NO tip transfer — the fee we
+/// pay is just the network base fee (+ optional priority fee). Faster and
+/// cheaper than a Jito bundle for the freshly-created pools this strategy hits.
+pub fn build_direct_transaction(
+    swap_ixs: &SwapInstructionsResponse,
+    payer: &Keypair,
+    cu_limit: u32,
+    priority_fee_microlamports: u64,
+    recent_blockhash: Hash,
+    alt_cache: &AltCache,
+    rpc_client: &RpcClient,
+) -> Result<VersionedTransaction> {
+    let mut instructions: Vec<Instruction> = Vec::new();
+
+    // #1 -- SetComputeUnitLimit
+    instructions.push(Instruction {
+        program_id: Pubkey::from_str("ComputeBudget111111111111111111111111111111")?,
+        accounts: vec![],
+        data: {
+            let mut data = vec![0x02];
+            data.extend_from_slice(&cu_limit.to_le_bytes());
+            data
+        },
+    });
+
+    // #2 -- SetComputeUnitPrice (priority fee), optional.
+    if priority_fee_microlamports > 0 {
+        instructions.push(Instruction {
+            program_id: Pubkey::from_str("ComputeBudget111111111111111111111111111111")?,
+            accounts: vec![],
+            data: {
+                let mut data = vec![0x03];
+                data.extend_from_slice(&priority_fee_microlamports.to_le_bytes());
+                data
+            },
+        });
+    }
+
+    // #3 -- Single route_v2 for the entire circular swap.
+    instructions.push(to_sdk_instruction(&swap_ixs.swap_instruction)?);
+
+    // Resolve ALTs via cache.
+    let mut alt_addresses: Vec<Pubkey> = Vec::new();
+    for addr in &swap_ixs.address_lookup_table_addresses {
+        let pubkey = Pubkey::from_str(addr)?;
+        if !alt_addresses.contains(&pubkey) {
+            alt_addresses.push(pubkey);
+        }
+    }
+    let mut address_lookup_tables: Vec<AddressLookupTableAccount> = Vec::new();
+    for alt_pubkey in &alt_addresses {
+        address_lookup_tables.push(alt_cache.get_or_fetch(alt_pubkey, rpc_client)?);
+    }
+
+    let message = v0::Message::try_compile(
+        &payer.pubkey(),
+        &instructions,
+        &address_lookup_tables,
+        recent_blockhash,
+    )
+    .context("failed to compile v0 message (direct)")?;
+
+    let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[payer])
+        .context("failed to sign versioned transaction (direct)")?;
+    Ok(tx)
+}
+
 /// Number of distinct accounts the transaction locks.
 ///
 /// Solana enforces MAX_TX_ACCOUNT_LOCKS = 64: the total of static account

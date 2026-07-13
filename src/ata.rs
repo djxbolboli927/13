@@ -16,6 +16,7 @@ use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
+use std::collections::HashSet;
 use tracing::{info, warn};
 
 /// Classic SPL Token program.
@@ -76,6 +77,100 @@ pub fn ensure_ata(rpc: &RpcClient, payer: &Keypair, mint: &Pubkey) -> Result<Pub
         }
     }
     Ok(ata)
+}
+
+/// Startup reconciliation: for every `mint` (excluding `skip`), make sure the
+/// trading wallet has an ATA, creating any that are missing. Existence is
+/// checked in batches via `getMultipleAccounts` (up to 100 per RPC call) so we
+/// stay well within a 10 req/s budget even for large pool sets. The token
+/// program for each mint is read from the mint account's owner (also batched),
+/// so Token-2022 mints are handled correctly.
+pub fn reconcile_atas(
+    rpc: &RpcClient,
+    payer: &Keypair,
+    mints: &[Pubkey],
+    skip: &HashSet<Pubkey>,
+) -> Result<()> {
+    let targets: Vec<Pubkey> = mints
+        .iter()
+        .filter(|m| !skip.contains(m))
+        .copied()
+        .collect();
+    if targets.is_empty() {
+        info!("ATA reconcile: nothing to check (all mints in always-exist set)");
+        return Ok(());
+    }
+
+    // 1. Batch-read each mint account to learn its token program (owner).
+    let mut token_prog: std::collections::HashMap<Pubkey, Pubkey> =
+        std::collections::HashMap::new();
+    for chunk in targets.chunks(100) {
+        match rpc.get_multiple_accounts(chunk) {
+            Ok(accts) => {
+                for (pk, acct) in chunk.iter().zip(accts) {
+                    let owner = acct.map(|a| a.owner).unwrap_or(SPL_TOKEN);
+                    token_prog.insert(*pk, owner);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "ATA reconcile: mint owner batch read failed; assuming SPL Token");
+                for pk in chunk {
+                    token_prog.entry(*pk).or_insert(SPL_TOKEN);
+                }
+            }
+        }
+    }
+
+    // 2. Derive each ATA.
+    let derived: Vec<(Pubkey, Pubkey)> = targets
+        .iter()
+        .map(|mint| {
+            let prog = *token_prog.get(mint).unwrap_or(&SPL_TOKEN);
+            (
+                *mint,
+                get_associated_token_address_with_program_id(&payer.pubkey(), mint, &prog),
+            )
+        })
+        .collect();
+
+    // 3. Batch-check which ATAs already exist; collect the missing mints.
+    let mut missing: Vec<Pubkey> = Vec::new();
+    for chunk in derived.chunks(100) {
+        let atas: Vec<Pubkey> = chunk.iter().map(|(_, ata)| *ata).collect();
+        match rpc.get_multiple_accounts(&atas) {
+            Ok(accts) => {
+                for ((mint, _), acct) in chunk.iter().zip(accts) {
+                    if acct.is_none() {
+                        missing.push(*mint);
+                    }
+                }
+            }
+            Err(e) => {
+                // On a batch failure, fall through to per-mint create (idempotent).
+                warn!(error = %e, "ATA reconcile: existence batch read failed; will create idempotently");
+                for (mint, _) in chunk {
+                    missing.push(*mint);
+                }
+            }
+        }
+    }
+
+    info!(
+        checked = targets.len(),
+        missing = missing.len(),
+        "ATA reconcile: creating missing token ATAs"
+    );
+
+    // 4. Create the missing ATAs (idempotent, one tx each).
+    let mut created = 0usize;
+    for mint in &missing {
+        match ensure_ata(rpc, payer, mint) {
+            Ok(_) => created += 1,
+            Err(e) => warn!(mint = %mint, error = %e, "ATA reconcile: create failed"),
+        }
+    }
+    info!(created, "ATA reconcile complete");
+    Ok(())
 }
 
 /// Close the trading wallet's ATA for `mint`, returning rent to the wallet.

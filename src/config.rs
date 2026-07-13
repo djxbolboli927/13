@@ -119,10 +119,28 @@ pub struct ShredArbConfig {
     /// input — a dead-pool mispricing. Default 50%.
     #[serde(default = "default_max_profit_fraction_pct")]
     pub max_profit_fraction_pct: f64,
-    /// TEST MODE: gate + on-chain floor become input+1 lamport (send whenever
-    /// output > input, ignoring profit). Tip/fee still apply. Default false.
+    /// DEPRECATED (test phase over). Kept so old config.toml files still parse.
     #[serde(default)]
+    #[allow(dead_code)]
     pub force_send_test: bool,
+    /// Minimum predicted NET profit (lamports, above the network fee) an
+    /// opportunity must clear before we fetch instructions and send. Production
+    /// default 5000 (= one network base fee). Below this we don't bother.
+    #[serde(default = "default_min_net_profit")]
+    pub min_net_profit_lamports: u64,
+    /// Send arb transactions DIRECTLY to the network via RPC instead of through
+    /// Jito bundles (Jito adds latency + a tip cost). Default true.
+    #[serde(default = "default_true")]
+    pub direct_send: bool,
+    /// Micro-lamports per compute unit for the priority fee on direct sends
+    /// (0 = no priority fee). Only used when `direct_send = true`.
+    #[serde(default)]
+    pub direct_priority_fee_microlamports: u64,
+    /// Token mints whose ATA is assumed to ALWAYS exist — never checked, never
+    /// created at startup. Put SOL/WSOL/USDC/USDT (and any other permanent
+    /// holdings) here. Edited in config.toml under `[shred_arb]`.
+    #[serde(default = "default_always_exist_mints")]
+    pub always_exist_mints: Vec<String>,
     /// Auto-discover new shared Pump.fun/Meteora pools via public APIs and add
     /// them to the strategy at runtime. Default true.
     #[serde(default = "default_true")]
@@ -167,6 +185,10 @@ impl Default for ShredArbConfig {
             size_safety_margin_pct: default_size_safety_margin_pct(),
             max_profit_fraction_pct: default_max_profit_fraction_pct(),
             force_send_test: false,
+            min_net_profit_lamports: default_min_net_profit(),
+            direct_send: true,
+            direct_priority_fee_microlamports: 0,
+            always_exist_mints: default_always_exist_mints(),
             discovery_enabled: true,
             discovery_interval_secs: default_discovery_interval(),
             discovery_new_pools_url: default_gecko_new_pools_url(),
@@ -177,6 +199,18 @@ impl Default for ShredArbConfig {
 
 fn default_discovery_interval() -> u64 {
     5
+}
+fn default_min_net_profit() -> u64 {
+    5000
+}
+fn default_always_exist_mints() -> Vec<String> {
+    vec![
+        // SOL / Wrapped SOL (same mint), USDC, USDT — permanent holdings whose
+        // ATAs we never need to create.
+        "So11111111111111111111111111111111111111112".to_string(), // WSOL / SOL
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(), // USDC
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".to_string(), // USDT
+    ]
 }
 fn default_gecko_new_pools_url() -> String {
     "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1".to_string()

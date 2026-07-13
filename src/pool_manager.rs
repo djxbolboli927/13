@@ -163,7 +163,10 @@ impl PoolManager {
                 }
                 for pool in drained {
                     strikes.remove(&pool);
-                    self.remove_pair(&pool);
+                    // remove_pair does blocking RPC (close ATA) — offload it so
+                    // the monitor loop isn't stalled on a tokio worker thread.
+                    let me = self.clone();
+                    tokio::task::spawn_blocking(move || me.remove_pair(&pool));
                 }
             }
         });

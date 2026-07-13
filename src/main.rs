@@ -345,7 +345,9 @@ fn spawn_shred_arb(
         max_price_impact: sa.max_price_impact_pct / 100.0,
         size_safety_margin: sa.size_safety_margin_pct / 100.0,
         max_profit_fraction: sa.max_profit_fraction_pct / 100.0,
-        force_send_test: sa.force_send_test,
+        min_net_profit_lamports: sa.min_net_profit_lamports,
+        direct_send: sa.direct_send,
+        direct_priority_fee_microlamports: sa.direct_priority_fee_microlamports,
     };
 
     // ── Build self-test ──────────────────────────────────────────────────────
@@ -464,20 +466,28 @@ fn spawn_shred_arb(
             trading_keypair.clone(),
         ));
 
-        // Ensure ATAs exist for the initial mix.json tokens (background so we
-        // don't block strategy startup on RPC round-trips).
+        // Startup ATA reconciliation: read EVERY token mint referenced in
+        // mix.json (no RPC needed to know the mints — they're in the file),
+        // skip the always-exist set (SOL/WSOL/USDC/USDT…), batch-check which
+        // ATAs exist, and create any that are missing. Runs off the async
+        // runtime (blocking RPC) so it doesn't stall the strategy.
         {
             let rpc = rpc_client.clone();
             let kp = trading_keypair.clone();
-            let initial: Vec<solana_sdk::pubkey::Pubkey> = registry
+            let mix_path = sa.mix_cache_path.clone();
+            let skip: std::collections::HashSet<solana_sdk::pubkey::Pubkey> = sa
+                .always_exist_mints
                 .iter()
-                .map(|e| e.value().token_mint)
+                .filter_map(|s| solana_sdk::pubkey::Pubkey::try_from(s.as_str()).ok())
                 .collect();
-            tokio::spawn(async move {
-                for mint in initial {
-                    if let Err(e) = ata::ensure_ata(&rpc, &kp, &mint) {
-                        tracing::warn!(token = %mint, error = %e, "initial ensure_ata failed");
+            tokio::task::spawn_blocking(move || {
+                match pool_registry::load_all_token_mints(&mix_path) {
+                    Ok(mints) => {
+                        if let Err(e) = ata::reconcile_atas(&rpc, &kp, &mints, &skip) {
+                            tracing::warn!(error = %e, "ATA reconcile failed");
+                        }
                     }
+                    Err(e) => tracing::warn!(error = %e, "ATA reconcile: cannot read mix.json"),
                 }
             });
         }
@@ -503,7 +513,6 @@ fn spawn_shred_arb(
             );
             disc.spawn();
         }
-        drop(pool_manager);
 
         let user_pubkey = trading_keypair.pubkey().to_string();
         let engine = Arc::new(shred_arb::ShredArbEngine::new(
@@ -521,6 +530,7 @@ fn spawn_shred_arb(
             registry,
             params,
             shred_metrics,
+            Some(pool_manager),
         ));
         engine.clone().spawn_reporter();
         eprintln!("[shred-arb] strategy started");
