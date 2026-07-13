@@ -157,6 +157,7 @@ pub fn build_arb_transaction(
 /// Identical to [`build_arb_transaction`] but with NO tip transfer — the fee we
 /// pay is just the network base fee (+ optional priority fee). Faster and
 /// cheaper than a Jito bundle for the freshly-created pools this strategy hits.
+#[allow(clippy::too_many_arguments)]
 pub fn build_direct_transaction(
     swap_ixs: &SwapInstructionsResponse,
     payer: &Keypair,
@@ -166,6 +167,12 @@ pub fn build_direct_transaction(
     recent_blockhash: Hash,
     alt_cache: &AltCache,
     rpc_client: &RpcClient,
+    // Extra ALTs (the pools' own lookup tables) folded in on top of whatever
+    // Metis returned. On a fresh Pump/Meteora pool Metis often has no registered
+    // ALT, so its pool/vault accounts would otherwise land in the static list at
+    // 32 bytes each; any of those that appear in one of these tables compiles to
+    // a 1-byte index instead — the difference between fitting under 1232 and not.
+    extra_alts: &[Pubkey],
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
@@ -209,7 +216,7 @@ pub fn build_direct_transaction(
     // #3 -- Single route_v2 for the entire circular swap.
     instructions.push(to_sdk_instruction(&swap_ixs.swap_instruction)?);
 
-    // Resolve ALTs via cache.
+    // Resolve ALTs via cache — Metis-returned tables first, then the pools' own.
     let mut alt_addresses: Vec<Pubkey> = Vec::new();
     for addr in &swap_ixs.address_lookup_table_addresses {
         let pubkey = Pubkey::from_str(addr)?;
@@ -217,9 +224,19 @@ pub fn build_direct_transaction(
             alt_addresses.push(pubkey);
         }
     }
+    for pubkey in extra_alts {
+        if !alt_addresses.contains(pubkey) {
+            alt_addresses.push(*pubkey);
+        }
+    }
     let mut address_lookup_tables: Vec<AddressLookupTableAccount> = Vec::new();
     for alt_pubkey in &alt_addresses {
-        address_lookup_tables.push(alt_cache.get_or_fetch(alt_pubkey, rpc_client)?);
+        // A pool ALT that can't be fetched is skipped (best-effort compression),
+        // never a hard failure — the tx just stays larger.
+        match alt_cache.get_or_fetch(alt_pubkey, rpc_client) {
+            Ok(a) => address_lookup_tables.push(a),
+            Err(e) => tracing::debug!(alt = %alt_pubkey, error = %e, "skip unfetchable ALT"),
+        }
     }
 
     let message = v0::Message::try_compile(

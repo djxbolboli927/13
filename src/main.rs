@@ -11,6 +11,7 @@ mod dex_accounts;
 mod dex_ids;
 #[allow(dead_code)]
 mod discovery;
+mod errlog;
 mod jito;
 #[allow(dead_code)]
 mod jito_grpc;
@@ -40,6 +41,8 @@ mod token_metrics;
 mod tokens;
 mod transaction;
 mod wallet;
+#[allow(dead_code)]
+mod wallet_miner;
 
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
@@ -357,7 +360,12 @@ fn spawn_shred_arb(
         pump_label: sa.metis_pump_label.clone(),
         meteora_label: sa.metis_meteora_label.clone(),
         use_shared_accounts: sa.metis_use_shared_accounts,
+        send_dedup_ms: sa.send_dedup_ms,
+        status_check_delay_secs: sa.status_check_delay_secs,
     };
+
+    // Errors-only file log (errors + why-not-sent + why-lost) under /root/g.
+    errlog::init(&sa.error_log_dir);
 
     // ── Build self-test ──────────────────────────────────────────────────────
     // Runs the exact Meteora math on real pool numbers seen in the logs. A fresh
@@ -530,10 +538,31 @@ fn spawn_shred_arb(
             });
         }
 
-        // Hourly RPC sweep: close ATAs whose pools have gone dead/inactive.
+        // Periodic RPC sweep (every 30 min): close ATAs whose pools have gone
+        // dead/inactive.
         pool_manager
             .clone()
-            .spawn_hourly_sweep(std::time::Duration::from_secs(3600));
+            .spawn_hourly_sweep(std::time::Duration::from_secs(1800));
+
+        // Wallet-transaction pool miner: mine competitors' recent txs for hot
+        // shared Pump/Meteora pools and add them (bot + Metis) every 30 min.
+        if !sa.target_wallets.is_empty() {
+            let miner = wallet_miner::WalletMiner::new(
+                wallet_miner::WalletMinerConfig {
+                    rpc_url: rpc_client.url(),
+                    wallets: sa.target_wallets.clone(),
+                    interval: std::time::Duration::from_secs(
+                        sa.wallet_mine_interval_secs.max(60),
+                    ),
+                    tx_limit: sa.wallet_mine_tx_limit.max(1),
+                    min_pump_wsol_lamports: sa.discovery_min_pump_wsol_lamports,
+                    min_meteora_wsol_lamports: sa.discovery_min_meteora_wsol_lamports,
+                },
+                pool_manager.clone(),
+                rpc_client.clone(),
+            );
+            miner.spawn();
+        }
 
         // Auto-discovery: poll public APIs for new shared Pump/Meteora pools and
         // add them at runtime via the pool manager.

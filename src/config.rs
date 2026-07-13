@@ -221,6 +221,46 @@ pub struct ShredArbConfig {
     /// trades that actually move price. 0 disables (fall back to min_trigger_sol).
     #[serde(default)]
     pub min_trigger_reserve_frac: f64,
+    /// Minimum gap (ms) between two SENDS on the SAME pool. A standing price gap
+    /// re-fires every cooldown (~100ms); without this we'd blast dozens of
+    /// identical txs before the first even lands. Set LOW (100-200) so several
+    /// distinct opportunities in the same block can each send; 0 = OFF (no dedup,
+    /// every profitable eval sends — bounded only by the RPC rate). Default 150.
+    #[serde(default = "default_send_dedup_ms")]
+    pub send_dedup_ms: u64,
+    /// Seconds to wait after a direct send before polling the tx's on-chain fate.
+    #[serde(default = "default_status_check_delay_secs")]
+    pub status_check_delay_secs: u64,
+    /// Absolute path to a directory where an errors-only log file is written
+    /// (errors + why a tx was NOT sent + why a sent tx was lost). Default /root/g.
+    #[serde(default = "default_error_log_dir")]
+    pub error_log_dir: String,
+    /// Target wallets whose recent transactions are mined for hot shared
+    /// Pump.fun/Meteora pools (competitors' pools). Empty = wallet mining off.
+    #[serde(default)]
+    pub target_wallets: Vec<String>,
+    /// Re-run the wallet mining pass every this many seconds. Default 1800 (30m).
+    #[serde(default = "default_wallet_mine_interval_secs")]
+    pub wallet_mine_interval_secs: u64,
+    /// How many recent signatures per wallet to scan each pass. Default 1000.
+    #[serde(default = "default_wallet_mine_tx_limit")]
+    pub wallet_mine_tx_limit: usize,
+}
+
+fn default_send_dedup_ms() -> u64 {
+    150
+}
+fn default_status_check_delay_secs() -> u64 {
+    12
+}
+fn default_error_log_dir() -> String {
+    "/root/g".to_string()
+}
+fn default_wallet_mine_interval_secs() -> u64 {
+    1800
+}
+fn default_wallet_mine_tx_limit() -> usize {
+    1000
 }
 
 impl Default for ShredArbConfig {
@@ -267,6 +307,12 @@ impl Default for ShredArbConfig {
             discovery_min_meteora_wsol_lamports: default_min_meteora_wsol(),
             pool_idle_close_secs: default_pool_idle_close_secs(),
             min_trigger_reserve_frac: 0.0,
+            send_dedup_ms: default_send_dedup_ms(),
+            status_check_delay_secs: default_status_check_delay_secs(),
+            error_log_dir: default_error_log_dir(),
+            target_wallets: Vec::new(),
+            wallet_mine_interval_secs: default_wallet_mine_interval_secs(),
+            wallet_mine_tx_limit: default_wallet_mine_tx_limit(),
             metis_pump_label: default_pump_label(),
             metis_meteora_label: default_meteora_label(),
             metis_use_shared_accounts: false,
@@ -295,7 +341,7 @@ fn default_min_meteora_wsol() -> u64 {
     2_000_000
 }
 fn default_pool_idle_close_secs() -> u64 {
-    14_400
+    1_800
 }
 
 fn default_discovery_seed_urls() -> Vec<String> {

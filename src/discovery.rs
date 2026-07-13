@@ -159,7 +159,7 @@ fn make_pool_info(
 
 /// Decode a pool account into `PoolInfo`, dispatching on the program `owner`.
 /// Returns `None` for programs we don't (yet) support or malformed data.
-fn decode_pool(pool: Pubkey, owner: &Pubkey, data: &[u8]) -> Option<PoolInfo> {
+pub(crate) fn decode_pool(pool: Pubkey, owner: &Pubkey, data: &[u8]) -> Option<PoolInfo> {
     match DexKind::from_owner(owner)? {
         DexKind::PumpFunAmm => make_pool_info(
             DexKind::PumpFunAmm,

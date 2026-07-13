@@ -93,6 +93,11 @@ pub struct ArbParams {
     pub meteora_label: String,
     /// Use Jupiter shared accounts (compresses the tx to fit 1232 bytes).
     pub use_shared_accounts: bool,
+    /// Minimum gap between two SENDS on the same pool (0 = off). Small so several
+    /// opportunities in one block can each send.
+    pub send_dedup_ms: u64,
+    /// Seconds to wait before polling a sent tx's on-chain fate.
+    pub status_check_delay_secs: u64,
 }
 
 pub struct ShredArbEngine {
@@ -143,6 +148,19 @@ pub struct ShredArbEngine {
     profitable: AtomicU64,
     not_profitable: AtomicU64,
     sent: AtomicU64,
+    // ── why a PROFITABLE opportunity did NOT reach the network ──
+    /// Suppressed by the per-pool send de-dup window.
+    nosend_dedup: AtomicU64,
+    /// A forced leg quote failed on Metis (no route / timeout).
+    nosend_quote_fail: AtomicU64,
+    /// /swap-instructions failed.
+    nosend_swapix_fail: AtomicU64,
+    /// Tx couldn't be built / signed.
+    nosend_build_fail: AtomicU64,
+    /// Tx exceeded 1232 bytes or 64 account locks after compression.
+    nosend_too_large: AtomicU64,
+    /// RPC rejected the send (or Jito path rate-limited).
+    nosend_send_err: AtomicU64,
     /// Best (max) net lamports the optimizer found in the current window,
     /// including negatives — shows how close we get when nothing is profitable.
     best_net_seen: AtomicI64,
@@ -165,15 +183,10 @@ struct SentStats {
     landed_err: AtomicU64,
     /// Never found on-chain — dropped / never landed.
     dropped: AtomicU64,
+    /// Fate check could not be resolved (RPC error every retry) — accounted so
+    /// sent == landed_ok + reverted + dropped + unknown always holds.
+    unknown: AtomicU64,
 }
-
-/// Don't re-send the same pool more often than this — a persistent gap fires
-/// every cooldown (100ms), which would otherwise blast dozens of identical txs
-/// before the first even lands.
-const SEND_DEDUP: Duration = Duration::from_millis(1200);
-
-/// Seconds to wait before checking a sent tx's on-chain fate.
-const STATUS_CHECK_DELAY_SECS: u64 = 12;
 
 impl ShredArbEngine {
     #[allow(clippy::too_many_arguments)]
@@ -228,6 +241,12 @@ impl ShredArbEngine {
             profitable: AtomicU64::new(0),
             not_profitable: AtomicU64::new(0),
             sent: AtomicU64::new(0),
+            nosend_dedup: AtomicU64::new(0),
+            nosend_quote_fail: AtomicU64::new(0),
+            nosend_swapix_fail: AtomicU64::new(0),
+            nosend_build_fail: AtomicU64::new(0),
+            nosend_too_large: AtomicU64::new(0),
+            nosend_send_err: AtomicU64::new(0),
             best_net_seen: AtomicI64::new(i64::MIN),
         }
     }
@@ -447,15 +466,17 @@ impl ShredArbEngine {
         self.best_net_seen
             .fetch_max(opt_net.clamp(i64::MIN as i128, i64::MAX as i128) as i64, Ordering::Relaxed);
 
-        // Detailed per-evaluation trace — SAMPLED (1 in EVAL_LOG_SAMPLE) so it
-        // doesn't flood the terminal; profitable evaluations always print.
-        let log_this = opt_net > 0
-            || self.eval_log_counter.fetch_add(1, Ordering::Relaxed) % EVAL_LOG_SAMPLE == 0;
-        if log_this {
+        // Detailed per-evaluation trace — DEBUG only (RUST_LOG=...=debug) and
+        // sampled, so a normal run never prints these negative/eval lines. The
+        // actionable, always-printed event is the "shred-arb opportunity" log
+        // below (a real send) and the sent-tx fate logs.
+        if tracing::enabled!(tracing::Level::DEBUG)
+            && self.eval_log_counter.fetch_add(1, Ordering::Relaxed) % EVAL_LOG_SAMPLE == 0
+        {
             let sample = |x: u64| -> Option<i64> {
                 eval(x).map(|o| o as i64 - x as i64 - required_extra as i64)
             };
-            info!(
+            debug!(
                 token = %pair.token_mint,
                 buy = if buy_on == BuyOn::Pump { "Pump" } else { "Meteora" },
                 gap_pct,
@@ -548,10 +569,14 @@ impl ShredArbEngine {
         floor: u64,
     ) {
         // De-dupe: don't blast the same pool with identical txs while an earlier
-        // one is still unconfirmed (a standing gap fires every ~100ms).
-        if let Some(prev) = self.last_sent.get(&pool) {
-            if prev.elapsed() < SEND_DEDUP {
-                return;
+        // one is still unconfirmed. Kept SMALL and configurable (send_dedup_ms,
+        // 0 = off) so multiple distinct opportunities in one block can each send.
+        if self.params.send_dedup_ms > 0 {
+            if let Some(prev) = self.last_sent.get(&pool) {
+                if prev.elapsed() < Duration::from_millis(self.params.send_dedup_ms) {
+                    self.nosend_dedup.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
             }
         }
 
@@ -567,7 +592,12 @@ impl ShredArbEngine {
         {
             Ok(q) => q,
             Err(e) => {
+                self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
                 warn!(error = %e, leg = "buy", venue = buy_label, "forced quote failed — re-adding market");
+                crate::errlog::log(
+                    "not-sent",
+                    &format!("token={token} reason=buy-quote-fail venue={buy_label} err={e}"),
+                );
                 self.readd_market(&pair, buy_kind).await;
                 self.note_route_failure(pool);
                 return;
@@ -575,7 +605,14 @@ impl ShredArbEngine {
         };
         let token_amt: u64 = match q1.out_amount.parse().ok().filter(|&v| v > 0) {
             Some(v) => v,
-            None => return,
+            None => {
+                self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
+                crate::errlog::log(
+                    "not-sent",
+                    &format!("token={token} reason=buy-quote-zero-out"),
+                );
+                return;
+            }
         };
 
         // Leg 2: forced sell on `sell_kind` (token → WSOL).
@@ -586,7 +623,12 @@ impl ShredArbEngine {
         {
             Ok(q) => q,
             Err(e) => {
+                self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
                 warn!(error = %e, leg = "sell", venue = sell_label, "forced quote failed — re-adding market");
+                crate::errlog::log(
+                    "not-sent",
+                    &format!("token={token} reason=sell-quote-fail venue={sell_label} err={e}"),
+                );
                 self.readd_market(&pair, sell_kind).await;
                 self.note_route_failure(pool);
                 return;
@@ -600,7 +642,9 @@ impl ShredArbEngine {
         let merged = match MetisClient::merge_quotes(&q1, &q2, floor) {
             Ok(m) => m,
             Err(e) => {
+                self.nosend_build_fail.fetch_add(1, Ordering::Relaxed);
                 warn!(error = %e, "merge_quotes failed");
+                crate::errlog::log("not-sent", &format!("token={token} reason=merge-fail err={e}"));
                 return;
             }
         };
@@ -611,8 +655,13 @@ impl ShredArbEngine {
             .await
         {
             Ok(s) => s,
-            Err(_) => {
-                warn!("swap_instructions failed for forced arb");
+            Err(e) => {
+                self.nosend_swapix_fail.fetch_add(1, Ordering::Relaxed);
+                warn!(?e, "swap_instructions failed for forced arb");
+                crate::errlog::log(
+                    "not-sent",
+                    &format!("token={token} reason=swap-instructions-fail err={e:?}"),
+                );
                 return;
             }
         };
@@ -622,8 +671,13 @@ impl ShredArbEngine {
         let alt = self.alt_cache.clone();
         let rpc = self.rpc_client.clone();
         let cu = self.params.cu_limit;
+        // The pools' own ALTs — folded into the tx so their pool/vault accounts
+        // compress from 32 static bytes to a 1-byte index (fixes tx-too-large on
+        // pools Metis hasn't registered an ALT for).
+        let extra_alts: Vec<solana_sdk::pubkey::Pubkey> =
+            [pair.pump.alt, pair.meteora.alt].into_iter().flatten().collect();
 
-        // ── Direct-to-RPC send (default): no Jito, no tip, minimal latency ──
+        // ── Direct-to-RPC send (default): no Jito, no tip, no rate limit ──
         if self.params.direct_send {
             let prio = self.params.direct_priority_fee_microlamports;
             let data_limit = self.params.loaded_accounts_data_limit;
@@ -641,6 +695,7 @@ impl ShredArbEngine {
                         recent_blockhash,
                         &alt,
                         &rpc,
+                        &extra_alts,
                     )
                 };
                 let tx = build(data_limit)?;
@@ -654,22 +709,34 @@ impl ShredArbEngine {
             {
                 Ok(Ok(tx)) => tx,
                 _ => {
+                    self.nosend_build_fail.fetch_add(1, Ordering::Relaxed);
                     warn!("build_direct_transaction failed");
+                    crate::errlog::log("not-sent", &format!("token={token} reason=build-fail"));
                     return;
                 }
             };
 
             if transaction::account_lock_count(&tx) > 64 {
+                self.nosend_too_large.fetch_add(1, Ordering::Relaxed);
                 warn!("direct arb tx exceeds 64 account locks, dropping");
+                crate::errlog::log(
+                    "not-sent",
+                    &format!("token={token} reason=too-many-account-locks"),
+                );
                 return;
             }
             // Final size gate (Solana caps at 1232 raw bytes).
             let raw = transaction::serialized_len(&tx);
             if raw > 1232 {
+                self.nosend_too_large.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     bytes = raw,
                     "direct arb tx still too large ({} > 1232) after compression — dropping",
                     raw
+                );
+                crate::errlog::log(
+                    "not-sent",
+                    &format!("token={token} reason=tx-too-large bytes={raw}"),
                 );
                 return;
             }
@@ -692,38 +759,28 @@ impl ShredArbEngine {
                     self.sent.fetch_add(1, Ordering::Relaxed);
                     self.last_sent.insert(pool, Instant::now());
                     info!(signature = %sig, input = amount_in, "shred-arb tx sent (direct)");
-                    // Check its on-chain fate a few seconds later so we actually
-                    // KNOW what happens to our txs (landed / reverted / dropped).
+                    // Resolve the on-chain fate so EVERY sent tx is accounted for
+                    // (landed_ok / reverted / dropped / unknown always sums to
+                    // sent). Uses history-searching status lookups + retries so a
+                    // tx that landed slightly late isn't miscounted as dropped.
                     let rpc3 = self.rpc_client.clone();
                     let stats = self.sent_stats.clone();
+                    let token_l = token.clone();
+                    let delay = self.params.status_check_delay_secs;
                     tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(STATUS_CHECK_DELAY_SECS)).await;
-                        let r = tokio::task::spawn_blocking(move || {
-                            rpc3.get_signature_statuses(&[sig])
-                        })
-                        .await;
-                        match r {
-                            Ok(Ok(resp)) => match resp.value.into_iter().next().flatten() {
-                                Some(st) => {
-                                    if let Some(err) = st.err {
-                                        stats.landed_err.fetch_add(1, Ordering::Relaxed);
-                                        warn!(%sig, error = ?err, "sent tx LANDED but REVERTED");
-                                    } else {
-                                        stats.landed_ok.fetch_add(1, Ordering::Relaxed);
-                                        info!(%sig, "sent tx landed OK ✅");
-                                    }
-                                }
-                                None => {
-                                    stats.dropped.fetch_add(1, Ordering::Relaxed);
-                                    warn!(%sig, "sent tx NOT FOUND on-chain (dropped/never landed)");
-                                }
-                            },
-                            _ => {}
-                        }
+                        resolve_fate(rpc3, stats, sig, token_l, delay).await;
                     });
                 }
-                Ok(Err(e)) => warn!(error = %e, "direct send failed"),
-                Err(e) => warn!(error = %e, "direct send task join failed"),
+                Ok(Err(e)) => {
+                    self.nosend_send_err.fetch_add(1, Ordering::Relaxed);
+                    warn!(error = %e, "direct send failed");
+                    crate::errlog::log("not-sent", &format!("token={token} reason=rpc-send-err err={e}"));
+                }
+                Err(e) => {
+                    self.nosend_send_err.fetch_add(1, Ordering::Relaxed);
+                    warn!(error = %e, "direct send task join failed");
+                    crate::errlog::log("not-sent", &format!("token={token} reason=send-join-err err={e}"));
+                }
             }
             return;
         }
@@ -846,119 +903,94 @@ impl ShredArbEngine {
     pub fn spawn_reporter(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(30));
-            let fallback_fee = self.params.meteora_fee_bps.saturating_mul(100_000);
-            // Snapshot of window-start counters for per-30s deltas.
-            let m = &self.shred_metrics;
-            let mut prev_entries = 0u64;
-            let mut prev_txns = 0u64;
-            let mut prev_pump = 0u64;
-            let mut prev_matched = 0u64;
-            let mut prev_updates = 0u64;
-            let mut prev_eval = 0u64;
             loop {
                 ticker.tick().await;
-                let entries = m.entries.load(Ordering::Relaxed);
-                let txns = m.txns.load(Ordering::Relaxed);
-                let pump = m.pump_txns.load(Ordering::Relaxed);
-                let matched = m.matched.load(Ordering::Relaxed);
-                let updates = self.pool_state.updates();
-                let eval = self.evaluated.load(Ordering::Relaxed);
-
-                // Everything below is per-30s-window (delta), plus lifetime totals.
+                // Concise, transaction-focused status. Only the numbers the
+                // operator asked to see: what was profitable, what actually SENT,
+                // where the sent ones ended up on-chain, and — crucially — WHY the
+                // profitable ones that did NOT send were held back. No shred/eval
+                // spam (those go to the /root/g error file / debug logs).
+                let ss = &self.sent_stats;
+                let landed_ok = ss.landed_ok.load(Ordering::Relaxed);
+                let reverted = ss.landed_err.load(Ordering::Relaxed);
+                let dropped = ss.dropped.load(Ordering::Relaxed);
+                let unknown = ss.unknown.load(Ordering::Relaxed);
                 eprintln!(
-                    "\n[shred-arb 30s] watching_pump_pools={} subscribed_cache={} pool_updates={} (Δ)\n\
-                     SHRED   : entriesΔ={} txnsΔ={} pumpfun_txnsΔ={} matched_our_poolsΔ={} unresolved={} signals_sent={} signals_dropped={}\n\
-                     ENGINE  : signals_recv={} evaluatedΔ={} | skip[min_trig={} no_pair={} cooldown={} no_pump_state={} no_meteora_state={} bad_price={} implausible={}]\n\
-                     RESULT  : profitable={} not_profitable={} (uncrossable={}) sent={} [landed_ok={} reverted={} dropped={}] best_net_lamports_window={} | pool_slot={}",
-                    m.watched_pools.load(Ordering::Relaxed),
-                    self.pool_state.cache_size(),
-                    updates.saturating_sub(prev_updates),
-                    entries.saturating_sub(prev_entries),
-                    txns.saturating_sub(prev_txns),
-                    pump.saturating_sub(prev_pump),
-                    matched.saturating_sub(prev_matched),
-                    m.unresolved_pool.load(Ordering::Relaxed),
-                    m.signals_sent.load(Ordering::Relaxed),
-                    m.signals_dropped.load(Ordering::Relaxed),
-                    self.signals_received.load(Ordering::Relaxed),
-                    eval.saturating_sub(prev_eval),
-                    self.skip_min_trigger.load(Ordering::Relaxed),
-                    self.skip_no_pair.load(Ordering::Relaxed),
-                    self.skip_cooldown.load(Ordering::Relaxed),
-                    self.skip_no_pump_state.load(Ordering::Relaxed),
-                    self.skip_no_meteora_state.load(Ordering::Relaxed),
-                    self.skip_bad_price.load(Ordering::Relaxed),
-                    self.skip_implausible.load(Ordering::Relaxed),
+                    "\n[shred-arb 30s] watching_pools={}\n\
+                     TX      : profitable={} sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
+                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} send_err={}",
+                    self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.profitable.load(Ordering::Relaxed),
-                    self.not_profitable.load(Ordering::Relaxed),
-                    self.skip_uncrossable.load(Ordering::Relaxed),
                     self.sent.load(Ordering::Relaxed),
-                    self.sent_stats.landed_ok.load(Ordering::Relaxed),
-                    self.sent_stats.landed_err.load(Ordering::Relaxed),
-                    self.sent_stats.dropped.load(Ordering::Relaxed),
-                    {
-                        let v = self.best_net_seen.swap(i64::MIN, Ordering::Relaxed);
-                        if v == i64::MIN { 0 } else { v }
-                    },
-                    self.pool_state.slot(),
+                    landed_ok,
+                    reverted,
+                    dropped,
+                    unknown,
+                    self.nosend_dedup.load(Ordering::Relaxed),
+                    self.nosend_quote_fail.load(Ordering::Relaxed),
+                    self.nosend_swapix_fail.load(Ordering::Relaxed),
+                    self.nosend_build_fail.load(Ordering::Relaxed),
+                    self.nosend_too_large.load(Ordering::Relaxed),
+                    self.nosend_send_err.load(Ordering::Relaxed),
                 );
-                prev_entries = entries;
-                prev_txns = txns;
-                prev_pump = pump;
-                prev_matched = matched;
-                prev_updates = updates;
-                prev_eval = eval;
-
-                // Decoded-state snapshot for calibration & diagnosis. Always
-                // printed so a missing side is visible (compare the prices
-                // against a live Metis quote for the same pool/size).
-                if self.registry.is_empty() {
-                    eprintln!("  SNAPSHOT: no pairs registered yet — waiting for discovery/mix.json");
-                }
-                for entry in self.registry.iter().take(3) {
-                    let pair = entry.value();
-                    let met = self
-                        .pool_state
-                        .meteora_pool(&pair.meteora.pool, fallback_fee);
-                    let pump = self
-                        .pool_state
-                        .pump_pool(&pair.pump.token_vault(), &pair.pump.wsol_vault());
-                    match (met, pump) {
-                        (Some(m), Some(p)) => {
-                            let met_price = m.token_price_in_sol(pair.meteora.token_is_a, 0, 0);
-                            let pump_price = if p.base_reserve == 0 {
-                                0.0
-                            } else {
-                                p.quote_reserve as f64 / p.base_reserve as f64
-                            };
-                            let diff_pct = if met_price > 0.0 {
-                                (pump_price - met_price) / met_price * 100.0
-                            } else {
-                                0.0
-                            };
-                            eprintln!(
-                                "  SNAPSHOT {}: meteora[sqrtP={} L={} fee_num={} price={:.6e}] \
-                                 pump[base={} quote={} price={:.6e}] diff={:.3}%",
-                                pair.token_mint, m.sqrt_price, m.liquidity, m.fee_numerator,
-                                met_price, p.base_reserve, p.quote_reserve, pump_price, diff_pct,
-                            );
-                        }
-                        (met_o, pump_o) => {
-                            eprintln!(
-                                "  SNAPSHOT {}: meteora_cached={} pump_cached={} \
-                                 (meteora_pool={} token_vault={} wsol_vault={})",
-                                pair.token_mint,
-                                met_o.is_some(),
-                                pump_o.is_some(),
-                                pair.meteora.pool,
-                                pair.pump.token_vault(),
-                                pair.pump.wsol_vault(),
-                            );
-                        }
-                    }
-                }
             }
         });
+    }
+}
+
+/// Resolve and account for a sent tx's on-chain fate. Retries a history-aware
+/// status lookup so a tx that lands a little late is classified correctly, and
+/// every outcome (ok / reverted / dropped / unknown) is counted — so
+/// `sent == landed_ok + reverted + dropped + unknown` always holds and no sent
+/// tx silently vanishes from the tally.
+async fn resolve_fate(
+    rpc: Arc<RpcClient>,
+    stats: Arc<SentStats>,
+    sig: solana_sdk::signature::Signature,
+    token: String,
+    delay_secs: u64,
+) {
+    tokio::time::sleep(Duration::from_secs(delay_secs.max(1))).await;
+    const RETRIES: usize = 5;
+    let mut last_err = false;
+    for _attempt in 0..RETRIES {
+        let r = {
+            let rpc = rpc.clone();
+            tokio::task::spawn_blocking(move || rpc.get_signature_statuses_with_history(&[sig])).await
+        };
+        match r {
+            Ok(Ok(resp)) => {
+                last_err = false;
+                match resp.value.into_iter().next().flatten() {
+                    Some(st) => {
+                        if let Some(err) = st.err {
+                            stats.landed_err.fetch_add(1, Ordering::Relaxed);
+                            warn!(%sig, error = ?err, "sent tx LANDED but REVERTED");
+                            crate::errlog::log(
+                                "lost",
+                                &format!("token={token} sig={sig} fate=reverted err={err:?}"),
+                            );
+                        } else {
+                            stats.landed_ok.fetch_add(1, Ordering::Relaxed);
+                            info!(%sig, "sent tx landed OK ✅");
+                        }
+                        return;
+                    }
+                    None => { /* not found yet — give it another poll */ }
+                }
+            }
+            _ => last_err = true,
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    // Exhausted retries.
+    if last_err {
+        stats.unknown.fetch_add(1, Ordering::Relaxed);
+        crate::errlog::log("lost", &format!("token={token} sig={sig} fate=unknown-rpc-error"));
+    } else {
+        stats.dropped.fetch_add(1, Ordering::Relaxed);
+        warn!(%sig, "sent tx NOT FOUND on-chain (dropped/never landed)");
+        crate::errlog::log("lost", &format!("token={token} sig={sig} fate=dropped-not-found"));
     }
 }
 
