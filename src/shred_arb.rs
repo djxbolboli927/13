@@ -627,17 +627,28 @@ impl ShredArbEngine {
         if self.params.direct_send {
             let prio = self.params.direct_priority_fee_microlamports;
             let data_limit = self.params.loaded_accounts_data_limit;
+            // Build the tx. If it's over the 1232-byte cap AND we included the
+            // optional SetLoadedAccountsDataSizeLimit instruction, rebuild WITHOUT
+            // it (saves ~10 bytes) rather than dropping a profitable opportunity.
             let tx = match tokio::task::spawn_blocking(move || {
-                transaction::build_direct_transaction(
-                    &swap_ixs,
-                    &keypair,
-                    cu,
-                    prio,
-                    data_limit,
-                    recent_blockhash,
-                    &alt,
-                    &rpc,
-                )
+                let build = |dl: u32| {
+                    transaction::build_direct_transaction(
+                        &swap_ixs,
+                        &keypair,
+                        cu,
+                        prio,
+                        dl,
+                        recent_blockhash,
+                        &alt,
+                        &rpc,
+                    )
+                };
+                let tx = build(data_limit)?;
+                if transaction::serialized_len(&tx) <= 1232 || data_limit == 0 {
+                    return Ok::<_, anyhow::Error>(tx);
+                }
+                // Too big with the data-size ix — try again without it.
+                build(0)
             })
             .await
             {
@@ -652,14 +663,12 @@ impl ShredArbEngine {
                 warn!("direct arb tx exceeds 64 account locks, dropping");
                 return;
             }
-            // Pre-check the raw byte size (Solana caps at 1232) so we don't burn
-            // an RPC round-trip on a guaranteed "-32602 too large" rejection.
+            // Final size gate (Solana caps at 1232 raw bytes).
             let raw = transaction::serialized_len(&tx);
             if raw > 1232 {
                 warn!(
                     bytes = raw,
-                    max_accounts = self.params.metis_max_accounts,
-                    "direct arb tx too large ({} > 1232 bytes), dropping — lower metis_max_accounts",
+                    "direct arb tx still too large ({} > 1232) after compression — dropping",
                     raw
                 );
                 return;
