@@ -238,10 +238,10 @@ metis_max_accounts = 50
 # شبکه 64MB). 0 = اصلاً اضافه نشود. ⚠️ هرگز عدد کوچک مثل 131072 نگذارید!
 direct_loaded_accounts_data_limit = 31630833
 
-# useSharedAccounts متیس/جوپیتر: اکانت‌ها را فشرده می‌کند تا تراکنش زیر 1232 بایت جا
-# شود (همان روشی که رقیب با آن چند-هاپ را جا می‌دهد). true = فشرده (پیشنهادی).
-# اگر با کوت circular ما مشکل ساخت اینستراکشن دیدید، false کنید.
-metis_use_shared_accounts = true
+# useSharedAccounts: ⚠️ باید false بماند! با کوت circular ادغام‌شدهٔ ما ناسازگار
+# است و باعث خطای «swap_instructions failed» می‌شود. متیس خودش ALTها را بعد از
+# add-market با RPC می‌گیرد و تراکنش را فشرده می‌کند؛ به این گزینه نیازی نیست.
+metis_use_shared_accounts = false
 
 # ─── تشخیص فرصت / سرعت ───
 # فقط تریدهایی را بررسی کن که سمت SOL آن‌ها حداقل این کسر از ذخیره‌ی WSOL استخر

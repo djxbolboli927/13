@@ -150,10 +150,10 @@ pub struct ShredArbConfig {
     /// (e.g. "Meteora DAMM V2", "Meteora DAMM v2").
     #[serde(default = "default_meteora_label")]
     pub metis_meteora_label: String,
-    /// Use Jupiter's shared-accounts program so the swap instruction's account
-    /// set is compressed enough to fit a multi-hop tx under Solana's 1232-byte
-    /// cap (how competitors fit 5-hop arbs). Default true.
-    #[serde(default = "default_true")]
+    /// Use Jupiter's shared-accounts program. NOTE: this BREAKS our hand-merged
+    /// circular quote (Metis returns an error building swap-instructions), so it
+    /// must stay false for this strategy. Kept configurable for completeness.
+    #[serde(default)]
     pub metis_use_shared_accounts: bool,
     /// `maxAccounts` requested from Metis for each forced leg. Lower = fewer
     /// accounts pulled into the tx = smaller serialized size (Solana caps a tx
@@ -269,7 +269,7 @@ impl Default for ShredArbConfig {
             min_trigger_reserve_frac: 0.0,
             metis_pump_label: default_pump_label(),
             metis_meteora_label: default_meteora_label(),
-            metis_use_shared_accounts: true,
+            metis_use_shared_accounts: false,
             metis_max_accounts: default_metis_max_accounts(),
             direct_loaded_accounts_data_limit: 0,
         }
