@@ -446,9 +446,13 @@ fn spawn_shred_arb(
             sa.shredstream_endpoint.clone(),
             target_pools,
             alt_map,
+            rpc_client.clone(),
         ));
         let shred_metrics = consumer.metrics.clone();
         consumer.clone().spawn(tx);
+        // Self-learning ALT cache: resolve pools hidden behind lookup tables so
+        // we stop missing swaps competitors already see.
+        consumer.clone().spawn_alt_fetcher();
 
         // Shared, mutable pool registry (seeded from mix.json; discovery adds more).
         let registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, pool_registry::ArbPair>> =
@@ -467,6 +471,7 @@ fn spawn_shred_arb(
             metis.clone(),
             rpc_client.clone(),
             trading_keypair.clone(),
+            sa.discovery_min_pump_wsol_lamports,
         ));
 
         // Startup ATA reconciliation: read EVERY token mint referenced in
@@ -503,9 +508,9 @@ fn spawn_shred_arb(
             std::time::Duration::from_secs(sa.pool_idle_close_secs.max(60)),
         );
 
-        // Route ShredStream remove-liquidity (withdraw) events on watched pools
-        // straight to the manager to close the pool + ATA — the direct rug
-        // signal the user asked for.
+        // Route ShredStream remove-liquidity (withdraw) events to an RPC-confirmed
+        // check: a withdraw may be a PARTIAL remove on a hot pool, so we only
+        // close if the pool is actually drained (never on a mere dip).
         {
             let (rm_tx, mut rm_rx) =
                 tokio::sync::mpsc::channel::<solana_sdk::pubkey::Pubkey>(256);
@@ -514,10 +519,15 @@ fn spawn_shred_arb(
             tokio::spawn(async move {
                 while let Some(pool) = rm_rx.recv().await {
                     let mgr = mgr.clone();
-                    tokio::task::spawn_blocking(move || mgr.remove_pair(&pool));
+                    tokio::task::spawn_blocking(move || mgr.check_and_close(&pool));
                 }
             });
         }
+
+        // Hourly RPC sweep: close ATAs whose pools have gone dead/inactive.
+        pool_manager
+            .clone()
+            .spawn_hourly_sweep(std::time::Duration::from_secs(3600));
 
         // Auto-discovery: poll public APIs for new shared Pump/Meteora pools and
         // add them at runtime via the pool manager.

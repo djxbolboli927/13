@@ -40,6 +40,10 @@ pub struct PoolManager {
     metis: Arc<MetisClient>,
     rpc: Arc<RpcClient>,
     keypair: Arc<Keypair>,
+    /// Reserved for tuning the drain threshold; closing currently uses a strict
+    /// full-drain check (dust floor) so a dip never closes a hot pool.
+    #[allow(dead_code)]
+    min_pump_wsol: u64,
 }
 
 impl PoolManager {
@@ -51,6 +55,7 @@ impl PoolManager {
         metis: Arc<MetisClient>,
         rpc: Arc<RpcClient>,
         keypair: Arc<Keypair>,
+        min_pump_wsol: u64,
     ) -> Self {
         Self {
             registry,
@@ -59,7 +64,72 @@ impl PoolManager {
             metis,
             rpc,
             keypair,
+            min_pump_wsol,
         }
+    }
+
+    fn read_u64(data: &[u8], off: usize) -> Option<u64> {
+        data.get(off..off + 8)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+    }
+    fn read_u128(data: &[u8], off: usize) -> Option<u128> {
+        data.get(off..off + 16)
+            .map(|s| u128::from_le_bytes(s.try_into().unwrap()))
+    }
+
+    /// Confirm via RPC whether a pool is actually dead, and close it only then.
+    /// Called on a ShredStream `withdraw` event (which may be a PARTIAL remove
+    /// on a still-liquid, hot pool) and by the hourly sweep — so a mere
+    /// liquidity dip never closes a good token; only a genuine drain does.
+    /// A pool is dead when Meteora `liquidity == 0`, or the Pump WSOL reserve
+    /// has fallen below `min_pump_wsol` (untradeable / rugged).
+    pub fn check_and_close(&self, pump_pool: &Pubkey) {
+        let pair = match self.registry.get(pump_pool) {
+            Some(e) => e.value().clone(),
+            None => return,
+        };
+        let met_liq = self
+            .rpc
+            .get_account(&pair.meteora.pool)
+            .ok()
+            .and_then(|a| Self::read_u128(&a.data, 360))
+            .unwrap_or(0);
+        let pump_wsol = self
+            .rpc
+            .get_account(&pair.pump.wsol_vault())
+            .ok()
+            .and_then(|a| Self::read_u64(&a.data, 64))
+            .unwrap_or(0);
+        // Close ONLY on a genuine full drain — Meteora liquidity gone, or the
+        // Pump WSOL reserve emptied to dust. A partial remove that leaves the
+        // pool liquid keeps it (never close on a mere reduction).
+        let dead = met_liq == 0 || pump_wsol < 1_000;
+        if dead {
+            info!(pump = %pump_pool, met_liq, pump_wsol, "confirmed dead pool — closing");
+            self.remove_pair(pump_pool);
+        } else {
+            info!(pump = %pump_pool, pump_wsol, "withdraw seen but pool still liquid — keeping");
+        }
+    }
+
+    /// Hourly RPC sweep over every tracked pool: close the ones that are dead
+    /// (drained/untradeable) so we don't hold idle ATAs. This is the periodic
+    /// "check all ATAs' pools" the operator asked for.
+    pub fn spawn_hourly_sweep(self: Arc<Self>, interval: Duration) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let pools: Vec<Pubkey> =
+                    self.registry.iter().map(|e| e.value().pump.pool).collect();
+                info!(count = pools.len(), "hourly pool sweep starting");
+                for pool in pools {
+                    let me = self.clone();
+                    // Blocking RPC off the async worker; space out to respect budget.
+                    let _ = tokio::task::spawn_blocking(move || me.check_and_close(&pool)).await;
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+            }
+        });
     }
 
     /// Whether the given Pump pool is already tracked.

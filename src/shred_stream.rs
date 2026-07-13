@@ -69,6 +69,13 @@ pub struct ShredConsumer {
     /// Optional sink for detected remove-liquidity (`withdraw`) events on a
     /// watched pool — the Pump pool pubkey is sent so the manager can close it.
     remove_tx: std::sync::RwLock<Option<mpsc::Sender<Pubkey>>>,
+    /// RPC used by the self-learning ALT fetcher.
+    rpc: Arc<solana_client::rpc_client::RpcClient>,
+    /// ALT account keys seen on Pump txns that we couldn't resolve yet. A
+    /// background task fetches these and folds them into `alt_map`, so that
+    /// swaps hiding the pool behind an ALT become resolvable — this is how we
+    /// stop missing trades that competitors (who resolve ALTs) already see.
+    pending_alts: std::sync::Mutex<HashSet<Pubkey>>,
     pub metrics: Arc<ShredMetrics>,
 }
 
@@ -77,6 +84,7 @@ impl ShredConsumer {
         endpoint: String,
         target_pools: HashSet<Pubkey>,
         alt_map: HashMap<Pubkey, Vec<Pubkey>>,
+        rpc: Arc<solana_client::rpc_client::RpcClient>,
     ) -> Self {
         let metrics = Arc::new(ShredMetrics::default());
         metrics
@@ -88,8 +96,62 @@ impl ShredConsumer {
             alt_map: std::sync::RwLock::new(alt_map),
             pumpfun: pumpfun_program(),
             remove_tx: std::sync::RwLock::new(None),
+            rpc,
+            pending_alts: std::sync::Mutex::new(HashSet::new()),
             metrics,
         }
+    }
+
+    /// Background task: periodically fetch ALT account contents we don't yet
+    /// know (harvested from observed Pump txns) and add them to `alt_map`, so
+    /// pool accounts hidden behind those ALTs become resolvable.
+    pub fn spawn_alt_fetcher(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                // Drain up to N unknown ALTs (skip ones already known).
+                let batch: Vec<Pubkey> = {
+                    let mut pending = self.pending_alts.lock().unwrap();
+                    if pending.is_empty() {
+                        continue;
+                    }
+                    let known = self.alt_map.read().unwrap();
+                    let take: Vec<Pubkey> = pending
+                        .iter()
+                        .filter(|k| !known.contains_key(k))
+                        .copied()
+                        .take(25)
+                        .collect();
+                    for k in &take {
+                        pending.remove(k);
+                    }
+                    take
+                };
+                if batch.is_empty() {
+                    continue;
+                }
+                let rpc = self.rpc.clone();
+                let me = self.clone();
+                // Blocking RPC off the async worker.
+                let _ = tokio::task::spawn_blocking(move || {
+                    let mut added = 0usize;
+                    for alt in batch {
+                        if let Ok(acct) = rpc.get_account(&alt) {
+                            if let Ok(addrs) =
+                                crate::transaction::deserialize_alt_addresses(&acct.data)
+                            {
+                                me.alt_map.write().unwrap().insert(alt, addrs);
+                                added += 1;
+                            }
+                        }
+                    }
+                    if added > 0 {
+                        info!(added, "shred ALT cache learned new lookup tables");
+                    }
+                })
+                .await;
+            }
+        });
     }
 
     /// Register a channel that receives the Pump pool pubkey whenever a
@@ -252,18 +314,35 @@ impl ShredConsumer {
         if let Some(lookups) = msg.address_table_lookups() {
             let mut writable = Vec::new();
             let mut readonly = Vec::new();
-            let alt_map = self.alt_map.read().unwrap();
-            for lookup in lookups {
-                let alt = alt_map.get(&lookup.account_key);
-                for &i in &lookup.writable_indexes {
-                    writable.push(
-                        alt.and_then(|a| a.get(i as usize)).copied().unwrap_or_default(),
-                    );
+            let mut unknown: Vec<Pubkey> = Vec::new();
+            {
+                let alt_map = self.alt_map.read().unwrap();
+                for lookup in lookups {
+                    let alt = alt_map.get(&lookup.account_key);
+                    if alt.is_none() {
+                        // ALT we don't have — queue it for the fetcher so future
+                        // swaps hiding a pool behind it become resolvable.
+                        unknown.push(lookup.account_key);
+                    }
+                    for &i in &lookup.writable_indexes {
+                        writable.push(
+                            alt.and_then(|a| a.get(i as usize)).copied().unwrap_or_default(),
+                        );
+                    }
+                    for &i in &lookup.readonly_indexes {
+                        readonly.push(
+                            alt.and_then(|a| a.get(i as usize)).copied().unwrap_or_default(),
+                        );
+                    }
                 }
-                for &i in &lookup.readonly_indexes {
-                    readonly.push(
-                        alt.and_then(|a| a.get(i as usize)).copied().unwrap_or_default(),
-                    );
+            }
+            if !unknown.is_empty() {
+                let mut pending = self.pending_alts.lock().unwrap();
+                // Bound memory: never let the backlog grow without limit.
+                if pending.len() < 5000 {
+                    for k in unknown {
+                        pending.insert(k);
+                    }
                 }
             }
             full.extend(writable);
