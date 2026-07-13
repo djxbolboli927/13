@@ -54,6 +54,10 @@ pub struct DiscoveryConfig {
     pub new_pools_url: String,
     /// DexScreener token endpoint with a literal `{mint}` placeholder.
     pub token_pairs_url: String,
+    /// Feed URLs scanned ONCE at startup to seed hot/top/trending tokens.
+    pub seed_urls: Vec<String>,
+    /// Max tokens resolved during the startup bootstrap.
+    pub bootstrap_max: usize,
 }
 
 pub struct Discovery {
@@ -69,6 +73,34 @@ pub struct Discovery {
 fn read_pk(data: &[u8], off: usize) -> Option<Pubkey> {
     data.get(off..off + 32)
         .map(|s| Pubkey::new_from_array(s.try_into().unwrap()))
+}
+
+/// Extract base+quote token mints from a GeckoTerminal-shaped pools response
+/// (`data[].relationships.{base,quote}_token.data.id == "solana_<mint>"`).
+/// WSOL is skipped. Shared by the new-pools feed and the startup seed feeds.
+fn extract_mints(body: &Value) -> Vec<Pubkey> {
+    let mut out = Vec::new();
+    if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
+        for item in arr {
+            for side in ["base_token", "quote_token"] {
+                if let Some(id) = item
+                    .get("relationships")
+                    .and_then(|r| r.get(side))
+                    .and_then(|t| t.get("data"))
+                    .and_then(|d| d.get("id"))
+                    .and_then(|s| s.as_str())
+                {
+                    let mint_str = id.rsplit('_').next().unwrap_or(id);
+                    if let Ok(pk) = Pubkey::from_str(mint_str) {
+                        if pk != wsol_mint() {
+                            out.push(pk);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Build a `PoolInfo` from a WSOL-paired pool given its mints and vaults.
@@ -149,8 +181,11 @@ impl Discovery {
         tokio::spawn(async move {
             info!(
                 interval_s = self.cfg.interval.as_secs(),
+                seed_urls = self.cfg.seed_urls.len(),
                 "pool discovery started"
             );
+            // One-time seed of hot/top tokens so the strategy starts full.
+            self.bootstrap().await;
             loop {
                 if let Err(e) = self.tick().await {
                     warn!(error = %e, "discovery tick failed");
@@ -186,29 +221,47 @@ impl Discovery {
             .await?
             .json()
             .await?;
-        let mut out = Vec::new();
-        if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
-            for item in arr {
-                for side in ["base_token", "quote_token"] {
-                    if let Some(id) = item
-                        .get("relationships")
-                        .and_then(|r| r.get(side))
-                        .and_then(|t| t.get("data"))
-                        .and_then(|d| d.get("id"))
-                        .and_then(|s| s.as_str())
-                    {
-                        // id form: "solana_<mint>"
-                        let mint_str = id.rsplit('_').next().unwrap_or(id);
-                        if let Ok(pk) = Pubkey::from_str(mint_str) {
-                            if pk != wsol_mint() {
-                                out.push(pk);
-                            }
-                        }
-                    }
-                }
+        Ok(extract_mints(&body))
+    }
+
+    /// Fetch candidate token mints from a single GeckoTerminal-shaped feed.
+    async fn fetch_mints_from(&self, url: &str) -> Result<Vec<Pubkey>> {
+        let body: Value = self.http.get(url).send().await?.json().await?;
+        Ok(extract_mints(&body))
+    }
+
+    /// One-time startup bootstrap: scan every seed URL for hot/top/trending
+    /// tokens, then resolve each (adding it if it lives on BOTH venues). Runs
+    /// before the normal poll loop so the strategy starts with a full pool set
+    /// instead of just the mix.json handful.
+    async fn bootstrap(&mut self) {
+        let mut candidates: Vec<Pubkey> = Vec::new();
+        for url in &self.cfg.seed_urls.clone() {
+            match self.fetch_mints_from(url).await {
+                Ok(mut m) => candidates.append(&mut m),
+                Err(e) => warn!(%url, error = %e, "bootstrap seed fetch failed"),
             }
         }
-        Ok(out)
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.truncate(self.cfg.bootstrap_max);
+        info!(count = candidates.len(), "bootstrap: resolving seed tokens");
+
+        let mut added = 0usize;
+        for mint in candidates {
+            if self.seen_tokens.contains(&mint) {
+                continue;
+            }
+            self.seen_tokens.insert(mint);
+            match self.try_resolve_pair(mint).await {
+                Ok(true) => added += 1,
+                Ok(false) => {}
+                Err(e) => debug!(token = %mint, error = %e, "bootstrap resolve failed"),
+            }
+            // Gentle pacing so we stay within API/RPC budgets (arb, not sniper).
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        info!(added, "bootstrap complete");
     }
 
     /// Ask DexScreener for candidate Pump/Meteora pool addresses for `mint`.
@@ -235,10 +288,11 @@ impl Discovery {
     }
 
     /// Resolve a token to a Pump↔Meteora `ArbPair` and add it, if one exists.
-    async fn try_resolve_pair(&self, mint: Pubkey) -> Result<()> {
+    /// Returns `Ok(true)` when a shared pool was found and added.
+    async fn try_resolve_pair(&self, mint: Pubkey) -> Result<bool> {
         let candidates = self.fetch_candidate_pools(&mint).await?;
         if candidates.len() < 2 {
-            return Ok(());
+            return Ok(false);
         }
 
         let pump_program = pumpfun_program();
@@ -277,7 +331,8 @@ impl Discovery {
                 meteora,
             };
             self.manager.add_pair(pair).await?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 }

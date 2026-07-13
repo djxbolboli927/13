@@ -507,6 +507,8 @@ fn spawn_shred_arb(
                     ),
                     new_pools_url: sa.discovery_new_pools_url.clone(),
                     token_pairs_url: sa.discovery_token_pairs_url.clone(),
+                    seed_urls: sa.discovery_seed_urls.clone(),
+                    bootstrap_max: sa.discovery_bootstrap_max,
                 },
                 pool_manager.clone(),
                 rpc_client.clone(),

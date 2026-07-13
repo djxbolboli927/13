@@ -155,6 +155,16 @@ pub struct ShredArbConfig {
     /// substituted with the token mint.
     #[serde(default = "default_dexscreener_token_url")]
     pub discovery_token_pairs_url: String,
+    /// STARTUP BOOTSTRAP: feed URLs (GeckoTerminal-shaped JSON) scanned once at
+    /// startup to seed the strategy with hot/top/trending tokens that already
+    /// trade on BOTH venues — so the bot isn't limited to the handful in
+    /// mix.json. Each pool's base+quote token is a candidate; only those with a
+    /// live Pump.fun AND Meteora pool are added.
+    #[serde(default = "default_discovery_seed_urls")]
+    pub discovery_seed_urls: Vec<String>,
+    /// Max tokens to resolve during the startup bootstrap (caps API/RPC work).
+    #[serde(default = "default_bootstrap_max")]
+    pub discovery_bootstrap_max: usize,
 }
 
 impl Default for ShredArbConfig {
@@ -193,8 +203,23 @@ impl Default for ShredArbConfig {
             discovery_interval_secs: default_discovery_interval(),
             discovery_new_pools_url: default_gecko_new_pools_url(),
             discovery_token_pairs_url: default_dexscreener_token_url(),
+            discovery_seed_urls: default_discovery_seed_urls(),
+            discovery_bootstrap_max: default_bootstrap_max(),
         }
     }
+}
+
+fn default_discovery_seed_urls() -> Vec<String> {
+    vec![
+        // Trending + top-volume Solana pools (all DEXes). On-chain owner check
+        // then keeps only the Pump.fun/Meteora tokens present on both venues.
+        "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1".to_string(),
+        "https://api.geckoterminal.com/api/v2/networks/solana/pools?page=1".to_string(),
+        "https://api.geckoterminal.com/api/v2/networks/solana/pools?page=2".to_string(),
+    ]
+}
+fn default_bootstrap_max() -> usize {
+    100
 }
 
 fn default_discovery_interval() -> u64 {
