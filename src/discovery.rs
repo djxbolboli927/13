@@ -62,6 +62,8 @@ pub struct DiscoveryConfig {
     pub min_h1_volume_usd: f64,
     /// Minimum Pump-side WSOL reserve (lamports) to add a token (0 = disabled).
     pub min_pump_wsol_lamports: u64,
+    /// Minimum Meteora-side WSOL vault balance (lamports) to add (0 = disabled).
+    pub min_meteora_wsol_lamports: u64,
 }
 
 pub struct Discovery {
@@ -88,18 +90,19 @@ fn extract_mints(body: &Value, min_h1_volume_usd: f64) -> Vec<Pubkey> {
     let mut out = Vec::new();
     if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
         for item in arr {
-            // Activity filter: 1-hour USD volume.
+            // Activity filter: require 1-hour USD volume ≥ threshold. Fail-CLOSED
+            // — a pool with no volume data is treated as quiet and skipped, so
+            // stale tokens (last trade hours ago) never get added.
             if min_h1_volume_usd > 0.0 {
                 let h1 = item
                     .get("attributes")
                     .and_then(|a| a.get("volume_usd"))
                     .and_then(|v| v.get("h1"))
                     .and_then(|s| s.as_str())
-                    .and_then(|s| s.parse::<f64>().ok());
-                if let Some(v) = h1 {
-                    if v < min_h1_volume_usd {
-                        continue; // too quiet
-                    }
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                if h1 < min_h1_volume_usd {
+                    continue; // too quiet / no data
                 }
             }
             for side in ["base_token", "quote_token"] {
@@ -368,6 +371,20 @@ impl Discovery {
             if met_liq == 0 {
                 debug!(token = %mint, "skip: Meteora pool already drained");
                 return Ok(false);
+            }
+            // Meteora depth gate: the arb is capped by the thin side, so a
+            // near-empty Meteora WSOL vault can never clear the fee. Skip those.
+            if self.cfg.min_meteora_wsol_lamports > 0 {
+                let met_wsol = self
+                    .rpc
+                    .get_account(&meteora.wsol_vault())
+                    .ok()
+                    .and_then(|a| read_u64(&a.data, 64))
+                    .unwrap_or(0);
+                if met_wsol < self.cfg.min_meteora_wsol_lamports {
+                    debug!(token = %mint, met_wsol, "skip: Meteora depth too thin");
+                    return Ok(false);
+                }
             }
 
             info!(token = %mint, "discovered shared Pump/Meteora pool");

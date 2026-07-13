@@ -136,6 +136,16 @@ pub struct ShredArbConfig {
     /// (0 = no priority fee). Only used when `direct_send = true`.
     #[serde(default)]
     pub direct_priority_fee_microlamports: u64,
+    /// Exact Metis `dexes=` label for the Pump.fun AMM leg. Case/spacing
+    /// sensitive. Configurable so you can fix it without a recompile if Metis
+    /// uses a slightly different string.
+    #[serde(default = "default_pump_label")]
+    pub metis_pump_label: String,
+    /// Exact Metis `dexes=` label for the Meteora DAMM v2 leg. If forced quotes
+    /// keep returning "No routes found" on the Meteora leg, try variants here
+    /// (e.g. "Meteora DAMM V2", "Meteora DAMM v2").
+    #[serde(default = "default_meteora_label")]
+    pub metis_meteora_label: String,
     /// `maxAccounts` requested from Metis for each forced leg. Lower = fewer
     /// accounts pulled into the tx = smaller serialized size (Solana caps a tx
     /// at 1232 raw bytes). 32 keeps a 2-hop circular comfortably under the cap.
@@ -187,6 +197,11 @@ pub struct ShredArbConfig {
     /// (or rugged) to bother with. Default 0.05 SOL. 0 disables the check.
     #[serde(default = "default_min_pump_wsol")]
     pub discovery_min_pump_wsol_lamports: u64,
+    /// Minimum Meteora-side WSOL vault balance (lamports) to add a token. The
+    /// arb is capped by the THIN side, so a near-empty Meteora pool can never
+    /// clear the fee no matter how big the gap. Default 0.002 SOL. 0 disables.
+    #[serde(default = "default_min_meteora_wsol")]
+    pub discovery_min_meteora_wsol_lamports: u64,
     /// Close a pool + its ATA if NO account update arrives for its Meteora pool
     /// for this many seconds while the bot is running (idle = abandoned/rugged).
     /// This — not a liquidity dip — is the primary rug signal. Default 14400 (4h).
@@ -239,8 +254,11 @@ impl Default for ShredArbConfig {
             discovery_bootstrap_max: default_bootstrap_max(),
             discovery_min_h1_volume_usd: default_min_h1_volume_usd(),
             discovery_min_pump_wsol_lamports: default_min_pump_wsol(),
+            discovery_min_meteora_wsol_lamports: default_min_meteora_wsol(),
             pool_idle_close_secs: default_pool_idle_close_secs(),
             min_trigger_reserve_frac: 0.0,
+            metis_pump_label: default_pump_label(),
+            metis_meteora_label: default_meteora_label(),
             metis_max_accounts: default_metis_max_accounts(),
             direct_loaded_accounts_data_limit: 0,
         }
@@ -250,11 +268,20 @@ impl Default for ShredArbConfig {
 fn default_metis_max_accounts() -> u64 {
     32
 }
+fn default_pump_label() -> String {
+    "Pump.fun Amm".to_string()
+}
+fn default_meteora_label() -> String {
+    "Meteora DAMM v2".to_string()
+}
 fn default_min_h1_volume_usd() -> f64 {
     200.0
 }
 fn default_min_pump_wsol() -> u64 {
     50_000_000
+}
+fn default_min_meteora_wsol() -> u64 {
+    2_000_000
 }
 fn default_pool_idle_close_secs() -> u64 {
     14_400

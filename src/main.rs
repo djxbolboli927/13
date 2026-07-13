@@ -351,6 +351,8 @@ fn spawn_shred_arb(
         metis_max_accounts: sa.metis_max_accounts,
         loaded_accounts_data_limit: sa.direct_loaded_accounts_data_limit,
         min_trigger_reserve_frac: sa.min_trigger_reserve_frac,
+        pump_label: sa.metis_pump_label.clone(),
+        meteora_label: sa.metis_meteora_label.clone(),
     };
 
     // ── Build self-test ──────────────────────────────────────────────────────
@@ -543,6 +545,7 @@ fn spawn_shred_arb(
                     bootstrap_max: sa.discovery_bootstrap_max,
                     min_h1_volume_usd: sa.discovery_min_h1_volume_usd,
                     min_pump_wsol_lamports: sa.discovery_min_pump_wsol_lamports,
+                    min_meteora_wsol_lamports: sa.discovery_min_meteora_wsol_lamports,
                 },
                 pool_manager.clone(),
                 rpc_client.clone(),

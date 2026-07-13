@@ -81,6 +81,9 @@ pub struct ArbParams {
     /// Only react to observed trades ≥ this fraction of the Pump WSOL reserve
     /// (0 = disabled, use the absolute min_trigger only).
     pub min_trigger_reserve_frac: f64,
+    /// Metis `dexes=` labels for each venue (configurable).
+    pub pump_label: String,
+    pub meteora_label: String,
 }
 
 pub struct ShredArbEngine {
@@ -437,22 +440,19 @@ impl ShredArbEngine {
         floor: u64,
     ) {
         let token = pair.token_mint.to_string();
+        let buy_label = self.label_for(buy_kind);
+        let sell_label = self.label_for(sell_kind);
 
         // Leg 1: forced buy on `buy_kind` (WSOL → token).
         let q1 = match self
             .metis
-            .get_quote_forced(
-                WSOL_MINT,
-                &token,
-                amount_in,
-                buy_kind.metis_label(),
-                self.params.metis_max_accounts,
-            )
+            .get_quote_forced(WSOL_MINT, &token, amount_in, buy_label, self.params.metis_max_accounts)
             .await
         {
             Ok(q) => q,
             Err(e) => {
-                warn!(error = %e, "forced buy quote failed");
+                warn!(error = %e, leg = "buy", venue = buy_label, "forced quote failed — re-adding market");
+                self.readd_market(&pair, buy_kind).await;
                 self.note_route_failure(pool);
                 return;
             }
@@ -465,18 +465,13 @@ impl ShredArbEngine {
         // Leg 2: forced sell on `sell_kind` (token → WSOL).
         let q2 = match self
             .metis
-            .get_quote_forced(
-                &token,
-                WSOL_MINT,
-                token_amt,
-                sell_kind.metis_label(),
-                self.params.metis_max_accounts,
-            )
+            .get_quote_forced(&token, WSOL_MINT, token_amt, sell_label, self.params.metis_max_accounts)
             .await
         {
             Ok(q) => q,
             Err(e) => {
-                warn!(error = %e, "forced sell quote failed");
+                warn!(error = %e, leg = "sell", venue = sell_label, "forced quote failed — re-adding market");
+                self.readd_market(&pair, sell_kind).await;
                 self.note_route_failure(pool);
                 return;
             }
@@ -634,6 +629,33 @@ impl ShredArbEngine {
                 info!(bundle = %id, input = amount_in, "shred-arb bundle sent");
             }
             Err(e) => warn!(error = %e, "shred-arb bundle send failed"),
+        }
+    }
+
+    /// The configurable Metis `dexes=` label for a venue.
+    fn label_for(&self, kind: DexKind) -> &str {
+        match kind {
+            DexKind::PumpFunAmm => &self.params.pump_label,
+            DexKind::MeteoraDammV2 => &self.params.meteora_label,
+        }
+    }
+
+    /// Re-register the relevant leg's pool with Metis after a "No routes"
+    /// failure — the market may not have loaded on the first add, or Metis
+    /// restarted. Cheap and idempotent; the route-failure counter still drops
+    /// the pool if it keeps failing.
+    async fn readd_market(&self, pair: &ArbPair, kind: DexKind) {
+        let (info, owner) = match kind {
+            DexKind::PumpFunAmm => (&pair.pump, crate::dex_ids::PUMPFUN_AMM_PROGRAM),
+            DexKind::MeteoraDammV2 => (&pair.meteora, crate::dex_ids::METEORA_DAMM_V2_PROGRAM),
+        };
+        let alt = info.alt.map(|a| a.to_string());
+        if let Err(e) = self
+            .metis
+            .add_market(&info.pool.to_string(), owner, alt.as_deref())
+            .await
+        {
+            debug!(pool = %info.pool, error = %e, "re-add market failed");
         }
     }
 
