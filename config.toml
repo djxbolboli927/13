@@ -171,6 +171,12 @@ max_profit_fraction_pct = 50.0
 # خروجی‌اش حتی ۱ لمپرت از ورودی بیشتر باشد ارسال می‌شود، بدون توجه به سود).
 # tip=1600 و fee=5000 همچنان روی تراکنش اعمال می‌شوند، پس این تریدها ضرر
 # می‌دهند — فقط برای آزمایش مسیر ارسال. در حالت واقعی false کنید.
+always_exist_mints = [
+  "So11111111111111111111111111111111111111112",  # SOL/WSOL
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+]
+
 force_send_test = true
 
 [template_cache]
