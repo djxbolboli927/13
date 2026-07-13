@@ -138,35 +138,50 @@ impl PoolManager {
         Ok(())
     }
 
-    /// Periodically sweep tracked pools and tear down any that have been
-    /// drained (rug): Meteora `liquidity == 0`, or a Pump vault emptied. A pool
-    /// must read as drained on `confirm_ticks` consecutive sweeps before we act,
-    /// so a transient zero/garbage read never triggers a false removal.
-    pub fn spawn_rug_monitor(self: Arc<Self>, interval: Duration, confirm_ticks: u32) {
+    /// Periodically sweep tracked pools and tear down dead ones. A pool is dead
+    /// when EITHER it is fully drained (Meteora `liquidity == 0` / an emptied
+    /// Pump vault — an unambiguous total removal, not a mere dip) OR it has been
+    /// IDLE: no account update for its Meteora pool for `idle_timeout` (the bot
+    /// has been running and simply stopped seeing activity → abandoned/rugged).
+    /// A liquidity *reduction* is deliberately NOT a trigger — that closed good
+    /// hot pools. Full-drain requires `confirm_ticks` consecutive reads to avoid
+    /// a transient garbage read; the idle check is time-based already.
+    pub fn spawn_rug_monitor(
+        self: Arc<Self>,
+        interval: Duration,
+        confirm_ticks: u32,
+        idle_timeout: Duration,
+    ) {
         tokio::spawn(async move {
             let mut strikes: std::collections::HashMap<Pubkey, u32> =
                 std::collections::HashMap::new();
-            // Running peak Meteora liquidity per pool, for partial-rug detection.
-            let mut peak: std::collections::HashMap<Pubkey, u128> =
-                std::collections::HashMap::new();
             loop {
                 tokio::time::sleep(interval).await;
-                let mut drained: Vec<Pubkey> = Vec::new();
+                let mut dead: Vec<Pubkey> = Vec::new();
                 for entry in self.registry.iter() {
                     let pair = entry.value();
-                    if self.is_drained(pair, &mut peak) {
+
+                    // Idle timeout: no Meteora update for the whole window.
+                    if let Some(age) = self.pool_state.last_update_age(&pair.meteora.pool) {
+                        if age >= idle_timeout {
+                            dead.push(pair.pump.pool);
+                            continue;
+                        }
+                    }
+
+                    // Full drain (confirmed over N sweeps).
+                    if self.is_fully_drained(pair) {
                         let c = strikes.entry(pair.pump.pool).or_insert(0);
                         *c += 1;
                         if *c >= confirm_ticks {
-                            drained.push(pair.pump.pool);
+                            dead.push(pair.pump.pool);
                         }
                     } else {
                         strikes.remove(&pair.pump.pool);
                     }
                 }
-                for pool in drained {
+                for pool in dead {
                     strikes.remove(&pool);
-                    peak.remove(&pool);
                     // remove_pair does blocking RPC (close ATA) — offload it so
                     // the monitor loop isn't stalled on a tokio worker thread.
                     let me = self.clone();
@@ -176,33 +191,15 @@ impl PoolManager {
         });
     }
 
-    /// True if the pair looks rugged. Catches BOTH a full drain (Meteora
-    /// `liquidity == 0` / an emptied Pump vault) AND a partial rug: Meteora
-    /// liquidity collapsing to under 20% of the peak we've observed (a large
-    /// remove-liquidity). `peak` (keyed by Pump pool) is the running max. A
-    /// missing cache read is "unknown", never drained.
-    fn is_drained(
-        &self,
-        pair: &ArbPair,
-        peak: &mut std::collections::HashMap<Pubkey, u128>,
-    ) -> bool {
-        let pump_dead = matches!(self.pool_state.spl_amount(&pair.pump.token_vault()), Some(0))
-            || matches!(self.pool_state.spl_amount(&pair.pump.wsol_vault()), Some(0));
-        if pump_dead {
-            return true;
-        }
-        match self.pool_state.meteora_raw_liquidity(&pair.meteora.pool) {
-            Some(0) => true,
-            Some(liq) => {
-                let p = peak.entry(pair.pump.pool).or_insert(liq);
-                if liq > *p {
-                    *p = liq;
-                }
-                // Collapsed to <20% of peak → treat as a rug (big remove-liq).
-                *p > 0 && liq < *p / 5
-            }
-            None => false, // not cached yet
-        }
+    /// True only on a TOTAL drain: Meteora `liquidity == 0` or a Pump vault
+    /// emptied. A missing cache read is "unknown", never drained.
+    fn is_fully_drained(&self, pair: &ArbPair) -> bool {
+        matches!(self.pool_state.spl_amount(&pair.pump.token_vault()), Some(0))
+            || matches!(self.pool_state.spl_amount(&pair.pump.wsol_vault()), Some(0))
+            || matches!(
+                self.pool_state.meteora_raw_liquidity(&pair.meteora.pool),
+                Some(0)
+            )
     }
 
     /// Tear down a rugged/dead pool: stop trading it, unwatch it, reclaim rent.

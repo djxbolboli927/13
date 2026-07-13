@@ -28,6 +28,8 @@ use pb::{shredstream_proxy_client::ShredstreamProxyClient, SubscribeEntriesReque
 // Anchor 8-byte discriminators for PumpSwap instructions.
 const DISC_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 const DISC_SELL: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+/// `withdraw` (remove liquidity) — the direct rug signal.
+const DISC_WITHDRAW: [u8; 8] = [183, 18, 70, 156, 148, 109, 161, 34];
 
 /// A Pump.fun swap observed on ShredStream, before it reaches Metis/chain.
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +66,9 @@ pub struct ShredConsumer {
     /// can resolve ALT-provided accounts without an RPC call on the hot path.
     alt_map: std::sync::RwLock<HashMap<Pubkey, Vec<Pubkey>>>,
     pumpfun: Pubkey,
+    /// Optional sink for detected remove-liquidity (`withdraw`) events on a
+    /// watched pool — the Pump pool pubkey is sent so the manager can close it.
+    remove_tx: std::sync::RwLock<Option<mpsc::Sender<Pubkey>>>,
     pub metrics: Arc<ShredMetrics>,
 }
 
@@ -82,8 +87,15 @@ impl ShredConsumer {
             target_pools: std::sync::RwLock::new(target_pools),
             alt_map: std::sync::RwLock::new(alt_map),
             pumpfun: pumpfun_program(),
+            remove_tx: std::sync::RwLock::new(None),
             metrics,
         }
+    }
+
+    /// Register a channel that receives the Pump pool pubkey whenever a
+    /// remove-liquidity (`withdraw`) instruction is seen on a watched pool.
+    pub fn set_remove_sender(&self, tx: mpsc::Sender<Pubkey>) {
+        *self.remove_tx.write().unwrap() = Some(tx);
     }
 
     /// Add a Pump.fun pool to the watch set at runtime (and optionally its ALT
@@ -182,13 +194,14 @@ impl ShredConsumer {
             if program != self.pumpfun {
                 continue;
             }
-            if ix.data.len() < 24 {
+            if ix.data.len() < 8 {
                 continue;
             }
             let disc: [u8; 8] = ix.data[0..8].try_into().unwrap();
             let is_buy = disc == DISC_BUY;
             let is_sell = disc == DISC_SELL;
-            if !is_buy && !is_sell {
+            let is_withdraw = disc == DISC_WITHDRAW;
+            if !is_buy && !is_sell && !is_withdraw {
                 continue;
             }
             // Account index 0 = pool.
@@ -204,6 +217,17 @@ impl ShredConsumer {
                 continue;
             }
 
+            // Remove-liquidity on a watched pool → signal the manager to close it.
+            if is_withdraw {
+                if let Some(sender) = self.remove_tx.read().unwrap().as_ref() {
+                    let _ = sender.try_send(pool);
+                }
+                continue;
+            }
+
+            if ix.data.len() < 24 {
+                continue;
+            }
             let base_amount = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());
             let quote_amount = u64::from_le_bytes(ix.data[16..24].try_into().unwrap());
 

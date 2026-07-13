@@ -162,6 +162,7 @@ pub fn build_direct_transaction(
     payer: &Keypair,
     cu_limit: u32,
     priority_fee_microlamports: u64,
+    loaded_accounts_data_limit: u32,
     recent_blockhash: Hash,
     alt_cache: &AltCache,
     rpc_client: &RpcClient,
@@ -187,6 +188,19 @@ pub fn build_direct_transaction(
             data: {
                 let mut data = vec![0x03];
                 data.extend_from_slice(&priority_fee_microlamports.to_le_bytes());
+                data
+            },
+        });
+    }
+
+    // #2b -- SetLoadedAccountsDataSizeLimit, optional (0x04, u32 bytes).
+    if loaded_accounts_data_limit > 0 {
+        instructions.push(Instruction {
+            program_id: Pubkey::from_str("ComputeBudget111111111111111111111111111111")?,
+            accounts: vec![],
+            data: {
+                let mut data = vec![0x04];
+                data.extend_from_slice(&loaded_accounts_data_limit.to_le_bytes());
                 data
             },
         });
@@ -219,6 +233,13 @@ pub fn build_direct_transaction(
     let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[payer])
         .context("failed to sign versioned transaction (direct)")?;
     Ok(tx)
+}
+
+/// Serialized (raw, wire) byte length of a transaction. Solana rejects any tx
+/// whose raw form exceeds 1232 bytes, so we check this before sending to avoid
+/// a guaranteed `-32602 too large` RPC error.
+pub fn serialized_len(tx: &VersionedTransaction) -> usize {
+    bincode::serialize(tx).map(|b| b.len()).unwrap_or(usize::MAX)
 }
 
 /// Number of distinct accounts the transaction locks.

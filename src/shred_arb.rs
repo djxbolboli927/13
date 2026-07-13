@@ -74,6 +74,13 @@ pub struct ArbParams {
     pub direct_send: bool,
     /// Priority fee (micro-lamports/CU) for direct sends (0 = none).
     pub direct_priority_fee_microlamports: u64,
+    /// `maxAccounts` requested per forced leg (controls tx size).
+    pub metis_max_accounts: u64,
+    /// SetLoadedAccountsDataSizeLimit byte value (0 = don't add).
+    pub loaded_accounts_data_limit: u32,
+    /// Only react to observed trades ≥ this fraction of the Pump WSOL reserve
+    /// (0 = disabled, use the absolute min_trigger only).
+    pub min_trigger_reserve_frac: f64,
 }
 
 pub struct ShredArbEngine {
@@ -225,6 +232,18 @@ impl ShredArbEngine {
                 return;
             }
         };
+        // Liquidity-relative trigger: skip trades too small to move THIS pool's
+        // price meaningfully (more precise than a flat lamport threshold — a
+        // "big" trade on a thin pool is tiny on a deep one).
+        if self.params.min_trigger_reserve_frac > 0.0 {
+            let thresh =
+                (pump_now.quote_reserve as f64 * self.params.min_trigger_reserve_frac) as u64;
+            if sig.quote_amount < thresh {
+                self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+
         let pump_after = if sig.is_buy {
             pump_now.after_observed_buy(sig.base_amount)
         } else {
@@ -422,7 +441,13 @@ impl ShredArbEngine {
         // Leg 1: forced buy on `buy_kind` (WSOL → token).
         let q1 = match self
             .metis
-            .get_quote_forced(WSOL_MINT, &token, amount_in, buy_kind.metis_label())
+            .get_quote_forced(
+                WSOL_MINT,
+                &token,
+                amount_in,
+                buy_kind.metis_label(),
+                self.params.metis_max_accounts,
+            )
             .await
         {
             Ok(q) => q,
@@ -440,7 +465,13 @@ impl ShredArbEngine {
         // Leg 2: forced sell on `sell_kind` (token → WSOL).
         let q2 = match self
             .metis
-            .get_quote_forced(&token, WSOL_MINT, token_amt, sell_kind.metis_label())
+            .get_quote_forced(
+                &token,
+                WSOL_MINT,
+                token_amt,
+                sell_kind.metis_label(),
+                self.params.metis_max_accounts,
+            )
             .await
         {
             Ok(q) => q,
@@ -484,12 +515,14 @@ impl ShredArbEngine {
         // ── Direct-to-RPC send (default): no Jito, no tip, minimal latency ──
         if self.params.direct_send {
             let prio = self.params.direct_priority_fee_microlamports;
+            let data_limit = self.params.loaded_accounts_data_limit;
             let tx = match tokio::task::spawn_blocking(move || {
                 transaction::build_direct_transaction(
                     &swap_ixs,
                     &keypair,
                     cu,
                     prio,
+                    data_limit,
                     recent_blockhash,
                     &alt,
                     &rpc,
@@ -506,6 +539,18 @@ impl ShredArbEngine {
 
             if transaction::account_lock_count(&tx) > 64 {
                 warn!("direct arb tx exceeds 64 account locks, dropping");
+                return;
+            }
+            // Pre-check the raw byte size (Solana caps at 1232) so we don't burn
+            // an RPC round-trip on a guaranteed "-32602 too large" rejection.
+            let raw = transaction::serialized_len(&tx);
+            if raw > 1232 {
+                warn!(
+                    bytes = raw,
+                    max_accounts = self.params.metis_max_accounts,
+                    "direct arb tx too large ({} > 1232 bytes), dropping — lower metis_max_accounts",
+                    raw
+                );
                 return;
             }
 

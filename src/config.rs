@@ -136,6 +136,17 @@ pub struct ShredArbConfig {
     /// (0 = no priority fee). Only used when `direct_send = true`.
     #[serde(default)]
     pub direct_priority_fee_microlamports: u64,
+    /// `maxAccounts` requested from Metis for each forced leg. Lower = fewer
+    /// accounts pulled into the tx = smaller serialized size (Solana caps a tx
+    /// at 1232 raw bytes). 32 keeps a 2-hop circular comfortably under the cap.
+    #[serde(default = "default_metis_max_accounts")]
+    pub metis_max_accounts: u64,
+    /// If > 0, add a `SetLoadedAccountsDataSizeLimit` compute-budget instruction
+    /// with this byte value (competitors use it to cut the CU billed for
+    /// account loading, which helps landing). 0 = don't add it. Note: it does
+    /// NOT reduce tx size — it adds a few bytes — so leave off if size-bound.
+    #[serde(default)]
+    pub direct_loaded_accounts_data_limit: u32,
     /// Token mints whose ATA is assumed to ALWAYS exist — never checked, never
     /// created at startup. Put SOL/WSOL/USDC/USDT (and any other permanent
     /// holdings) here. Edited in config.toml under `[shred_arb]`.
@@ -165,6 +176,26 @@ pub struct ShredArbConfig {
     /// Max tokens to resolve during the startup bootstrap (caps API/RPC work).
     #[serde(default = "default_bootstrap_max")]
     pub discovery_bootstrap_max: usize,
+    /// Only consider pools created within this many hours (freshness filter for
+    /// bootstrap/discovery). We want hot recently-launched tokens, not stale
+    /// ones whose last trade was a day ago. Default 2.
+    #[serde(default = "default_discovery_max_age_hours")]
+    pub discovery_max_age_hours: u64,
+    /// Minimum Pump.fun-side WSOL reserve (lamports) for a token to be added.
+    /// Liquidity matters mostly on the Pump side; a pool below this is too thin
+    /// (or rugged) to bother with. Default 0.05 SOL. 0 disables the check.
+    #[serde(default = "default_min_pump_wsol")]
+    pub discovery_min_pump_wsol_lamports: u64,
+    /// Close a pool + its ATA if NO account update arrives for its Meteora pool
+    /// for this many seconds while the bot is running (idle = abandoned/rugged).
+    /// This — not a liquidity dip — is the primary rug signal. Default 14400 (4h).
+    #[serde(default = "default_pool_idle_close_secs")]
+    pub pool_idle_close_secs: u64,
+    /// Only react to an observed Pump trade if its SOL-side size is at least this
+    /// fraction of the Pump pool's WSOL reserve (e.g. 0.02 = 2%). Focuses work on
+    /// trades that actually move price. 0 disables (fall back to min_trigger_sol).
+    #[serde(default)]
+    pub min_trigger_reserve_frac: f64,
 }
 
 impl Default for ShredArbConfig {
@@ -205,17 +236,37 @@ impl Default for ShredArbConfig {
             discovery_token_pairs_url: default_dexscreener_token_url(),
             discovery_seed_urls: default_discovery_seed_urls(),
             discovery_bootstrap_max: default_bootstrap_max(),
+            discovery_max_age_hours: default_discovery_max_age_hours(),
+            discovery_min_pump_wsol_lamports: default_min_pump_wsol(),
+            pool_idle_close_secs: default_pool_idle_close_secs(),
+            min_trigger_reserve_frac: 0.0,
+            metis_max_accounts: default_metis_max_accounts(),
+            direct_loaded_accounts_data_limit: 0,
         }
     }
 }
 
+fn default_metis_max_accounts() -> u64 {
+    32
+}
+fn default_discovery_max_age_hours() -> u64 {
+    2
+}
+fn default_min_pump_wsol() -> u64 {
+    50_000_000
+}
+fn default_pool_idle_close_secs() -> u64 {
+    14_400
+}
+
 fn default_discovery_seed_urls() -> Vec<String> {
     vec![
-        // Trending + top-volume Solana pools (all DEXes). On-chain owner check
-        // then keeps only the Pump.fun/Meteora tokens present on both venues.
+        // Freshly-created pools (newest first) + trending — the age filter then
+        // keeps only recent ones. On-chain owner check keeps Pump/Meteora tokens
+        // present on both venues. These are hot NEW launches, not day-old tokens.
+        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1".to_string(),
+        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2".to_string(),
         "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1".to_string(),
-        "https://api.geckoterminal.com/api/v2/networks/solana/pools?page=1".to_string(),
-        "https://api.geckoterminal.com/api/v2/networks/solana/pools?page=2".to_string(),
     ]
 }
 fn default_bootstrap_max() -> usize {

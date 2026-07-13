@@ -49,6 +49,9 @@ const SPL_AMOUNT_OFFSET: usize = 64;
 #[derive(Clone)]
 pub struct PoolStateCache {
     inner: Arc<DashMap<Pubkey, Vec<u8>>>,
+    /// Last time each account's data changed (seeded at prefetch, refreshed on
+    /// every stream update). Used by the rug monitor's idle-timeout check.
+    last_update: Arc<DashMap<Pubkey, std::time::Instant>>,
     slot: Arc<AtomicU64>,
     /// Total account updates received (for diagnostics).
     updates: Arc<AtomicU64>,
@@ -72,6 +75,7 @@ impl PoolStateCache {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(DashMap::with_capacity(256)),
+            last_update: Arc::new(DashMap::with_capacity(256)),
             slot: Arc::new(AtomicU64::new(0)),
             updates: Arc::new(AtomicU64::new(0)),
             accounts: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -123,16 +127,24 @@ impl PoolStateCache {
     /// fresh. Runs synchronously at startup.
     pub fn prefetch(&self, rpc: &RpcClient, accounts: &[Pubkey]) {
         let mut ok = 0usize;
+        let now = std::time::Instant::now();
         for pk in accounts {
             match rpc.get_account(pk) {
                 Ok(acct) => {
                     self.inner.insert(*pk, acct.data);
+                    self.last_update.insert(*pk, now);
                     ok += 1;
                 }
                 Err(e) => warn!(account = %pk, error = %e, "pool-state prefetch miss"),
             }
         }
         info!(requested = accounts.len(), fetched = ok, "pool-state prefetch complete");
+    }
+
+    /// How long since `account` last changed (seeded at prefetch). `None` if we
+    /// have never seen it. Used to detect abandoned/rugged pools by idleness.
+    pub fn last_update_age(&self, account: &Pubkey) -> Option<std::time::Duration> {
+        self.last_update.get(account).map(|t| t.elapsed())
     }
 
     /// Decode a Meteora pool account into its pricing slice. The fee is read
@@ -210,6 +222,7 @@ impl PoolStateCache {
             set.dedup();
         }
         let inner = self.inner.clone();
+        let last_update = self.last_update.clone();
         let slot = self.slot.clone();
         let updates = self.updates.clone();
         let acct_set = self.accounts.clone();
@@ -217,8 +230,10 @@ impl PoolStateCache {
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
             loop {
-                match run_stream(&endpoint, &x_token, &acct_set, &change, &inner, &slot, &updates)
-                    .await
+                match run_stream(
+                    &endpoint, &x_token, &acct_set, &change, &inner, &last_update, &slot, &updates,
+                )
+                .await
                 {
                     Ok(()) => warn!("pool-state stream ended cleanly, reconnecting"),
                     Err(e) => warn!(error = %e, "pool-state stream error, reconnecting"),
@@ -254,6 +269,7 @@ async fn run_stream(
     acct_set: &Arc<std::sync::Mutex<Vec<Pubkey>>>,
     change: &Arc<tokio::sync::Notify>,
     cache: &Arc<DashMap<Pubkey, Vec<u8>>>,
+    last_update: &Arc<DashMap<Pubkey, std::time::Instant>>,
     slot: &Arc<AtomicU64>,
     updates: &Arc<AtomicU64>,
 ) -> Result<()> {
@@ -298,6 +314,7 @@ async fn run_stream(
                 if let Some(info) = a.account {
                     if let Ok(pk) = Pubkey::try_from(info.pubkey.as_slice()) {
                         cache.insert(pk, info.data);
+                        last_update.insert(pk, std::time::Instant::now());
                         updates.fetch_add(1, Ordering::Relaxed);
                     }
                 }

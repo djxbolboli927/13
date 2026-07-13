@@ -348,6 +348,9 @@ fn spawn_shred_arb(
         min_net_profit_lamports: sa.min_net_profit_lamports,
         direct_send: sa.direct_send,
         direct_priority_fee_microlamports: sa.direct_priority_fee_microlamports,
+        metis_max_accounts: sa.metis_max_accounts,
+        loaded_accounts_data_limit: sa.direct_loaded_accounts_data_limit,
+        min_trigger_reserve_frac: sa.min_trigger_reserve_frac,
     };
 
     // ── Build self-test ──────────────────────────────────────────────────────
@@ -491,11 +494,30 @@ fn spawn_shred_arb(
                 }
             });
         }
-        // Rug monitor: drop pools whose liquidity has been pulled and close
-        // their ATAs. Confirm over 3 consecutive sweeps to avoid false removals.
-        pool_manager
-            .clone()
-            .spawn_rug_monitor(std::time::Duration::from_secs(2), 3);
+        // Rug monitor: close pools on total drain (confirmed over 3 sweeps) or
+        // after `pool_idle_close_secs` with no Meteora update (abandoned). A
+        // mere liquidity dip is NOT a trigger.
+        pool_manager.clone().spawn_rug_monitor(
+            std::time::Duration::from_secs(2),
+            3,
+            std::time::Duration::from_secs(sa.pool_idle_close_secs.max(60)),
+        );
+
+        // Route ShredStream remove-liquidity (withdraw) events on watched pools
+        // straight to the manager to close the pool + ATA — the direct rug
+        // signal the user asked for.
+        {
+            let (rm_tx, mut rm_rx) =
+                tokio::sync::mpsc::channel::<solana_sdk::pubkey::Pubkey>(256);
+            consumer.set_remove_sender(rm_tx);
+            let mgr = pool_manager.clone();
+            tokio::spawn(async move {
+                while let Some(pool) = rm_rx.recv().await {
+                    let mgr = mgr.clone();
+                    tokio::task::spawn_blocking(move || mgr.remove_pair(&pool));
+                }
+            });
+        }
 
         // Auto-discovery: poll public APIs for new shared Pump/Meteora pools and
         // add them at runtime via the pool manager.
@@ -509,6 +531,8 @@ fn spawn_shred_arb(
                     token_pairs_url: sa.discovery_token_pairs_url.clone(),
                     seed_urls: sa.discovery_seed_urls.clone(),
                     bootstrap_max: sa.discovery_bootstrap_max,
+                    max_age_secs: sa.discovery_max_age_hours.saturating_mul(3600),
+                    min_pump_wsol_lamports: sa.discovery_min_pump_wsol_lamports,
                 },
                 pool_manager.clone(),
                 rpc_client.clone(),

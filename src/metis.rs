@@ -221,18 +221,19 @@ impl MetisClient {
         output_mint: &str,
         amount_lamports: u64,
         dex_label: &str,
+        max_accounts: u64,
     ) -> Result<QuoteResponse> {
         let dexes = dex_label.replace(' ', "+");
         let url = format!(
             "{}/quote?inputMint={}&outputMint={}&amount={}\
              &slippageBps=0\
-             &maxAccounts=50\
+             &maxAccounts={}\
              &swapMode=ExactIn\
              &forJitoBundle=true\
              &onlyDirectRoutes=true\
              &instructionVersion=V2\
              &dexes={}",
-            self.base_url, input_mint, output_mint, amount_lamports, dexes
+            self.base_url, input_mint, output_mint, amount_lamports, max_accounts, dexes
         );
 
         let resp = self

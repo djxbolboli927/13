@@ -58,6 +58,10 @@ pub struct DiscoveryConfig {
     pub seed_urls: Vec<String>,
     /// Max tokens resolved during the startup bootstrap.
     pub bootstrap_max: usize,
+    /// Only accept pools created within this many seconds (0 = no age filter).
+    pub max_age_secs: u64,
+    /// Minimum Pump-side WSOL reserve (lamports) to add a token (0 = disabled).
+    pub min_pump_wsol_lamports: u64,
 }
 
 pub struct Discovery {
@@ -77,11 +81,26 @@ fn read_pk(data: &[u8], off: usize) -> Option<Pubkey> {
 
 /// Extract base+quote token mints from a GeckoTerminal-shaped pools response
 /// (`data[].relationships.{base,quote}_token.data.id == "solana_<mint>"`).
-/// WSOL is skipped. Shared by the new-pools feed and the startup seed feeds.
-fn extract_mints(body: &Value) -> Vec<Pubkey> {
+/// WSOL is skipped. `max_age_secs > 0` drops pools whose `pool_created_at` is
+/// older than that (freshness filter); a pool with no timestamp is kept.
+fn extract_mints(body: &Value, max_age_secs: u64) -> Vec<Pubkey> {
+    let now = unix_now();
     let mut out = Vec::new();
     if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
         for item in arr {
+            // Freshness filter.
+            if max_age_secs > 0 {
+                if let Some(created) = item
+                    .get("attributes")
+                    .and_then(|a| a.get("pool_created_at"))
+                    .and_then(|s| s.as_str())
+                    .and_then(iso8601_to_unix)
+                {
+                    if now.saturating_sub(created) > max_age_secs as i64 {
+                        continue; // too old
+                    }
+                }
+            }
             for side in ["base_token", "quote_token"] {
                 if let Some(id) = item
                     .get("relationships")
@@ -101,6 +120,34 @@ fn extract_mints(body: &Value) -> Vec<Pubkey> {
         }
     }
     out
+}
+
+/// Current unix time (seconds).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse an `YYYY-MM-DDTHH:MM:SSZ` (RFC3339, UTC) timestamp to a unix epoch.
+/// Minimal — ignores fractional seconds and non-Z offsets (treats as UTC).
+fn iso8601_to_unix(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 19 {
+        return None;
+    }
+    let num = |a: usize, z: usize| -> Option<i64> { s.get(a..z)?.parse().ok() };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, se) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    // days from civil (Howard Hinnant's algorithm).
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + h * 3600 + mi * 60 + se)
 }
 
 /// Build a `PoolInfo` from a WSOL-paired pool given its mints and vaults.
@@ -221,13 +268,13 @@ impl Discovery {
             .await?
             .json()
             .await?;
-        Ok(extract_mints(&body))
+        Ok(extract_mints(&body, self.cfg.max_age_secs))
     }
 
     /// Fetch candidate token mints from a single GeckoTerminal-shaped feed.
     async fn fetch_mints_from(&self, url: &str) -> Result<Vec<Pubkey>> {
         let body: Value = self.http.get(url).send().await?.json().await?;
-        Ok(extract_mints(&body))
+        Ok(extract_mints(&body, self.cfg.max_age_secs))
     }
 
     /// One-time startup bootstrap: scan every seed URL for hot/top/trending
@@ -324,6 +371,32 @@ impl Discovery {
         }
 
         if let (Some(pump), Some(meteora)) = (pump, meteora) {
+            // Liquidity + not-rugged gates. Liquidity matters mostly on the Pump
+            // side; Meteora just needs to still hold liquidity (not rugged).
+            if self.cfg.min_pump_wsol_lamports > 0 {
+                let wsol = self
+                    .rpc
+                    .get_account(&pump.wsol_vault())
+                    .ok()
+                    .and_then(|a| read_u64(&a.data, 64))
+                    .unwrap_or(0);
+                if wsol < self.cfg.min_pump_wsol_lamports {
+                    debug!(token = %mint, wsol, "skip: Pump liquidity below threshold");
+                    return Ok(false);
+                }
+            }
+            // Meteora must still have liquidity (offset 360, u128) — skip rugs.
+            let met_liq = self
+                .rpc
+                .get_account(&meteora.pool)
+                .ok()
+                .and_then(|a| read_u128(&a.data, 360))
+                .unwrap_or(0);
+            if met_liq == 0 {
+                debug!(token = %mint, "skip: Meteora pool already drained");
+                return Ok(false);
+            }
+
             info!(token = %mint, "discovered shared Pump/Meteora pool");
             let pair = ArbPair {
                 token_mint: mint,
@@ -335,4 +408,13 @@ impl Discovery {
         }
         Ok(false)
     }
+}
+
+fn read_u64(data: &[u8], off: usize) -> Option<u64> {
+    data.get(off..off + 8)
+        .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+}
+fn read_u128(data: &[u8], off: usize) -> Option<u128> {
+    data.get(off..off + 16)
+        .map(|s| u128::from_le_bytes(s.try_into().unwrap()))
 }
