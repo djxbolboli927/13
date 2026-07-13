@@ -618,7 +618,7 @@ pub async fn scan_all_tokens(
         tokio::spawn(async move {
             let t = std::time::Instant::now();
             let result =
-                ctx_c.metis.get_swap_instructions(&ctx_c.user_pubkey, &merged).await;
+                ctx_c.metis.get_swap_instructions(&ctx_c.user_pubkey, &merged, false).await;
             let fetch_ms = t.elapsed().as_millis() as u64;
 
             let swap_ixs = match result {

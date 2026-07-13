@@ -91,6 +91,8 @@ pub struct ArbParams {
     /// Metis `dexes=` labels for each venue (configurable).
     pub pump_label: String,
     pub meteora_label: String,
+    /// Use Jupiter shared accounts (compresses the tx to fit 1232 bytes).
+    pub use_shared_accounts: bool,
 }
 
 pub struct ShredArbEngine {
@@ -605,7 +607,7 @@ impl ShredArbEngine {
 
         let swap_ixs = match self
             .metis
-            .get_swap_instructions(&self.user_pubkey, &merged)
+            .get_swap_instructions(&self.user_pubkey, &merged, self.params.use_shared_accounts)
             .await
         {
             Ok(s) => s,

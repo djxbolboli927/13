@@ -327,6 +327,7 @@ impl MetisClient {
         &self,
         user_pubkey: &str,
         quote_response: &QuoteResponse,
+        use_shared_accounts: bool,
     ) -> std::result::Result<SwapInstructionsResponse, SwapIxError> {
         let quote_value = match serde_json::to_value(quote_response) {
             Ok(v) => v,
@@ -337,7 +338,11 @@ impl MetisClient {
             user_public_key: user_pubkey.to_string(),
             quote_response: quote_value,
             wrap_and_unwrap_sol: false,
-            use_shared_accounts: false,
+            // Jupiter's shared-accounts program compresses the account set so a
+            // multi-hop swap fits under Solana's 1232-byte tx cap — this is how
+            // competitors fit 5-hop arbs. Configurable in case a merged circular
+            // quote misbehaves with it.
+            use_shared_accounts,
             dynamic_compute_unit_limit: false,
             skip_user_accounts_rpc_calls: true,
             as_legacy_transaction: false,

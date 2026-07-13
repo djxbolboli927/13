@@ -356,6 +356,7 @@ fn spawn_shred_arb(
         min_trigger_reserve_frac: sa.min_trigger_reserve_frac,
         pump_label: sa.metis_pump_label.clone(),
         meteora_label: sa.metis_meteora_label.clone(),
+        use_shared_accounts: sa.metis_use_shared_accounts,
     };
 
     // ── Build self-test ──────────────────────────────────────────────────────
