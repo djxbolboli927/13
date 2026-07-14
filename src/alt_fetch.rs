@@ -48,6 +48,9 @@ pub struct AltFetcher {
     /// Probe size for the quote (lamports of WSOL). Any reasonable size routes
     /// through the same pool; the ALTs are size-independent.
     probe_lamports: u64,
+    /// Cap on ALTs kept per pool (1 is enough — the aggregator's route ALT covers
+    /// the route; only one is needed).
+    max_per_pool: usize,
     /// pump_pool → the ALT pubkeys that cover its route.
     cache: DashMap<Pubkey, Vec<Pubkey>>,
 }
@@ -58,6 +61,7 @@ impl AltFetcher {
         user_pubkey: String,
         pump_label: String,
         meteora_label: String,
+        max_per_pool: usize,
     ) -> Arc<Self> {
         let http = Client::builder()
             .timeout(Duration::from_secs(8))
@@ -70,6 +74,7 @@ impl AltFetcher {
             pump_label,
             meteora_label,
             probe_lamports: 10_000_000, // 0.01 SOL
+            max_per_pool: max_per_pool.max(1),
             cache: DashMap::new(),
         })
     }
@@ -110,6 +115,9 @@ impl AltFetcher {
             }
         }
 
+        // Keep only up to `max_per_pool` (default 1) — the aggregator's route ALT
+        // already covers the route, so one is enough.
+        alts.truncate(self.max_per_pool);
         if alts.is_empty() {
             debug!(%token, pump = %pump_pool, "alt-fetch: no ALTs found from any provider");
         } else {

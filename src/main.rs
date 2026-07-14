@@ -503,6 +503,7 @@ fn spawn_shred_arb(
                 trading_keypair.pubkey().to_string(),
                 sa.metis_pump_label.clone(),
                 sa.metis_meteora_label.clone(),
+                sa.alt_max_per_pool,
             ))
         };
 

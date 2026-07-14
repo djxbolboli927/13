@@ -905,6 +905,10 @@ impl ShredArbEngine {
             return;
         }
 
+        // Signature of the swap tx — used to check whether the bundle actually
+        // landed (Jito accepting a bundle ≠ it landing; it may lose the auction
+        // or its tx may revert). Without this the Jito path is blind.
+        let sig = tx.signatures.first().copied();
         let result = if use_grpc {
             match &self.jito_grpc {
                 Some(g) => g.send_bundle(&tx).await,
@@ -918,7 +922,18 @@ impl ShredArbEngine {
             Ok(id) => {
                 self.sent.fetch_add(1, Ordering::Relaxed);
                 self.last_sent.insert(pool, Instant::now());
-                info!(bundle = %id, input = amount_in, tip, "shred-arb bundle sent");
+                info!(bundle = %id, input = amount_in, tip, via = if use_grpc { "grpc" } else { "rest" }, "shred-arb bundle sent");
+                // Track on-chain fate so we KNOW: landed_ok / reverted / dropped
+                // (auction-lost or never landed). A dropped bundle costs nothing.
+                if let Some(sig) = sig {
+                    let rpc3 = self.rpc_client.clone();
+                    let stats = self.sent_stats.clone();
+                    let token_l = token.clone();
+                    let delay = self.params.status_check_delay_secs;
+                    tokio::spawn(async move {
+                        resolve_fate(rpc3, stats, sig, token_l, delay).await;
+                    });
+                }
             }
             Err(e) => {
                 self.nosend_send_err.fetch_add(1, Ordering::Relaxed);

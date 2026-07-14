@@ -270,6 +270,10 @@ pub struct ShredArbConfig {
     /// fetch free ALTs from the providers above. Kept as a fallback toggle.
     #[serde(default)]
     pub alt_self_build: bool,
+    /// Max ALTs kept per pool (the aggregator's route ALT already covers the
+    /// route, so 1 is enough; raise only if a tx still comes back too large).
+    #[serde(default = "default_alt_max_per_pool")]
+    pub alt_max_per_pool: usize,
     /// Minimum Jito tip (lamports) added on top of the profit share. Default 1000.
     #[serde(default = "default_jito_tip_min")]
     pub jito_tip_min_lamports: u64,
@@ -280,6 +284,9 @@ pub struct ShredArbConfig {
 
 fn default_alt_fetch_providers() -> Vec<String> {
     vec!["jupiter|https://lite-api.jup.ag/swap/v1".to_string()]
+}
+fn default_alt_max_per_pool() -> usize {
+    1
 }
 fn default_jito_tip_min() -> u64 {
     1000
@@ -372,6 +379,7 @@ impl Default for ShredArbConfig {
             idle_tokens_path: default_idle_tokens_path(),
             alt_fetch_providers: default_alt_fetch_providers(),
             alt_self_build: false,
+            alt_max_per_pool: default_alt_max_per_pool(),
             jito_tip_min_lamports: default_jito_tip_min(),
             jito_tip_profit_fraction: default_jito_tip_profit_frac(),
             metis_pump_label: default_pump_label(),
