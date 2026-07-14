@@ -2,6 +2,7 @@
 mod account_cache;
 mod alt_builder;
 mod alt_cache;
+mod alt_fetch;
 mod arbitrage;
 #[allow(dead_code)]
 mod ata;
@@ -352,6 +353,8 @@ fn spawn_shred_arb(
     let params = shred_arb::ArbParams {
         tip_lamports: sa.tip_lamports,
         network_fee_lamports: sa.network_fee_lamports,
+        jito_tip_min_lamports: sa.jito_tip_min_lamports,
+        jito_tip_profit_fraction: sa.jito_tip_profit_fraction,
         meteora_fee_bps: sa.meteora_fee_bps,
         min_trigger_lamports: lamports(sa.min_trigger_sol),
         min_amount_lamports: lamports(sa.min_amount_sol).max(1),
@@ -479,11 +482,42 @@ fn spawn_shred_arb(
         // we stop missing swaps competitors already see.
         consumer.clone().spawn_alt_fetcher();
 
+        // Free ALT fetcher (Jupiter/DFlow/Raptor) — the cheap way to compress the
+        // route (no on-chain writes / rent from us).
+        let providers: Vec<alt_fetch::Provider> = sa
+            .alt_fetch_providers
+            .iter()
+            .filter_map(|s| {
+                let (name, url) = s.split_once('|')?;
+                Some(alt_fetch::Provider {
+                    name: name.trim().to_string(),
+                    base_url: url.trim().to_string(),
+                })
+            })
+            .collect();
+        let alt_fetcher = if providers.is_empty() {
+            None
+        } else {
+            Some(alt_fetch::AltFetcher::new(
+                providers,
+                trading_keypair.pubkey().to_string(),
+                sa.metis_pump_label.clone(),
+                sa.metis_meteora_label.clone(),
+            ))
+        };
+
         // Shared, mutable pool registry (seeded from mix.json; discovery adds more).
         let registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, pool_registry::ArbPair>> =
             Arc::new(dashmap::DashMap::new());
         for p in pairs {
             registry.insert(p.pump.pool, p);
+        }
+        // Pre-fetch ALTs for the startup (mix.json) pools so their first txs fit.
+        if let Some(f) = &alt_fetcher {
+            for e in registry.iter() {
+                let p = e.value();
+                tokio::spawn(f.clone().fetch_for_pool(p.pump.pool, p.meteora.pool, p.token_mint));
+            }
         }
 
         // Automatic pool manager: add-market to Metis, extend the gRPC/shred
@@ -497,6 +531,7 @@ fn spawn_shred_arb(
             rpc_client.clone(),
             trading_keypair.clone(),
             sa.discovery_min_pump_wsol_lamports,
+            alt_fetcher.clone(),
         ));
 
         // Startup ATA reconciliation: read EVERY token mint referenced in
@@ -646,14 +681,17 @@ fn spawn_shred_arb(
             disc.spawn();
         }
 
-        // Self-learning owned ALT: the decisive tx-size fix. Harvests every
-        // account from Metis swap instructions into our own on-chain lookup
-        // table so the full route compresses under 1232 bytes.
-        let alt_builder = Some(alt_builder::AltBuilder::spawn(
-            rpc_client.clone(),
-            trading_keypair.clone(),
-            sa.alt_store_path.clone(),
-        ));
+        // Self-owned ALT — OFF by default (costs rent). Only spawned when
+        // alt_self_build=true; normally we rely on the free provider ALTs above.
+        let alt_builder = if sa.alt_self_build {
+            Some(alt_builder::AltBuilder::spawn(
+                rpc_client.clone(),
+                trading_keypair.clone(),
+                sa.alt_store_path.clone(),
+            ))
+        } else {
+            None
+        };
 
         let user_pubkey = trading_keypair.pubkey().to_string();
         let engine = Arc::new(shred_arb::ShredArbEngine::new(
@@ -673,6 +711,7 @@ fn spawn_shred_arb(
             shred_metrics,
             Some(pool_manager),
             alt_builder,
+            alt_fetcher,
         ));
         engine.clone().spawn_reporter();
         // Second opportunity source: re-assess all pairs from current state

@@ -260,6 +260,32 @@ pub struct ShredArbConfig {
     /// File the idle-token report is written to. Default /root/g/idle-tokens.txt.
     #[serde(default = "default_idle_tokens_path")]
     pub idle_tokens_path: String,
+    /// Free ALT providers, tried in order. Each entry is "name|baseUrl" of a
+    /// Jupiter-compatible `/quote` + `/swap-instructions` API. We fetch the ALT
+    /// covering each pool's route from these (free) instead of paying to build
+    /// our own. Default: Jupiter Lite (add DFlow/Raptor once their URLs are set).
+    #[serde(default = "default_alt_fetch_providers")]
+    pub alt_fetch_providers: Vec<String>,
+    /// Build/extend our OWN on-chain ALT (costs rent). Default false now that we
+    /// fetch free ALTs from the providers above. Kept as a fallback toggle.
+    #[serde(default)]
+    pub alt_self_build: bool,
+    /// Minimum Jito tip (lamports) added on top of the profit share. Default 1000.
+    #[serde(default = "default_jito_tip_min")]
+    pub jito_tip_min_lamports: u64,
+    /// Fraction of the detected net profit paid to Jito as tip (0.20 = 20%).
+    #[serde(default = "default_jito_tip_profit_frac")]
+    pub jito_tip_profit_fraction: f64,
+}
+
+fn default_alt_fetch_providers() -> Vec<String> {
+    vec!["jupiter|https://lite-api.jup.ag/swap/v1".to_string()]
+}
+fn default_jito_tip_min() -> u64 {
+    1000
+}
+fn default_jito_tip_profit_frac() -> f64 {
+    0.20
 }
 
 fn default_alt_store_path() -> String {
@@ -344,6 +370,10 @@ impl Default for ShredArbConfig {
             never_close_pools: true,
             idle_token_check_secs: default_idle_check_secs(),
             idle_tokens_path: default_idle_tokens_path(),
+            alt_fetch_providers: default_alt_fetch_providers(),
+            alt_self_build: false,
+            jito_tip_min_lamports: default_jito_tip_min(),
+            jito_tip_profit_fraction: default_jito_tip_profit_frac(),
             metis_pump_label: default_pump_label(),
             metis_meteora_label: default_meteora_label(),
             metis_use_shared_accounts: false,

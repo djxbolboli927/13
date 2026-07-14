@@ -44,6 +44,8 @@ pub struct PoolManager {
     /// full-drain check (dust floor) so a dip never closes a hot pool.
     #[allow(dead_code)]
     min_pump_wsol: u64,
+    /// Free ALT fetcher — pre-fetches each pool's route ALTs at add time.
+    alt_fetcher: Option<Arc<crate::alt_fetch::AltFetcher>>,
 }
 
 impl PoolManager {
@@ -56,6 +58,7 @@ impl PoolManager {
         rpc: Arc<RpcClient>,
         keypair: Arc<Keypair>,
         min_pump_wsol: u64,
+        alt_fetcher: Option<Arc<crate::alt_fetch::AltFetcher>>,
     ) -> Self {
         Self {
             registry,
@@ -65,6 +68,7 @@ impl PoolManager {
             rpc,
             keypair,
             min_pump_wsol,
+            alt_fetcher,
         }
     }
 
@@ -203,7 +207,16 @@ impl PoolManager {
             Err(e) => warn!(token = %pair.token_mint, error = %e, "ensure_ata failed"),
         }
 
-        // 5. Register with the engine.
+        // 5. Pre-fetch the route ALTs (free) so the first tx already compresses.
+        if let Some(f) = &self.alt_fetcher {
+            tokio::spawn(f.clone().fetch_for_pool(
+                pair.pump.pool,
+                pair.meteora.pool,
+                pair.token_mint,
+            ));
+        }
+
+        // 6. Register with the engine.
         self.registry.insert(pair.pump.pool, pair);
         Ok(())
     }

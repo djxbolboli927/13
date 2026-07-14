@@ -78,6 +78,7 @@ fn to_sdk_instruction(ix: &InstructionData) -> Result<Instruction> {
 /// The on-chain minimum output (quotedOutAmount in the route_v2 instruction)
 /// is controlled by setting out_amount in the merged quote passed to Metis
 /// before calling this function — do not patch instruction bytes here.
+#[allow(clippy::too_many_arguments)]
 pub fn build_arb_transaction(
     swap_ixs: &SwapInstructionsResponse,
     payer: &Keypair,
@@ -86,6 +87,9 @@ pub fn build_arb_transaction(
     recent_blockhash: Hash,
     alt_cache: &AltCache,
     rpc_client: &RpcClient,
+    // Extra ALTs (fetched free from Jupiter/DFlow/Raptor) folded in so the route
+    // accounts compress to 1-byte indexes.
+    extra_alts: &[Pubkey],
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
@@ -125,11 +129,20 @@ pub fn build_arb_transaction(
             alt_addresses.push(pubkey);
         }
     }
+    for pubkey in extra_alts {
+        if !alt_addresses.contains(pubkey) {
+            alt_addresses.push(*pubkey);
+        }
+    }
 
     let mut address_lookup_tables: Vec<AddressLookupTableAccount> = Vec::new();
     for alt_pubkey in &alt_addresses {
-        let alt_account = alt_cache.get_or_fetch(alt_pubkey, rpc_client)?;
-        address_lookup_tables.push(alt_account);
+        // Best-effort: a table we can't fetch is skipped (tx just stays larger),
+        // never a hard failure.
+        match alt_cache.get_or_fetch(alt_pubkey, rpc_client) {
+            Ok(a) => address_lookup_tables.push(a),
+            Err(e) => tracing::debug!(alt = %alt_pubkey, error = %e, "skip unfetchable ALT (jito)"),
+        }
     }
 
     // Build VersionedTransaction v0

@@ -49,11 +49,15 @@ const EVAL_LOG_SAMPLE: u64 = 50;
 /// Tunables sourced from `[shred_arb]` config.
 #[derive(Clone)]
 pub struct ArbParams {
-    pub tip_lamports: u64,
-    /// Retained for the legacy Jito path / reference; profit gating now uses
-    /// `min_net_profit_lamports`.
+    /// Legacy fixed tip (superseded by the dynamic jito_tip_* below).
     #[allow(dead_code)]
+    pub tip_lamports: u64,
+    /// Network base fee (lamports) included in the on-chain output floor.
     pub network_fee_lamports: u64,
+    /// Minimum Jito tip (lamports) on top of the profit share.
+    pub jito_tip_min_lamports: u64,
+    /// Fraction of detected net profit paid to Jito as tip (0.20 = 20%).
+    pub jito_tip_profit_fraction: f64,
     pub meteora_fee_bps: u64,
     /// Ignore observed trades whose SOL-side arg is below this (small trades
     /// barely move price).
@@ -127,8 +131,11 @@ pub struct ShredArbEngine {
     #[allow(dead_code)]
     pub manager: Option<Arc<crate::pool_manager::PoolManager>>,
     /// Self-learning owned ALT — harvests accounts from Metis swap instructions
-    /// so the full route compresses under 1232 bytes.
+    /// so the full route compresses under 1232 bytes. Off by default (costs rent).
     pub alt_builder: Option<Arc<crate::alt_builder::AltBuilder>>,
+    /// Free ALTs fetched from Jupiter/DFlow/Raptor per pool — the cheap way to
+    /// compress the route (no on-chain writes from us).
+    pub alt_fetcher: Option<Arc<crate::alt_fetch::AltFetcher>>,
     last_fired: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
     /// Last time we actually SENT a tx for a pool — de-dupes the spam of
     /// re-firing the same standing gap every 100ms.
@@ -226,6 +233,7 @@ impl ShredArbEngine {
         shred_metrics: Arc<crate::shred_stream::ShredMetrics>,
         manager: Option<Arc<crate::pool_manager::PoolManager>>,
         alt_builder: Option<Arc<crate::alt_builder::AltBuilder>>,
+        alt_fetcher: Option<Arc<crate::alt_fetch::AltFetcher>>,
     ) -> Self {
         Self {
             metis,
@@ -244,6 +252,7 @@ impl ShredArbEngine {
             shred_metrics,
             manager,
             alt_builder,
+            alt_fetcher,
             last_fired: dashmap::DashMap::new(),
             last_sent: dashmap::DashMap::new(),
             sent_stats: Arc::new(SentStats::default()),
@@ -578,12 +587,14 @@ impl ShredArbEngine {
         );
 
         self.last_fired.insert(pool, Instant::now());
-        // On-chain minimum output = exactly the input (break-even). The tx then
-        // reverts only if the trade would actually lose lamports; any realized
-        // price still at/above break-even lands and captures whatever profit
-        // exists at execution time.
-        let onchain_floor = best_x;
-        self.execute(pair, pool, buy_kind, sell_kind, best_x, onchain_floor)
+        // Jito tip = min tip + a share of the detected profit (e.g. 1000 + 20%).
+        // On-chain output floor = input + network fee + tip, so the tx reverts
+        // unless it at least covers the fee and the tip (we keep the rest). Only
+        // opportunities whose realized profit exceeds fee+tip actually land.
+        let tip = self.params.jito_tip_min_lamports
+            + (net as f64 * self.params.jito_tip_profit_fraction) as u64;
+        let onchain_floor = best_x + self.params.network_fee_lamports + tip;
+        self.execute(pair, pool, buy_kind, sell_kind, best_x, onchain_floor, tip)
             .await;
     }
 
@@ -596,6 +607,7 @@ impl ShredArbEngine {
         sell_kind: DexKind,
         amount_in: u64,
         floor: u64,
+        tip: u64,
     ) {
         // De-dupe: don't blast the same pool with identical txs while an earlier
         // one is still unconfirmed. Kept SMALL and configurable (send_dedup_ms,
@@ -700,11 +712,19 @@ impl ShredArbEngine {
         let alt = self.alt_cache.clone();
         let rpc = self.rpc_client.clone();
         let cu = self.params.cu_limit;
-        // The pools' own ALTs — folded into the tx so their pool/vault accounts
-        // compress from 32 static bytes to a 1-byte index (fixes tx-too-large on
-        // pools Metis hasn't registered an ALT for).
-        let extra_alts: Vec<solana_sdk::pubkey::Pubkey> =
-            [pair.pump.alt, pair.meteora.alt].into_iter().flatten().collect();
+        // ALTs folded into the tx so route accounts compress from 32 static bytes
+        // to a 1-byte index. Priority: free provider ALTs (Jupiter/DFlow/Raptor)
+        // for this pool, plus any ALT recorded on the pool itself.
+        let mut extra_alts: Vec<solana_sdk::pubkey::Pubkey> = self
+            .alt_fetcher
+            .as_ref()
+            .map(|f| f.tables_for(&pool))
+            .unwrap_or_default();
+        for a in [pair.pump.alt, pair.meteora.alt].into_iter().flatten() {
+            if !extra_alts.contains(&a) {
+                extra_alts.push(a);
+            }
+        }
 
         // ── Direct-to-RPC send (default): no Jito, no tip, no rate limit ──
         if self.params.direct_send {
@@ -823,7 +843,9 @@ impl ShredArbEngine {
             return;
         }
 
-        // ── Jito bundle path (legacy, direct_send = false) ──
+        // ── Jito bundle path (direct_send = false): REST 5/s + gRPC 5/s ──
+        // Rate-limited: try the REST limiter first, else the gRPC limiter; if both
+        // are full this second, drop (rate-limited).
         let use_grpc = if self.jito_limiter.lock().unwrap().try_acquire() {
             false
         } else if self
@@ -834,11 +856,12 @@ impl ShredArbEngine {
         {
             true
         } else {
-            debug!("jito rate-limited, dropping arb");
+            self.nosend_send_err.fetch_add(1, Ordering::Relaxed);
+            crate::errlog::log("not-sent", &format!("token={token} reason=jito-rate-limited"));
             return;
         };
 
-        let tip = self.params.tip_lamports;
+        // `tip` is the dynamic tip computed in assess (min + profit share).
         let tx = match tokio::task::spawn_blocking(move || {
             transaction::build_arb_transaction(
                 &swap_ixs,
@@ -848,19 +871,37 @@ impl ShredArbEngine {
                 recent_blockhash,
                 &alt,
                 &rpc,
+                &extra_alts,
             )
         })
         .await
         {
             Ok(Ok(tx)) => tx,
             _ => {
+                self.nosend_build_fail.fetch_add(1, Ordering::Relaxed);
                 warn!("build_arb_transaction failed");
+                crate::errlog::log("not-sent", &format!("token={token} reason=build-fail-jito"));
                 return;
             }
         };
 
         if transaction::account_lock_count(&tx) > 64 {
+            self.nosend_too_locks.fetch_add(1, Ordering::Relaxed);
             warn!("forced arb tx exceeds 64 account locks, dropping");
+            return;
+        }
+        let raw = transaction::serialized_len(&tx);
+        if raw > 1232 {
+            self.nosend_too_large.fetch_add(1, Ordering::Relaxed);
+            let alts_used = match &tx.message {
+                solana_sdk::message::VersionedMessage::V0(m) => m.address_table_lookups.len(),
+                _ => 0,
+            };
+            warn!(bytes = raw, alts_used, "jito arb tx too large — dropping");
+            crate::errlog::log(
+                "not-sent",
+                &format!("token={token} reason=tx-too-large-jito bytes={raw} alts_used={alts_used}"),
+            );
             return;
         }
 
@@ -876,9 +917,14 @@ impl ShredArbEngine {
         match result {
             Ok(id) => {
                 self.sent.fetch_add(1, Ordering::Relaxed);
-                info!(bundle = %id, input = amount_in, "shred-arb bundle sent");
+                self.last_sent.insert(pool, Instant::now());
+                info!(bundle = %id, input = amount_in, tip, "shred-arb bundle sent");
             }
-            Err(e) => warn!(error = %e, "shred-arb bundle send failed"),
+            Err(e) => {
+                self.nosend_send_err.fetch_add(1, Ordering::Relaxed);
+                warn!(error = %e, "shred-arb bundle send failed");
+                crate::errlog::log("not-sent", &format!("token={token} reason=jito-send-fail err={e}"));
+            }
         }
     }
 
