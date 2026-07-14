@@ -173,6 +173,11 @@ pub fn build_direct_transaction(
     // 32 bytes each; any of those that appear in one of these tables compiles to
     // a 1-byte index instead — the difference between fitting under 1232 and not.
     extra_alts: &[Pubkey],
+    // Our OWN self-learning lookup tables, supplied with their current in-memory
+    // address lists (no RPC fetch, always consistent with what we've committed).
+    // These accumulate every account we've seen in a Metis swap instruction, so
+    // they compress the FULL route — the decisive size fix.
+    owned_alts: &[AddressLookupTableAccount],
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
@@ -236,6 +241,12 @@ pub fn build_direct_transaction(
         match alt_cache.get_or_fetch(alt_pubkey, rpc_client) {
             Ok(a) => address_lookup_tables.push(a),
             Err(e) => tracing::debug!(alt = %alt_pubkey, error = %e, "skip unfetchable ALT"),
+        }
+    }
+    // Fold in our own learned tables (deduped by key).
+    for t in owned_alts {
+        if !address_lookup_tables.iter().any(|x| x.key == t.key) {
+            address_lookup_tables.push(t.clone());
         }
     }
 

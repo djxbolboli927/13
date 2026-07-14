@@ -98,6 +98,8 @@ pub struct ArbParams {
     pub send_dedup_ms: u64,
     /// Seconds to wait before polling a sent tx's on-chain fate.
     pub status_check_delay_secs: u64,
+    /// Never tear a pool down (route failures no longer drop/close it).
+    pub never_close: bool,
 }
 
 pub struct ShredArbEngine {
@@ -120,6 +122,9 @@ pub struct ShredArbEngine {
     /// Optional pool manager, used to auto-drop pools that consistently fail to
     /// route on Metis (effectively single-sided / rugged) — closes their ATA too.
     pub manager: Option<Arc<crate::pool_manager::PoolManager>>,
+    /// Self-learning owned ALT — harvests accounts from Metis swap instructions
+    /// so the full route compresses under 1232 bytes.
+    pub alt_builder: Option<Arc<crate::alt_builder::AltBuilder>>,
     last_fired: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
     /// Last time we actually SENT a tx for a pool — de-dupes the spam of
     /// re-firing the same standing gap every 100ms.
@@ -209,6 +214,7 @@ impl ShredArbEngine {
         params: ArbParams,
         shred_metrics: Arc<crate::shred_stream::ShredMetrics>,
         manager: Option<Arc<crate::pool_manager::PoolManager>>,
+        alt_builder: Option<Arc<crate::alt_builder::AltBuilder>>,
     ) -> Self {
         Self {
             metis,
@@ -226,6 +232,7 @@ impl ShredArbEngine {
             params,
             shred_metrics,
             manager,
+            alt_builder,
             last_fired: dashmap::DashMap::new(),
             last_sent: dashmap::DashMap::new(),
             sent_stats: Arc::new(SentStats::default()),
@@ -670,6 +677,17 @@ impl ShredArbEngine {
             }
         };
 
+        // Teach our self-learning ALT every account in this route so subsequent
+        // txs for this pool compress fully. Cheap: only unseen pubkeys enqueue.
+        if let Some(ab) = &self.alt_builder {
+            ab.note(harvest_accounts(&swap_ixs));
+        }
+        let owned_alts = self
+            .alt_builder
+            .as_ref()
+            .map(|ab| ab.tables())
+            .unwrap_or_default();
+
         let recent_blockhash = self.blockhash_cache.get();
         let keypair = self.trading_keypair.clone();
         let alt = self.alt_cache.clone();
@@ -700,6 +718,7 @@ impl ShredArbEngine {
                         &alt,
                         &rpc,
                         &extra_alts,
+                        &owned_alts,
                     )
                 };
                 let tx = build(data_limit)?;
@@ -887,6 +906,12 @@ impl ShredArbEngine {
     /// `ROUTE_FAIL_LIMIT` consecutive failures it is effectively single-sided
     /// (or rugged) on Metis, so we drop it (and close its ATA) via the manager.
     fn note_route_failure(&self, pool: solana_sdk::pubkey::Pubkey) {
+        // Operator policy: never tear a pool down — only ever add. A pool that
+        // can't route right now may route later (or is reported by the idle
+        // sweeper); we keep it and simply stop counting strikes toward removal.
+        if self.params.never_close {
+            return;
+        }
         let n = {
             let mut e = self.route_fail.entry(pool).or_insert(0);
             *e += 1;
@@ -1013,6 +1038,39 @@ async fn resolve_fate(
         warn!(%sig, "sent tx NOT FOUND on-chain (dropped/never landed)");
         crate::errlog::log("lost", &format!("token={token} sig={sig} fate=dropped-not-found"));
     }
+}
+
+/// Collect every account pubkey referenced by a Metis swap-instructions response
+/// (all instruction blocks + their program ids). These are exactly the accounts
+/// our tx will reference, so feeding them into the owned ALT lets `try_compile`
+/// compress the whole route next time.
+fn harvest_accounts(
+    s: &crate::metis::SwapInstructionsResponse,
+) -> Vec<solana_sdk::pubkey::Pubkey> {
+    use std::str::FromStr;
+    let mut out = Vec::new();
+    let mut push = |s: &str| {
+        if let Ok(pk) = solana_sdk::pubkey::Pubkey::from_str(s) {
+            out.push(pk);
+        }
+    };
+    let mut visit = |ix: &crate::metis::InstructionData| {
+        push(&ix.program_id);
+        for a in &ix.accounts {
+            push(&a.pubkey);
+        }
+    };
+    for ix in &s.compute_budget_instructions {
+        visit(ix);
+    }
+    for ix in &s.setup_instructions {
+        visit(ix);
+    }
+    visit(&s.swap_instruction);
+    if let Some(ix) = &s.cleanup_instruction {
+        visit(ix);
+    }
+    out
 }
 
 fn buy_kind_label(k: DexKind) -> &'static str {

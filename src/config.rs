@@ -245,6 +245,31 @@ pub struct ShredArbConfig {
     /// How many recent signatures per wallet to scan each pass. Default 1000.
     #[serde(default = "default_wallet_mine_tx_limit")]
     pub wallet_mine_tx_limit: usize,
+    /// File that persists our self-owned ALT pubkey(s) so a restart reuses the
+    /// same on-chain table(s) instead of leaking rent. Default /root/g/our_alt.txt.
+    #[serde(default = "default_alt_store_path")]
+    pub alt_store_path: String,
+    /// If true, NEVER close a pool/ATA — only ever open. Rug/idle/drain no longer
+    /// tears anything down; instead the idle reporter records untraded tokens.
+    #[serde(default = "default_true")]
+    pub never_close_pools: bool,
+    /// Every this many seconds, write the list of tokens with NO on-chain trade
+    /// in the window to `idle_tokens_path`. Default 43200 (12h).
+    #[serde(default = "default_idle_check_secs")]
+    pub idle_token_check_secs: u64,
+    /// File the idle-token report is written to. Default /root/g/idle-tokens.txt.
+    #[serde(default = "default_idle_tokens_path")]
+    pub idle_tokens_path: String,
+}
+
+fn default_alt_store_path() -> String {
+    "/root/g/our_alt.txt".to_string()
+}
+fn default_idle_check_secs() -> u64 {
+    43_200
+}
+fn default_idle_tokens_path() -> String {
+    "/root/g/idle-tokens.txt".to_string()
 }
 
 fn default_send_dedup_ms() -> u64 {
@@ -315,6 +340,10 @@ impl Default for ShredArbConfig {
             target_wallets: Vec::new(),
             wallet_mine_interval_secs: default_wallet_mine_interval_secs(),
             wallet_mine_tx_limit: default_wallet_mine_tx_limit(),
+            alt_store_path: default_alt_store_path(),
+            never_close_pools: true,
+            idle_token_check_secs: default_idle_check_secs(),
+            idle_tokens_path: default_idle_tokens_path(),
             metis_pump_label: default_pump_label(),
             metis_meteora_label: default_meteora_label(),
             metis_use_shared_accounts: false,

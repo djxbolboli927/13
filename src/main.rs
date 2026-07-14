@@ -1,5 +1,6 @@
 #[allow(dead_code)]
 mod account_cache;
+mod alt_builder;
 mod alt_cache;
 mod arbitrage;
 #[allow(dead_code)]
@@ -318,7 +319,16 @@ fn spawn_shred_arb(
     // Dedicated CU limit for the 2-hop Pump↔Meteora tx. Competitor arb txs
     // consume ~178k CU, so the legacy 170k default would run out — use a
     // roomier value (configurable).
-    let cu_limit = sa.cu_limit;
+    // CU limit for the arb tx, taken from [performance].cu_limits (indexed by
+    // hop count: index 0 = 2 hops, 1 = 3 hops, …) so the operator tunes it in one
+    // place. The 2-hop Pump↔Meteora route needs ~120k; falls back to the
+    // [shred_arb].cu_limit only if the array is empty.
+    let cu_limit = config
+        .performance
+        .cu_limits
+        .first()
+        .copied()
+        .unwrap_or(sa.cu_limit);
 
     // Auto-launch the ShredStream proxy immediately — it does not depend on
     // mix.json, and the entries feed can warm up while we wait for the pools.
@@ -362,6 +372,7 @@ fn spawn_shred_arb(
         use_shared_accounts: sa.metis_use_shared_accounts,
         send_dedup_ms: sa.send_dedup_ms,
         status_check_delay_secs: sa.status_check_delay_secs,
+        never_close: sa.never_close_pools,
     };
 
     // Errors-only file log (errors + why-not-sent + why-lost) under /root/g.
@@ -513,19 +524,17 @@ fn spawn_shred_arb(
                 }
             });
         }
-        // Rug monitor: close pools on total drain (confirmed over 3 sweeps) or
-        // after `pool_idle_close_secs` with no Meteora update (abandoned). A
-        // mere liquidity dip is NOT a trigger.
-        pool_manager.clone().spawn_rug_monitor(
-            std::time::Duration::from_secs(2),
-            3,
-            std::time::Duration::from_secs(sa.pool_idle_close_secs.max(60)),
-        );
-
-        // Route ShredStream remove-liquidity (withdraw) events to an RPC-confirmed
-        // check: a withdraw may be a PARTIAL remove on a hot pool, so we only
-        // close if the pool is actually drained (never on a mere dip).
-        {
+        // Teardown pipeline (rug monitor / withdraw-close / sweep) is DISABLED
+        // when never_close_pools is set: the bot only ever opens pools+ATAs, and
+        // an idle-token sweeper (below) just REPORTS untraded tokens to a file
+        // instead of closing anything. Kept behind the flag so the old
+        // close-on-drain behaviour is still available if re-enabled.
+        if !sa.never_close_pools {
+            pool_manager.clone().spawn_rug_monitor(
+                std::time::Duration::from_secs(2),
+                3,
+                std::time::Duration::from_secs(sa.pool_idle_close_secs.max(60)),
+            );
             let (rm_tx, mut rm_rx) =
                 tokio::sync::mpsc::channel::<solana_sdk::pubkey::Pubkey>(256);
             consumer.set_remove_sender(rm_tx);
@@ -536,13 +545,64 @@ fn spawn_shred_arb(
                     tokio::task::spawn_blocking(move || mgr.check_and_close(&pool));
                 }
             });
+            pool_manager
+                .clone()
+                .spawn_hourly_sweep(std::time::Duration::from_secs(1800));
         }
 
-        // Periodic RPC sweep (every 30 min): close ATAs whose pools have gone
-        // dead/inactive.
-        pool_manager
-            .clone()
-            .spawn_hourly_sweep(std::time::Duration::from_secs(1800));
+        // Idle-token sweeper: every `idle_token_check_secs` (default 12h), record
+        // which tracked tokens had NO on-chain trade in the window to a file.
+        // Never closes anything — reporting only.
+        {
+            let registry = registry.clone();
+            let rpc = rpc_client.clone();
+            let path = sa.idle_tokens_path.clone();
+            let window = std::time::Duration::from_secs(sa.idle_token_check_secs.max(60));
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(window);
+                ticker.tick().await; // skip the immediate first tick
+                loop {
+                    ticker.tick().await;
+                    let pools: Vec<(String, solana_sdk::pubkey::Pubkey)> = registry
+                        .iter()
+                        .map(|e| (e.value().token_mint.to_string(), e.value().meteora.pool))
+                        .collect();
+                    let rpc = rpc.clone();
+                    let path = path.clone();
+                    let window_secs = window.as_secs() as i64;
+                    tokio::task::spawn_blocking(move || {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let mut idle: Vec<String> = Vec::new();
+                        for (token, pool) in pools {
+                            // Most recent signature's blockTime on the pool account.
+                            let last = rpc
+                                .get_signatures_for_address(&pool)
+                                .ok()
+                                .and_then(|v| v.into_iter().next())
+                                .and_then(|s| s.block_time);
+                            let traded_recently = matches!(last, Some(t) if now - t < window_secs);
+                            if !traded_recently {
+                                idle.push(token);
+                            }
+                        }
+                        let body = format!(
+                            "# tokens with no on-chain trade in the last {}h (as of unix {})\n{}\n",
+                            window_secs / 3600,
+                            now,
+                            idle.join("\n")
+                        );
+                        if let Err(e) = std::fs::write(&path, body) {
+                            tracing::warn!(error = %e, path = %path, "idle-token report write failed");
+                        } else {
+                            tracing::info!(idle = idle.len(), path = %path, "idle-token report written");
+                        }
+                    });
+                }
+            });
+        }
 
         // Wallet-transaction pool miner: mine competitors' recent txs for hot
         // shared Pump/Meteora pools and add them (bot + Metis) every 30 min.
@@ -586,6 +646,15 @@ fn spawn_shred_arb(
             disc.spawn();
         }
 
+        // Self-learning owned ALT: the decisive tx-size fix. Harvests every
+        // account from Metis swap instructions into our own on-chain lookup
+        // table so the full route compresses under 1232 bytes.
+        let alt_builder = Some(alt_builder::AltBuilder::spawn(
+            rpc_client.clone(),
+            trading_keypair.clone(),
+            sa.alt_store_path.clone(),
+        ));
+
         let user_pubkey = trading_keypair.pubkey().to_string();
         let engine = Arc::new(shred_arb::ShredArbEngine::new(
             metis,
@@ -603,6 +672,7 @@ fn spawn_shred_arb(
             params,
             shred_metrics,
             Some(pool_manager),
+            alt_builder,
         ));
         engine.clone().spawn_reporter();
         // Second opportunity source: re-assess all pairs from current state
