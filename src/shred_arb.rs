@@ -34,9 +34,10 @@ use crate::shred_stream::PumpSwapSignal;
 use crate::tokens::WSOL_MINT;
 use crate::transaction;
 
-/// Consecutive forced-quote route failures after which a pool is dropped as
-/// effectively single-sided / rugged (no route on one of the two venues).
-const ROUTE_FAIL_LIMIT: u32 = 5;
+/// After this many consecutive Metis "No routes found" failures — while we keep
+/// re-adding BOTH legs — a pool is disabled (only one leg ever loaded into
+/// Metis). Stops the endless No-routes spam; the reason is written to /root/g.
+const LOAD_RETRY_LIMIT: u32 = 10;
 
 /// A raw price gap larger than this is never a real arb — it's a decode
 /// artifact or a one-sided dead pool. Real cross-pool gaps are a few percent.
@@ -98,7 +99,9 @@ pub struct ArbParams {
     pub send_dedup_ms: u64,
     /// Seconds to wait before polling a sent tx's on-chain fate.
     pub status_check_delay_secs: u64,
-    /// Never tear a pool down (route failures no longer drop/close it).
+    /// Never tear a pool down (route failures no longer drop/close it). Kept for
+    /// config symmetry; teardown is gated in main.rs, so it's not read here.
+    #[allow(dead_code)]
     pub never_close: bool,
 }
 
@@ -119,8 +122,9 @@ pub struct ShredArbEngine {
     pub registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, ArbPair>>,
     pub params: ArbParams,
     pub shred_metrics: Arc<crate::shred_stream::ShredMetrics>,
-    /// Optional pool manager, used to auto-drop pools that consistently fail to
-    /// route on Metis (effectively single-sided / rugged) — closes their ATA too.
+    /// Optional pool manager (teardown is now gated off by never_close, so this
+    /// is retained for wiring symmetry but not used on the route-failure path).
+    #[allow(dead_code)]
     pub manager: Option<Arc<crate::pool_manager::PoolManager>>,
     /// Self-learning owned ALT — harvests accounts from Metis swap instructions
     /// so the full route compresses under 1232 bytes.
@@ -134,6 +138,13 @@ pub struct ShredArbEngine {
     /// Consecutive forced-quote route failures per pool. A pool that can't be
     /// routed on both venues repeatedly is dropped (see `ROUTE_FAIL_LIMIT`).
     route_fail: dashmap::DashMap<solana_sdk::pubkey::Pubkey, u32>,
+    /// Consecutive "No routes found" load failures per pool while we retry
+    /// add-market on BOTH legs. After `LOAD_RETRY_LIMIT` the pool is disabled.
+    load_fail: dashmap::DashMap<solana_sdk::pubkey::Pubkey, u32>,
+    /// Pools disabled after repeated failed Metis loads (only one leg ever
+    /// loaded). Skipped in `assess` so they stop producing No-routes spam. Never
+    /// closed (per never_close policy) — just not traded.
+    disabled: dashmap::DashSet<solana_sdk::pubkey::Pubkey>,
     // ── diagnostics ──
     signals_received: AtomicU64,
     skip_min_trigger: AtomicU64,
@@ -237,6 +248,8 @@ impl ShredArbEngine {
             last_sent: dashmap::DashMap::new(),
             sent_stats: Arc::new(SentStats::default()),
             route_fail: dashmap::DashMap::new(),
+            load_fail: dashmap::DashMap::new(),
+            disabled: dashmap::DashSet::new(),
             signals_received: AtomicU64::new(0),
             skip_min_trigger: AtomicU64::new(0),
             skip_no_pair: AtomicU64::new(0),
@@ -371,6 +384,11 @@ impl ShredArbEngine {
     /// to price/quote against — predicted post-trade reserves for a shred
     /// trigger, or the current reserves for a pool-state-update trigger.
     async fn assess(&self, pair: &ArbPair, pool: solana_sdk::pubkey::Pubkey, pump_after: PumpPool) {
+        // Skip pools we disabled after repeated Metis load failures (only one leg
+        // ever loaded) — they'd only produce No-routes spam.
+        if self.disabled.contains(&pool) {
+            return;
+        }
         // Cooldown per pool — applies only after a fire, so the state evaluator
         // can keep re-checking a not-yet-profitable pool every tick.
         if let Some(prev) = self.last_fired.get(&pool) {
@@ -604,13 +622,7 @@ impl ShredArbEngine {
             Ok(q) => q,
             Err(e) => {
                 self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
-                warn!(error = %e, leg = "buy", venue = buy_label, "forced quote failed — re-adding market");
-                crate::errlog::log(
-                    "not-sent",
-                    &format!("token={token} reason=buy-quote-fail venue={buy_label} err={e}"),
-                );
-                self.readd_market(&pair, buy_kind).await;
-                self.note_route_failure(pool);
+                self.handle_load_failure(pair, pool, "buy", buy_label, &e.to_string()).await;
                 return;
             }
         };
@@ -635,17 +647,12 @@ impl ShredArbEngine {
             Ok(q) => q,
             Err(e) => {
                 self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
-                warn!(error = %e, leg = "sell", venue = sell_label, "forced quote failed — re-adding market");
-                crate::errlog::log(
-                    "not-sent",
-                    &format!("token={token} reason=sell-quote-fail venue={sell_label} err={e}"),
-                );
-                self.readd_market(&pair, sell_kind).await;
-                self.note_route_failure(pool);
+                self.handle_load_failure(pair, pool, "sell", sell_label, &e.to_string()).await;
                 return;
             }
         };
-        // Both legs routed — this pool is genuinely two-sided; clear any strikes.
+        // Both legs routed — clear any load-failure strikes.
+        self.load_fail.remove(&pool);
         self.note_route_success(pool);
 
         // Set the on-chain floor to exactly the input (break-even) regardless of
@@ -883,6 +890,49 @@ impl ShredArbEngine {
         }
     }
 
+    /// A forced-quote "No routes found" means one of the two legs never loaded
+    /// into Metis. Re-add BOTH legs (add-market is idempotent) and count the
+    /// strike; after `LOAD_RETRY_LIMIT` consecutive failures disable the pool so
+    /// it stops spamming No-routes, recording why to the /root/g error file.
+    async fn handle_load_failure(
+        &self,
+        pair: &ArbPair,
+        pool: solana_sdk::pubkey::Pubkey,
+        leg: &str,
+        venue: &str,
+        err: &str,
+    ) {
+        let n = {
+            let mut e = self.load_fail.entry(pool).or_insert(0);
+            *e += 1;
+            *e
+        };
+        // Re-add BOTH markets so a half-loaded pair gets its missing leg.
+        self.readd_market(pair, DexKind::PumpFunAmm).await;
+        self.readd_market(pair, DexKind::MeteoraDammV2).await;
+        if n >= LOAD_RETRY_LIMIT {
+            self.disabled.insert(pool);
+            self.load_fail.remove(&pool);
+            warn!(%pool, token = %pair.token_mint, attempts = n, "disabling pool — Metis never loaded both legs");
+            crate::errlog::log(
+                "error",
+                &format!(
+                    "token={} pool={} reason=disabled-after-{}-load-failures leg={leg} venue={venue} \
+                     pump_pool={} meteora_pool={} last_err={err}",
+                    pair.token_mint, pool, n, pair.pump.pool, pair.meteora.pool
+                ),
+            );
+        } else {
+            crate::errlog::log(
+                "not-sent",
+                &format!(
+                    "token={} reason={leg}-quote-fail attempt={n}/{LOAD_RETRY_LIMIT} venue={venue} err={err}",
+                    pair.token_mint
+                ),
+            );
+        }
+    }
+
     /// Re-register the relevant leg's pool with Metis after a "No routes"
     /// failure — the market may not have loaded on the first add, or Metis
     /// restarted. Cheap and idempotent; the route-failure counter still drops
@@ -899,34 +949,6 @@ impl ShredArbEngine {
             .await
         {
             debug!(pool = %info.pool, error = %e, "re-add market failed");
-        }
-    }
-
-    /// Record a forced-quote route failure for `pool`. Once a pool accrues
-    /// `ROUTE_FAIL_LIMIT` consecutive failures it is effectively single-sided
-    /// (or rugged) on Metis, so we drop it (and close its ATA) via the manager.
-    fn note_route_failure(&self, pool: solana_sdk::pubkey::Pubkey) {
-        // Operator policy: never tear a pool down — only ever add. A pool that
-        // can't route right now may route later (or is reported by the idle
-        // sweeper); we keep it and simply stop counting strikes toward removal.
-        if self.params.never_close {
-            return;
-        }
-        let n = {
-            let mut e = self.route_fail.entry(pool).or_insert(0);
-            *e += 1;
-            *e
-        };
-        if n >= ROUTE_FAIL_LIMIT {
-            self.route_fail.remove(&pool);
-            warn!(%pool, "dropping pool after repeated Metis route failures (single-sided/rugged)");
-            if let Some(mgr) = &self.manager {
-                // close_ata inside remove_pair does blocking RPC — offload it.
-                let mgr = mgr.clone();
-                tokio::task::spawn_blocking(move || mgr.remove_pair(&pool));
-            } else {
-                self.registry.remove(&pool);
-            }
         }
     }
 

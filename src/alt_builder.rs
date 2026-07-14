@@ -43,6 +43,9 @@ pub struct AltBuilder {
     pending: Mutex<VecDeque<Pubkey>>,
     /// Snapshot of our tables (key + current addresses) for the tx builder.
     tables: RwLock<Vec<AddressLookupTableAccount>>,
+    /// Last time we ATTEMPTED to create a table — backoff so a failing create
+    /// doesn't spam the RPC (we're limited to a few tx/s).
+    last_create: Mutex<Option<std::time::Instant>>,
 }
 
 impl AltBuilder {
@@ -54,6 +57,7 @@ impl AltBuilder {
             seen: DashSet::new(),
             pending: Mutex::new(VecDeque::new()),
             tables: RwLock::new(Vec::new()),
+            last_create: Mutex::new(None),
         });
         let me2 = me.clone();
         tokio::spawn(async move {
@@ -176,10 +180,24 @@ impl AltBuilder {
                 }
             }
         }
-        // Need a new table.
+        // Need a new table — but back off so a failing create doesn't spam RPC.
+        {
+            let mut lc = self.last_create.lock().unwrap();
+            if let Some(t) = *lc {
+                if t.elapsed() < Duration::from_secs(10) {
+                    return None;
+                }
+            }
+            *lc = Some(std::time::Instant::now());
+        }
+        // The lookup-table program requires `recent_slot` to be present in the
+        // SlotHashes sysvar (last 512 slots) and strictly below the current slot.
+        // `finalized` on some RPCs lags >512 slots ("not a recent slot"), so use
+        // `confirmed` (a slot or two behind tip — always valid).
         let recent_slot = rpc
-            .get_slot_with_commitment(CommitmentConfig::finalized())
-            .ok()?;
+            .get_slot_with_commitment(CommitmentConfig::confirmed())
+            .ok()?
+            .saturating_sub(1);
         let (ix, table_key) = create_lookup_table(keypair.pubkey(), keypair.pubkey(), recent_slot);
         let bh = rpc.get_latest_blockhash().ok()?;
         let tx =
