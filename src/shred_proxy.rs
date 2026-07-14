@@ -70,12 +70,13 @@ pub fn spawn_supervised(cfg: ProxyConfig) {
             info!(bin = %cfg.bin, "launching jito-shredstream-proxy");
             let mut command = tokio::process::Command::new(&cfg.bin);
             command.args(&args).kill_on_drop(true);
-            // Silence the proxy's per-second `solana_metrics` datapoint spam
-            // (packets_count/... lines) unless the operator overrides RUST_LOG.
-            // Keeps only warnings/errors from the proxy in our terminal.
-            if std::env::var_os("RUST_LOG").is_none() {
-                command.env("RUST_LOG", "warn,solana_metrics=off");
-            }
+            // ALWAYS silence the proxy's `solana_metrics` datapoint spam (the
+            // per-second `packets_count=...` INFO lines and the giant
+            // `deshred_missed_fec_sets` WARN dumps). We take whatever RUST_LOG the
+            // operator set and append `solana_metrics=off`, so their chosen level
+            // is preserved for every OTHER target but the metrics target is muted.
+            let child_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+            command.env("RUST_LOG", format!("{child_log},solana_metrics=off"));
             match command.status().await {
                 Ok(status) => {
                     warn!(?status, "shredstream proxy exited; restarting after backoff");

@@ -257,7 +257,9 @@ fn default_error_log_dir() -> String {
     "/root/g".to_string()
 }
 fn default_wallet_mine_interval_secs() -> u64 {
-    1800
+    // First pass is a full ~1000-tx scan; every pass after is incremental (only
+    // new signatures), so a short interval is cheap and keeps the pool set fresh.
+    300
 }
 fn default_wallet_mine_tx_limit() -> usize {
     1000

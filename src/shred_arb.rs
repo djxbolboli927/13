@@ -157,8 +157,11 @@ pub struct ShredArbEngine {
     nosend_swapix_fail: AtomicU64,
     /// Tx couldn't be built / signed.
     nosend_build_fail: AtomicU64,
-    /// Tx exceeded 1232 bytes or 64 account locks after compression.
+    /// Tx exceeded 1232 raw bytes after compression.
     nosend_too_large: AtomicU64,
+    /// Tx exceeded 64 account locks (ALTs don't help this — too many distinct
+    /// accounts). Distinguished from byte-size so we know which wall we hit.
+    nosend_too_locks: AtomicU64,
     /// RPC rejected the send (or Jito path rate-limited).
     nosend_send_err: AtomicU64,
     /// Best (max) net lamports the optimizer found in the current window,
@@ -246,6 +249,7 @@ impl ShredArbEngine {
             nosend_swapix_fail: AtomicU64::new(0),
             nosend_build_fail: AtomicU64::new(0),
             nosend_too_large: AtomicU64::new(0),
+            nosend_too_locks: AtomicU64::new(0),
             nosend_send_err: AtomicU64::new(0),
             best_net_seen: AtomicI64::new(i64::MIN),
         }
@@ -716,12 +720,13 @@ impl ShredArbEngine {
                 }
             };
 
-            if transaction::account_lock_count(&tx) > 64 {
-                self.nosend_too_large.fetch_add(1, Ordering::Relaxed);
-                warn!("direct arb tx exceeds 64 account locks, dropping");
+            let locks = transaction::account_lock_count(&tx);
+            if locks > 64 {
+                self.nosend_too_locks.fetch_add(1, Ordering::Relaxed);
+                warn!(locks, "direct arb tx exceeds 64 account locks, dropping");
                 crate::errlog::log(
                     "not-sent",
-                    &format!("token={token} reason=too-many-account-locks"),
+                    &format!("token={token} reason=too-many-account-locks locks={locks}"),
                 );
                 return;
             }
@@ -729,14 +734,21 @@ impl ShredArbEngine {
             let raw = transaction::serialized_len(&tx);
             if raw > 1232 {
                 self.nosend_too_large.fetch_add(1, Ordering::Relaxed);
+                let alts_used = match &tx.message {
+                    solana_sdk::message::VersionedMessage::V0(m) => m.address_table_lookups.len(),
+                    _ => 0,
+                };
                 warn!(
-                    bytes = raw,
-                    "direct arb tx still too large ({} > 1232) after compression — dropping",
-                    raw
+                    bytes = raw, locks, alts_used,
+                    "direct arb tx still too large ({raw} > 1232) after compression — dropping"
                 );
                 crate::errlog::log(
                     "not-sent",
-                    &format!("token={token} reason=tx-too-large bytes={raw}"),
+                    &format!(
+                        "token={token} reason=tx-too-large bytes={raw} locks={locks} \
+                         alts_used={alts_used} pump_alt={:?} met_alt={:?}",
+                        pair.pump.alt, pair.meteora.alt
+                    ),
                 );
                 return;
             }
@@ -917,10 +929,18 @@ impl ShredArbEngine {
                 let unknown = ss.unknown.load(Ordering::Relaxed);
                 eprintln!(
                     "\n[shred-arb 30s] watching_pools={}\n\
-                     TX      : profitable={} sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
-                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} send_err={}",
+                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} bad_price={} implausible={}]\n\
+                     TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
+                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
+                    self.evaluated.load(Ordering::Relaxed),
                     self.profitable.load(Ordering::Relaxed),
+                    self.not_profitable.load(Ordering::Relaxed),
+                    self.skip_uncrossable.load(Ordering::Relaxed),
+                    self.skip_min_trigger.load(Ordering::Relaxed),
+                    self.skip_no_meteora_state.load(Ordering::Relaxed),
+                    self.skip_bad_price.load(Ordering::Relaxed),
+                    self.skip_implausible.load(Ordering::Relaxed),
                     self.sent.load(Ordering::Relaxed),
                     landed_ok,
                     reverted,
@@ -931,6 +951,7 @@ impl ShredArbEngine {
                     self.nosend_swapix_fail.load(Ordering::Relaxed),
                     self.nosend_build_fail.load(Ordering::Relaxed),
                     self.nosend_too_large.load(Ordering::Relaxed),
+                    self.nosend_too_locks.load(Ordering::Relaxed),
                     self.nosend_send_err.load(Ordering::Relaxed),
                 );
             }

@@ -7,16 +7,21 @@
 //! and add the ones that live on BOTH venues (a shared, tradeable pair) to the
 //! bot AND to Metis via the normal `PoolManager` pipeline.
 //!
-//! This is the Rust port of the operator's `universal_extractor.py`, narrowed to
-//! the two venues we arb. Decode indices mirror the script exactly:
+//! Crucially we also capture the **Address Lookup Table** each competitor tx
+//! used for those pools (mirroring `find_pool_alt` in `universal_extractor.py`):
+//! that ALT already contains the pool/vault/authority accounts of the exact
+//! route we trade, so registering it with Metis (and folding it into our own tx)
+//! compresses those accounts from 32 static bytes to a 1-byte index — the
+//! difference between a 2-hop tx fitting under 1232 bytes and not.
+//!
+//! Decode indices mirror the script exactly:
 //!   * Pump.fun AMM  — pool account = instruction account #0
 //!   * Meteora DAMM v2 — pool account = instruction account #1
-//! We walk both the top-level instructions and every inner instruction, so a
-//! pool routed through Jupiter/aggregators is still found.
+//! We walk both the top-level instructions and every inner instruction.
 //!
-//! Runs once at startup and then on a timer (default every 30 min). Only the
-//! last ~1000 signatures are scanned: going further back tends to surface pools
-//! that have since removed liquidity.
+//! First pass is a full scan of the last ~1000 signatures; every pass after
+//! that is INCREMENTAL (only signatures newer than the last one seen), so the
+//! repeat cost is tiny and it can run every few minutes.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -34,6 +39,7 @@ use crate::dex_ids::{
 use crate::discovery::decode_pool;
 use crate::pool_manager::PoolManager;
 use crate::pool_registry::{ArbPair, PoolInfo};
+use crate::transaction::deserialize_alt_addresses;
 
 pub struct WalletMinerConfig {
     pub rpc_url: String,
@@ -52,6 +58,18 @@ pub struct WalletMiner {
     /// Pools already fetched+decoded (added or ruled out) so repeat passes skip
     /// the on-chain read.
     seen_pools: HashSet<Pubkey>,
+    /// Newest signature already processed per wallet — subsequent passes fetch
+    /// only signatures newer than this (incremental, cheap).
+    newest_sig: HashMap<String, String>,
+    /// Cache of ALT → its address set, so `find_pool_alt` reads each table once.
+    alt_members: HashMap<Pubkey, HashSet<Pubkey>>,
+}
+
+/// A candidate pool found in a competitor tx: its venue and the ALT keys that tx
+/// referenced (one of which almost certainly covers this pool's route accounts).
+struct Candidate {
+    kind: DexKind,
+    alt_keys: Vec<Pubkey>,
 }
 
 impl WalletMiner {
@@ -66,6 +84,8 @@ impl WalletMiner {
             rpc,
             http,
             seen_pools: HashSet::new(),
+            newest_sig: HashMap::new(),
+            alt_members: HashMap::new(),
         }
     }
 
@@ -79,32 +99,37 @@ impl WalletMiner {
                 interval_s = self.cfg.interval.as_secs(),
                 "wallet miner started"
             );
+            let mut first = true;
             loop {
-                if let Err(e) = self.run_pass().await {
+                if let Err(e) = self.run_pass(first).await {
                     warn!(error = %e, "wallet miner pass failed");
                 }
+                first = false;
                 tokio::time::sleep(self.cfg.interval).await;
             }
         });
     }
 
-    /// One full pass over every configured wallet.
-    async fn run_pass(&mut self) -> Result<()> {
-        // 1) Collect candidate (pool, kind) across all wallets this pass.
-        let mut candidates: HashMap<Pubkey, DexKind> = HashMap::new();
+    /// One full pass over every configured wallet. `full` = scan the whole
+    /// `tx_limit` window (startup); otherwise only signatures newer than the
+    /// last one seen.
+    async fn run_pass(&mut self, full: bool) -> Result<()> {
+        // 1) Collect candidate pools (+ their tx's ALT keys) across all wallets.
+        let mut candidates: HashMap<Pubkey, Candidate> = HashMap::new();
         for wallet in self.cfg.wallets.clone() {
-            match self.scan_wallet(&wallet, &mut candidates).await {
-                Ok(n) => info!(%wallet, pools_seen = n, "wallet scanned"),
+            match self.scan_wallet(&wallet, full, &mut candidates).await {
+                Ok(n) => info!(%wallet, pools_seen = n, full, "wallet scanned"),
                 Err(e) => warn!(%wallet, error = %e, "wallet scan failed"),
             }
         }
 
-        // 2) Decode the NEW candidate pool accounts and bucket by token mint.
+        // 2) Decode the NEW candidate pool accounts, attach the covering ALT, and
+        //    bucket by token mint.
         let pump_prog = pumpfun_program();
         let met_prog = meteora_program();
         let mut pumps: HashMap<Pubkey, PoolInfo> = HashMap::new();
         let mut meteoras: HashMap<Pubkey, PoolInfo> = HashMap::new();
-        for (pool, _kind) in candidates {
+        for (pool, cand) in candidates {
             if self.seen_pools.contains(&pool) || self.manager.contains(&pool) {
                 continue;
             }
@@ -117,14 +142,18 @@ impl WalletMiner {
             if acct.owner != pump_prog && acct.owner != met_prog {
                 continue;
             }
-            if let Some(info) = decode_pool(pool, &acct.owner, &acct.data) {
-                match info.kind {
-                    DexKind::PumpFunAmm => {
-                        pumps.insert(info.token_mint, info);
-                    }
-                    DexKind::MeteoraDammV2 => {
-                        meteoras.insert(info.token_mint, info);
-                    }
+            let Some(mut info) = decode_pool(pool, &acct.owner, &acct.data) else {
+                continue;
+            };
+            // Golden ALT: whichever of this tx's tables actually contains the pool
+            // (and thus its route accounts). This is what makes our tx fit.
+            info.alt = self.find_pool_alt(&pool, &cand.alt_keys).await;
+            match cand.kind {
+                DexKind::PumpFunAmm => {
+                    pumps.insert(info.token_mint, info);
+                }
+                DexKind::MeteoraDammV2 => {
+                    meteoras.insert(info.token_mint, info);
                 }
             }
         }
@@ -133,14 +162,13 @@ impl WalletMiner {
         let mut added = 0usize;
         for (token, pump) in pumps {
             let Some(meteora) = meteoras.get(&token).cloned() else {
-                // One-sided so far (only Pump seen this pass). Left un-added; a
-                // later pass may see its Meteora counterpart and pair it then.
-                continue;
+                continue; // one-sided this pass; a later pass may pair it
             };
             if !self.passes_liquidity(&pump, &meteora).await {
                 continue;
             }
-            info!(%token, "wallet miner: adding shared Pump/Meteora pool");
+            info!(%token, pump_alt = ?pump.alt, met_alt = ?meteora.alt,
+                  "wallet miner: adding shared Pump/Meteora pool");
             let pair = ArbPair {
                 token_mint: token,
                 pump,
@@ -154,6 +182,50 @@ impl WalletMiner {
         }
         info!(added, "wallet miner pass complete");
         Ok(())
+    }
+
+    /// Pick the ALT to attach to this pool. Prefer the table that literally
+    /// contains the pool pubkey; if the pool itself was passed static in the
+    /// competitor tx (its vaults still live in the route ALT), fall back to the
+    /// LARGEST referenced table — the one most likely to cover the route
+    /// accounts and give us the compression we need.
+    async fn find_pool_alt(&mut self, pool: &Pubkey, alt_keys: &[Pubkey]) -> Option<Pubkey> {
+        for alt in alt_keys {
+            if self.alt_contains(alt, pool).await {
+                return Some(*alt);
+            }
+        }
+        // Fallback: largest table among those the tx referenced.
+        let mut best: Option<(Pubkey, usize)> = None;
+        for alt in alt_keys {
+            self.alt_contains(alt, pool).await; // ensures it's cached
+            let n = self.alt_members.get(alt).map(|s| s.len()).unwrap_or(0);
+            if best.map(|(_, bn)| n > bn).unwrap_or(true) {
+                best = Some((*alt, n));
+            }
+        }
+        best.map(|(a, _)| a)
+    }
+
+    async fn alt_contains(&mut self, alt: &Pubkey, needle: &Pubkey) -> bool {
+        if !self.alt_members.contains_key(alt) {
+            let rpc = self.rpc.clone();
+            let alt_pk = *alt;
+            let members = tokio::task::spawn_blocking(move || {
+                rpc.get_account(&alt_pk)
+                    .ok()
+                    .and_then(|a| deserialize_alt_addresses(&a.data).ok())
+                    .map(|v| v.into_iter().collect::<HashSet<Pubkey>>())
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
+            self.alt_members.insert(*alt, members);
+        }
+        self.alt_members
+            .get(alt)
+            .map(|s| s.contains(needle))
+            .unwrap_or(false)
     }
 
     /// Liquidity / not-rugged gates (same thresholds as API discovery).
@@ -175,7 +247,6 @@ impl WalletMiner {
                     return false;
                 }
             }
-            // Meteora liquidity@360 must be non-zero (not rugged).
             let liq = rpc
                 .get_account(&met_pool)
                 .ok()
@@ -200,21 +271,35 @@ impl WalletMiner {
         .unwrap_or(false)
     }
 
-    /// Scan one wallet: fetch its recent signatures, then each transaction, and
-    /// record every Pump/Meteora pool it touched into `out`. Returns the count
-    /// of distinct pools found for this wallet.
+    /// Scan one wallet: fetch its recent signatures (full window or only those
+    /// newer than the last seen), then each transaction, recording every
+    /// Pump/Meteora pool it touched (with the tx's ALT keys) into `out`.
     async fn scan_wallet(
-        &self,
+        &mut self,
         wallet: &str,
-        out: &mut HashMap<Pubkey, DexKind>,
+        full: bool,
+        out: &mut HashMap<Pubkey, Candidate>,
     ) -> Result<usize> {
-        let sigs = self.fetch_signatures(wallet, self.cfg.tx_limit).await?;
+        let until = if full {
+            None
+        } else {
+            self.newest_sig.get(wallet).cloned()
+        };
+        let limit = if full { self.cfg.tx_limit } else { self.cfg.tx_limit.min(1000) };
+        let sigs = self.fetch_signatures(wallet, limit, until.as_deref()).await?;
+        // Remember the newest signature for the next incremental pass.
+        if let Some(newest) = sigs.first() {
+            self.newest_sig.insert(wallet.to_string(), newest.clone());
+        }
         let start = out.len();
-        for sig in sigs {
-            match self.fetch_tx_pools(&sig).await {
-                Ok(pools) => {
+        for sig in &sigs {
+            match self.fetch_tx_pools(sig).await {
+                Ok((pools, alt_keys)) => {
                     for (pk, kind) in pools {
-                        out.entry(pk).or_insert(kind);
+                        out.entry(pk).or_insert(Candidate {
+                            kind,
+                            alt_keys: alt_keys.clone(),
+                        });
                     }
                 }
                 Err(_) => continue, // one bad tx never aborts the wallet
@@ -223,8 +308,14 @@ impl WalletMiner {
         Ok(out.len().saturating_sub(start))
     }
 
-    /// `getSignaturesForAddress` (paged, up to `limit`).
-    async fn fetch_signatures(&self, wallet: &str, limit: usize) -> Result<Vec<String>> {
+    /// `getSignaturesForAddress` (newest first, paged). If `until` is set, only
+    /// signatures newer than it are returned.
+    async fn fetch_signatures(
+        &self,
+        wallet: &str,
+        limit: usize,
+        until: Option<&str>,
+    ) -> Result<Vec<String>> {
         let mut sigs = Vec::new();
         let mut before: Option<String> = None;
         while sigs.len() < limit {
@@ -232,6 +323,9 @@ impl WalletMiner {
             let mut opts = serde_json::json!({ "limit": want, "commitment": "confirmed" });
             if let Some(b) = &before {
                 opts["before"] = Value::String(b.clone());
+            }
+            if let Some(u) = until {
+                opts["until"] = Value::String(u.to_string());
             }
             let resp = self
                 .rpc_call("getSignaturesForAddress", serde_json::json!([wallet, opts]))
@@ -251,16 +345,16 @@ impl WalletMiner {
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string());
             if arr.len() < want {
-                break; // end of history
+                break;
             }
         }
         sigs.truncate(limit);
         Ok(sigs)
     }
 
-    /// Fetch a transaction (jsonParsed) and extract its Pump/Meteora pools from
-    /// both the outer instructions and every inner instruction.
-    async fn fetch_tx_pools(&self, sig: &str) -> Result<Vec<(Pubkey, DexKind)>> {
+    /// Fetch a transaction (jsonParsed) and extract its Pump/Meteora pools plus
+    /// the ALT keys it referenced.
+    async fn fetch_tx_pools(&self, sig: &str) -> Result<(Vec<(Pubkey, DexKind)>, Vec<Pubkey>)> {
         let resp = self
             .rpc_call(
                 "getTransaction",
@@ -272,7 +366,7 @@ impl WalletMiner {
             .await?;
         let tx = match resp.get("result") {
             Some(v) if !v.is_null() => v,
-            _ => return Ok(Vec::new()),
+            _ => return Ok((Vec::new(), Vec::new())),
         };
         let mut out = Vec::new();
         let mut seen: HashSet<Pubkey> = HashSet::new();
@@ -296,10 +390,12 @@ impl WalletMiner {
             }
         };
 
-        // Outer instructions.
-        if let Some(ixs) = tx
+        let message = tx
             .get("transaction")
-            .and_then(|t| t.get("message"))
+            .and_then(|t| t.get("message"));
+
+        // Outer instructions.
+        if let Some(ixs) = message
             .and_then(|m| m.get("instructions"))
             .and_then(|i| i.as_array())
         {
@@ -325,7 +421,22 @@ impl WalletMiner {
                 }
             }
         }
-        Ok(out)
+
+        // ALT keys referenced by the tx (v0 addressTableLookups).
+        let mut alt_keys = Vec::new();
+        if let Some(lookups) = message
+            .and_then(|m| m.get("addressTableLookups"))
+            .and_then(|l| l.as_array())
+        {
+            for l in lookups {
+                if let Some(k) = l.get("accountKey").and_then(|k| k.as_str()) {
+                    if let Ok(pk) = Pubkey::from_str(k) {
+                        alt_keys.push(pk);
+                    }
+                }
+            }
+        }
+        Ok((out, alt_keys))
     }
 
     /// One JSON-RPC POST to the configured RPC endpoint.
