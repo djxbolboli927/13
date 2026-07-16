@@ -76,6 +76,9 @@ pub struct ShredConsumer {
     /// swaps hiding the pool behind an ALT become resolvable — this is how we
     /// stop missing trades that competitors (who resolve ALTs) already see.
     pending_alts: std::sync::Mutex<HashSet<Pubkey>>,
+    /// Optional sink for `(pump_pool, alt_keys)` — the ALTs a competitor tx used
+    /// on a watched pool, fed to the AltRegistry so it can pick the best table.
+    alt_candidate_tx: std::sync::RwLock<Option<mpsc::Sender<(Pubkey, Vec<Pubkey>)>>>,
     pub metrics: Arc<ShredMetrics>,
 }
 
@@ -98,8 +101,15 @@ impl ShredConsumer {
             remove_tx: std::sync::RwLock::new(None),
             rpc,
             pending_alts: std::sync::Mutex::new(HashSet::new()),
+            alt_candidate_tx: std::sync::RwLock::new(None),
             metrics,
         }
+    }
+
+    /// Register the AltRegistry sink that receives `(pump_pool, alt_keys)` for
+    /// each competitor tx seen on a watched pool.
+    pub fn set_alt_candidate_sender(&self, tx: mpsc::Sender<(Pubkey, Vec<Pubkey>)>) {
+        *self.alt_candidate_tx.write().unwrap() = Some(tx);
     }
 
     /// Background task: periodically fetch ALT account contents we don't yet
@@ -248,6 +258,13 @@ impl ShredConsumer {
         // readonly), filling unknown-ALT slots with a placeholder.
         let full_keys = self.resolve_keys(msg);
 
+        // The ALT keys this tx used — candidates for whichever watched pool it
+        // touches (fed to the AltRegistry, which picks the best-coverage table).
+        let tx_alts: Vec<Pubkey> = msg
+            .address_table_lookups()
+            .map(|ls| ls.iter().map(|l| l.account_key).collect())
+            .unwrap_or_default();
+
         for ix in msg.instructions() {
             let program = match full_keys.get(ix.program_id_index as usize) {
                 Some(p) => *p,
@@ -277,6 +294,14 @@ impl ShredConsumer {
             }
             if !self.target_pools.read().unwrap().contains(&pool) {
                 continue;
+            }
+
+            // Feed this tx's ALTs as candidates for the pool (the AltRegistry
+            // picks the best-coverage one and stops once it's good enough).
+            if !tx_alts.is_empty() {
+                if let Some(s) = self.alt_candidate_tx.read().unwrap().as_ref() {
+                    let _ = s.try_send((pool, tx_alts.clone()));
+                }
             }
 
             // Remove-liquidity on a watched pool → signal the manager to close it.

@@ -3,6 +3,7 @@ mod account_cache;
 mod alt_builder;
 mod alt_cache;
 mod alt_fetch;
+mod alt_registry;
 mod arbitrage;
 #[allow(dead_code)]
 mod ata;
@@ -521,6 +522,17 @@ fn spawn_shred_arb(
             }
         }
 
+        // Per-pool best-ALT registry, fed by competitor shreds: picks the single
+        // highest-coverage ALT for each pool and registers it with Metis. This is
+        // the primary tx-size fix (aggregators only have ALTs for old pools).
+        let (alt_registry, alt_cand_tx) = alt_registry::AltRegistry::spawn(
+            registry.clone(),
+            metis.clone(),
+            rpc_client.clone(),
+            sa.alt_min_coverage,
+        );
+        consumer.set_alt_candidate_sender(alt_cand_tx);
+
         // Automatic pool manager: add-market to Metis, extend the gRPC/shred
         // subscriptions, and manage ATAs — all at runtime, no restart. It holds
         // clones so the engine can still own its handles below.
@@ -713,6 +725,7 @@ fn spawn_shred_arb(
             Some(pool_manager),
             alt_builder,
             alt_fetcher,
+            alt_registry,
         ));
         engine.clone().spawn_reporter();
         // Second opportunity source: re-assess all pairs from current state

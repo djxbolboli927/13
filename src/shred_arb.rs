@@ -136,6 +136,9 @@ pub struct ShredArbEngine {
     /// Free ALTs fetched from Jupiter/DFlow/Raptor per pool — the cheap way to
     /// compress the route (no on-chain writes from us).
     pub alt_fetcher: Option<Arc<crate::alt_fetch::AltFetcher>>,
+    /// Best-ALT-per-pool registry harvested from competitor shreds (primary
+    /// source for fresh pools). One max-coverage ALT per pool.
+    pub alt_registry: Arc<crate::alt_registry::AltRegistry>,
     last_fired: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
     /// Last time we actually SENT a tx for a pool — de-dupes the spam of
     /// re-firing the same standing gap every 100ms.
@@ -254,6 +257,7 @@ impl ShredArbEngine {
         manager: Option<Arc<crate::pool_manager::PoolManager>>,
         alt_builder: Option<Arc<crate::alt_builder::AltBuilder>>,
         alt_fetcher: Option<Arc<crate::alt_fetch::AltFetcher>>,
+        alt_registry: Arc<crate::alt_registry::AltRegistry>,
     ) -> Self {
         Self {
             metis,
@@ -273,6 +277,7 @@ impl ShredArbEngine {
             manager,
             alt_builder,
             alt_fetcher,
+            alt_registry,
             last_fired: dashmap::DashMap::new(),
             last_sent: dashmap::DashMap::new(),
             sent_stats: Arc::new(SentStats::default()),
@@ -744,16 +749,21 @@ impl ShredArbEngine {
         let rpc = self.rpc_client.clone();
         let cu = self.params.cu_limit;
         // ALTs folded into the tx so route accounts compress from 32 static bytes
-        // to a 1-byte index. Priority: free provider ALTs (Jupiter/DFlow/Raptor)
-        // for this pool, plus any ALT recorded on the pool itself.
-        let mut extra_alts: Vec<solana_sdk::pubkey::Pubkey> = self
-            .alt_fetcher
-            .as_ref()
-            .map(|f| f.tables_for(&pool))
-            .unwrap_or_default();
-        for a in [pair.pump.alt, pair.meteora.alt].into_iter().flatten() {
-            if !extra_alts.contains(&a) {
-                extra_alts.push(a);
+        // to a 1-byte index. Priority: the single max-coverage ALT the registry
+        // harvested for this pool from competitor shreds; then (as fallback) a
+        // free provider ALT and any ALT recorded on the pool itself.
+        let mut extra_alts: Vec<solana_sdk::pubkey::Pubkey> = Vec::new();
+        if let Some(a) = self.alt_registry.best_for(&pool) {
+            extra_alts.push(a);
+        }
+        if extra_alts.is_empty() {
+            if let Some(f) = &self.alt_fetcher {
+                extra_alts = f.tables_for(&pool);
+            }
+            for a in [pair.pump.alt, pair.meteora.alt].into_iter().flatten() {
+                if !extra_alts.contains(&a) {
+                    extra_alts.push(a);
+                }
             }
         }
 
