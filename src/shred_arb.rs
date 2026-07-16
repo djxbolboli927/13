@@ -732,6 +732,14 @@ impl ShredArbEngine {
             }
         };
 
+        // Record the REAL route-account set for this pool so the ALT registry
+        // scores harvested competitor tables against exactly what THIS tx must
+        // compress (shared program/config/mint accounts included), not just the
+        // pool/vault pubkeys. This is what makes a harvested ALT actually reduce
+        // our tx size instead of contributing zero used entries.
+        self.alt_registry
+            .record_route_accounts(pool, harvest_accounts(&swap_ixs));
+
         // Teach our self-learning ALT every account in this route so subsequent
         // txs for this pool compress fully. Cheap: only unseen pubkeys enqueue.
         if let Some(ab) = &self.alt_builder {

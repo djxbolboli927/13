@@ -45,6 +45,12 @@ pub struct AltRegistry {
     chosen: DashMap<Pubkey, Chosen>,
     /// ALT key → its member set (fetched once, cached).
     members: DashMap<Pubkey, Arc<HashSet<Pubkey>>>,
+    /// pump_pool → the REAL set of accounts Metis puts in this pool's route
+    /// (both legs). Captured the first time the engine builds a tx for the pool.
+    /// This is what a good ALT must cover — NOT just the pool/vault pubkeys,
+    /// because most of the compressible weight is the shared program/config/mint
+    /// accounts the route touches.
+    route_accounts: DashMap<Pubkey, Arc<HashSet<Pubkey>>>,
     /// Coverage (route accounts found in the table) at which we finalize.
     min_coverage: usize,
 }
@@ -66,6 +72,7 @@ impl AltRegistry {
             rpc,
             chosen: DashMap::new(),
             members: DashMap::new(),
+            route_accounts: DashMap::new(),
             min_coverage: min_coverage.max(1),
         });
         me.clone().run(rx);
@@ -77,6 +84,18 @@ impl AltRegistry {
         self.chosen.get(pump_pool).map(|c| c.alt)
     }
 
+    /// Record the REAL account set Metis uses for this pool's route, so candidate
+    /// ALTs are scored against exactly what our tx needs to compress. Called by
+    /// the engine on the first (and every) build for the pool; cheap and
+    /// idempotent — we only replace when we don't yet have a set.
+    pub fn record_route_accounts(&self, pump_pool: Pubkey, accounts: Vec<Pubkey>) {
+        if accounts.is_empty() || self.route_accounts.contains_key(&pump_pool) {
+            return;
+        }
+        let set: HashSet<Pubkey> = accounts.into_iter().collect();
+        self.route_accounts.insert(pump_pool, Arc::new(set));
+    }
+
     fn run(self: Arc<Self>, mut rx: mpsc::Receiver<(Pubkey, Vec<Pubkey>)>) {
         tokio::spawn(async move {
             while let Some((pool, candidates)) = rx.recv().await {
@@ -85,8 +104,17 @@ impl AltRegistry {
         });
     }
 
-    /// The route accounts a good table should cover: both pools + their vaults.
+    /// The accounts a good table should cover. Prefer the REAL route-account set
+    /// Metis emitted for this pool (captured on the first build) — that's the
+    /// exact set our tx must compress, dominated by shared program/config/mint
+    /// accounts, not just the pool/vault pubkeys. Until that's recorded, fall
+    /// back to the pool + vaults we know from the pair.
     fn needed_accounts(&self, pump_pool: &Pubkey) -> Option<HashSet<Pubkey>> {
+        if let Some(r) = self.route_accounts.get(pump_pool) {
+            if !r.is_empty() {
+                return Some((**r).clone());
+            }
+        }
         let pair = self.registry.get(pump_pool)?;
         let mut set = HashSet::new();
         for a in [
