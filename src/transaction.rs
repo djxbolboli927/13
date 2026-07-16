@@ -79,6 +79,7 @@ fn to_sdk_instruction(ix: &InstructionData) -> Result<Instruction> {
 /// is controlled by setting out_amount in the merged quote passed to Metis
 /// before calling this function — do not patch instruction bytes here.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn build_arb_transaction(
     swap_ixs: &SwapInstructionsResponse,
     payer: &Keypair,
@@ -90,6 +91,12 @@ pub fn build_arb_transaction(
     // Extra ALTs (fetched free from Jupiter/DFlow/Raptor) folded in so the route
     // accounts compress to 1-byte indexes.
     extra_alts: &[Pubkey],
+    // Our OWN self-learning lookup tables, with their current in-memory address
+    // lists (no RPC fetch). These accumulate every account seen in a Metis swap
+    // instruction, so they compress the FULL route — the decisive size fix. On
+    // the Jito path this was previously missing, so owned tables were ignored
+    // and the tx stayed oversized (alts_used=0).
+    owned_alts: &[AddressLookupTableAccount],
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
@@ -142,6 +149,12 @@ pub fn build_arb_transaction(
         match alt_cache.get_or_fetch(alt_pubkey, rpc_client) {
             Ok(a) => address_lookup_tables.push(a),
             Err(e) => tracing::debug!(alt = %alt_pubkey, error = %e, "skip unfetchable ALT (jito)"),
+        }
+    }
+    // Fold in our own learned tables (deduped by key) — the decisive compressor.
+    for t in owned_alts {
+        if !address_lookup_tables.iter().any(|x| x.key == t.key) {
+            address_lookup_tables.push(t.clone());
         }
     }
 

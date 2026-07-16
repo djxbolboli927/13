@@ -190,7 +190,7 @@ alt_fetch_providers = [
 ]
 # ساخت ALT خودمان روی زنجیره (هزینه رنت دارد). طبق درخواست خاموش شد؛ فقط اگر
 # ارائه‌دهنده‌ها جواب ندادند به‌عنوان fالback می‌توانید true کنید.
-alt_self_build = false
+alt_self_build = true
 # فایل ذخیره pubkey جدول(های) خودمان (فقط وقتی alt_self_build=true معنی دارد).
 alt_store_path = "/root/g/our_alt.txt"
 

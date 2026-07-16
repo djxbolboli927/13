@@ -364,6 +364,7 @@ pub fn spawn_workers(
                         &alt,
                         &rpc,
                         &[],
+                        &[],
                     )
                 })
                 .await
