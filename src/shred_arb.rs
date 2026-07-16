@@ -187,6 +187,9 @@ pub struct ShredArbEngine {
     nosend_too_locks: AtomicU64,
     /// RPC rejected the send (or Jito path rate-limited).
     nosend_send_err: AtomicU64,
+    /// Skipped at the last moment because the pool moved during our compute
+    /// window (a competitor's trade landed) so the tx would now revert.
+    nosend_preempted: AtomicU64,
     /// Best (max) net lamports the optimizer found in the current window,
     /// including negatives — shows how close we get when nothing is profitable.
     best_net_seen: AtomicI64,
@@ -197,6 +200,23 @@ pub struct ShredArbEngine {
 enum BuyOn {
     Pump,
     Meteora,
+}
+
+/// Everything needed to re-check, at the very last moment before sending,
+/// whether the opportunity is still alive. Between detection and send we spend
+/// ~100-200ms fetching Metis quotes; in that window a competitor's trade may
+/// land on the Meteora pool and close the gap, which would make our tx revert.
+/// The pump side is held at our predicted post-trade reserves (the trade we're
+/// front-running is landing); only the Meteora side is re-read live.
+struct Recheck {
+    buy_on_pump: bool,
+    token_is_a: bool,
+    pump_after: PumpPool,
+    met_pool: solana_sdk::pubkey::Pubkey,
+    fallback_fee: u64,
+    amount_in: u64,
+    /// Minimum WSOL out we need (input + network fee + tip).
+    min_out: u64,
 }
 
 /// On-chain fate of the direct-sent transactions (checked a few seconds after
@@ -280,6 +300,7 @@ impl ShredArbEngine {
             nosend_too_large: AtomicU64::new(0),
             nosend_too_locks: AtomicU64::new(0),
             nosend_send_err: AtomicU64::new(0),
+            nosend_preempted: AtomicU64::new(0),
             best_net_seen: AtomicI64::new(i64::MIN),
         }
     }
@@ -594,7 +615,16 @@ impl ShredArbEngine {
         let tip = self.params.jito_tip_min_lamports
             + (net as f64 * self.params.jito_tip_profit_fraction) as u64;
         let onchain_floor = best_x + self.params.network_fee_lamports + tip;
-        self.execute(pair, pool, buy_kind, sell_kind, best_x, onchain_floor, tip)
+        let recheck = Recheck {
+            buy_on_pump: buy_on == BuyOn::Pump,
+            token_is_a,
+            pump_after,
+            met_pool: pair.meteora.pool,
+            fallback_fee: fallback_fee_numerator,
+            amount_in: best_x,
+            min_out: onchain_floor,
+        };
+        self.execute(pair, pool, buy_kind, sell_kind, best_x, onchain_floor, tip, recheck)
             .await;
     }
 
@@ -608,6 +638,7 @@ impl ShredArbEngine {
         amount_in: u64,
         floor: u64,
         tip: u64,
+        recheck: Recheck,
     ) {
         // De-dupe: don't blast the same pool with identical txs while an earlier
         // one is still unconfirmed. Kept SMALL and configurable (send_dedup_ms,
@@ -799,6 +830,18 @@ impl ShredArbEngine {
                 return;
             }
 
+            // Last-moment freshness gate: if the pool moved against us while we
+            // fetched quotes/built the tx (a competitor's trade landed), this tx
+            // would revert — skip it instead of sending a doomed tx.
+            if !self.still_profitable(&recheck) {
+                self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
+                crate::errlog::log(
+                    "not-sent",
+                    &format!("token={token} reason=preempted (pool moved before send)"),
+                );
+                return;
+            }
+
             let rpc2 = self.rpc_client.clone();
             let send_res = tokio::task::spawn_blocking(move || {
                 use solana_client::rpc_config::RpcSendTransactionConfig;
@@ -905,6 +948,17 @@ impl ShredArbEngine {
             return;
         }
 
+        // Last-moment freshness gate (same as the direct path): skip if the pool
+        // moved against us during the compute window (would revert).
+        if !self.still_profitable(&recheck) {
+            self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
+            crate::errlog::log(
+                "not-sent",
+                &format!("token={token} reason=preempted (pool moved before send)"),
+            );
+            return;
+        }
+
         // Signature of the swap tx — used to check whether the bundle actually
         // landed (Jito accepting a bundle ≠ it landing; it may lose the auction
         // or its tx may revert). Without this the Jito path is blind.
@@ -941,6 +995,31 @@ impl ShredArbEngine {
                 crate::errlog::log("not-sent", &format!("token={token} reason=jito-send-fail err={e}"));
             }
         }
+    }
+
+    /// Final gate: using the LATEST cached Meteora state, would the trade still
+    /// clear `min_out`? Returns false if a competitor moved the pool against us
+    /// during the compute window (the tx would revert). If we have no fresh
+    /// Meteora reading we do NOT block (return true) — better to try than to
+    /// stall on a cache gap.
+    fn still_profitable(&self, r: &Recheck) -> bool {
+        let met = match self.pool_state.meteora_pool(&r.met_pool, r.fallback_fee) {
+            Some(m) => m,
+            None => return true,
+        };
+        let out = if r.buy_on_pump {
+            let base = r.pump_after.quote_buy(r.amount_in);
+            if base == 0 {
+                return false;
+            }
+            met.sell_token_for_wsol(base, r.token_is_a)
+        } else {
+            match met.buy_token_with_wsol(r.amount_in, r.token_is_a) {
+                Some(base) if base > 0 => Some(PumpPool::quote_sell(&r.pump_after, base)),
+                _ => None,
+            }
+        };
+        matches!(out, Some(o) if o >= r.min_out)
     }
 
     /// The configurable Metis `dexes=` label for a venue.
@@ -1039,7 +1118,7 @@ impl ShredArbEngine {
                     "\n[shred-arb 30s] watching_pools={}\n\
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} bad_price={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
-                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={}",
+                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
                     self.profitable.load(Ordering::Relaxed),
@@ -1061,6 +1140,7 @@ impl ShredArbEngine {
                     self.nosend_too_large.load(Ordering::Relaxed),
                     self.nosend_too_locks.load(Ordering::Relaxed),
                     self.nosend_send_err.load(Ordering::Relaxed),
+                    self.nosend_preempted.load(Ordering::Relaxed),
                 );
             }
         });
