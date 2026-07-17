@@ -44,6 +44,11 @@ const LOAD_RETRY_LIMIT: u32 = 10;
 /// keeping the per-ALT (~34-byte) overhead in check.
 const MAX_ALTS_PER_TX: usize = 3;
 
+/// Diagnostic: simulate 1 in this many sent bundles against live chain state and
+/// log the REAL failure reason (slippage vs other) to the error log. Jito drops
+/// failing bundles silently, so this is how we learn WHY. 0 disables it.
+const SIM_SAMPLE_EVERY: u64 = 10;
+
 /// A raw price gap larger than this is never a real arb — it's a decode
 /// artifact or a one-sided dead pool. Real cross-pool gaps are a few percent.
 const MAX_PLAUSIBLE_GAP_PCT: f64 = 300.0;
@@ -150,6 +155,8 @@ pub struct ShredArbEngine {
     last_sent: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
     /// On-chain fate of sent txs.
     sent_stats: Arc<SentStats>,
+    /// Rolling counter used to sample pre-send simulations (diagnostic).
+    sim_sample: AtomicU64,
     /// Consecutive forced-quote route failures per pool. A pool that can't be
     /// routed on both venues repeatedly is dropped (see `ROUTE_FAIL_LIMIT`).
     route_fail: dashmap::DashMap<solana_sdk::pubkey::Pubkey, u32>,
@@ -286,6 +293,7 @@ impl ShredArbEngine {
             last_fired: dashmap::DashMap::new(),
             last_sent: dashmap::DashMap::new(),
             sent_stats: Arc::new(SentStats::default()),
+            sim_sample: AtomicU64::new(0),
             route_fail: dashmap::DashMap::new(),
             load_fail: dashmap::DashMap::new(),
             disabled: dashmap::DashSet::new(),
@@ -976,6 +984,49 @@ impl ShredArbEngine {
                 &format!("token={token} reason=preempted (pool moved before send)"),
             );
             return;
+        }
+
+        // Diagnostic (sampled): simulate against LIVE chain state right before
+        // sending and log the real reason a bundle would fail. If sim is clean
+        // but the bundle still drops → we're losing the Jito auction (front-run),
+        // not reverting. If sim shows a program error → it's our tx (slippage/
+        // floor). Spawned so it never delays the actual send.
+        if SIM_SAMPLE_EVERY > 0
+            && self.sim_sample.fetch_add(1, Ordering::Relaxed) % SIM_SAMPLE_EVERY == 0
+        {
+            let rpc_sim = self.rpc_client.clone();
+            let tx_sim = tx.clone();
+            let tok = token.clone();
+            let net = recheck.min_out.saturating_sub(amount_in);
+            tokio::spawn(async move {
+                let res = tokio::task::spawn_blocking(move || {
+                    use solana_client::rpc_config::RpcSimulateTransactionConfig;
+                    rpc_sim.simulate_transaction_with_config(
+                        &tx_sim,
+                        RpcSimulateTransactionConfig {
+                            sig_verify: false,
+                            replace_recent_blockhash: true,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .await;
+                if let Ok(Ok(resp)) = res {
+                    let v = resp.value;
+                    let tail: Vec<String> = v
+                        .logs
+                        .as_ref()
+                        .map(|l| l.iter().rev().take(3).cloned().collect())
+                        .unwrap_or_default();
+                    crate::errlog::log(
+                        "sim",
+                        &format!(
+                            "token={tok} floor_net={net} sim_err={:?} units={:?} logs_tail={:?}",
+                            v.err, v.units_consumed, tail
+                        ),
+                    );
+                }
+            });
         }
 
         // Signature of the swap tx — used to check whether the bundle actually
