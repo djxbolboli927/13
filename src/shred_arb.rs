@@ -522,10 +522,15 @@ impl ShredArbEngine {
         // Profit GATE: the optimizer maximizes `out - x - required_extra`, where
         // `required_extra` is the minimum profit we insist on (default 5000 =
         // one network base fee). Direct sends pay only that fee, no Jito tip.
-        // NOTE: this is only the gate — the on-chain minimum output is set to
-        // exactly the input (break-even) at send time, so a trade that clears
-        // the gate at predict time still lands as long as it doesn't lose money.
-        let required_extra = self.params.min_net_profit_lamports;
+        // The optimizer maximises `out - x - required_extra`. `required_extra`
+        // MUST be the FULL unavoidable cost of a landed tx — network fee AND the
+        // minimum Jito tip — otherwise we'd optimise (and detect) against a floor
+        // that's lower than the on-chain min-out and every marginal trade would
+        // revert. (This was the bug: detection used only the network fee, but the
+        // on-chain floor added the tip on top → guaranteed self-inflicted revert
+        // for any opportunity whose profit was below the tip.)
+        let required_extra =
+            self.params.network_fee_lamports + self.params.jito_tip_min_lamports;
 
         // Ceiling on trade size: never add more WSOL than a fraction of the
         // BUY pool's current WSOL reserve (keeps the swap in a valid range and
@@ -610,12 +615,28 @@ impl ShredArbEngine {
                 return;
             }
         };
-        let profit_floor = best_x + required_extra;
-        if best_out <= profit_floor {
+        // Surplus over the swap's OWN cost (input + network fee). Everything
+        // above this is split between the Jito tip and the profit we keep.
+        let network_fee = self.params.network_fee_lamports;
+        let surplus = best_out.saturating_sub(best_x + network_fee);
+        // Must at least cover the minimum tip, otherwise the bundle can't win.
+        if surplus <= self.params.jito_tip_min_lamports {
             self.not_profitable.fetch_add(1, Ordering::Relaxed);
-            return; // predicted profit below the minimum gate
+            return;
         }
-        let net = best_out - profit_floor;
+        // Split surplus into tip + kept profit, honouring tip = min + frac·kept:
+        //   surplus = tip + kept = min + frac·kept + kept  ⇒  kept = (surplus-min)/(1+frac)
+        // Built this way the on-chain floor (input+fee+tip) = best_out - kept, so
+        // the quote ALWAYS clears its own floor — a landed tx can only fail if a
+        // competitor moves the pool first, never because of our own arithmetic.
+        let frac = self.params.jito_tip_profit_fraction.max(0.0);
+        let kept = (((surplus - self.params.jito_tip_min_lamports) as f64) / (1.0 + frac)) as u64;
+        let tip = surplus - kept; // = min tip + frac·kept
+        let net = kept;
+        if net < self.params.min_net_profit_lamports {
+            self.not_profitable.fetch_add(1, Ordering::Relaxed);
+            return; // real kept profit below the "worth it" gate
+        }
 
         // Plausibility guard: a real cross-pool gap is small. A predicted net
         // above `max_profit_fraction` of the input is always a dead-pool
@@ -644,13 +665,10 @@ impl ShredArbEngine {
         );
 
         self.last_fired.insert(pool, Instant::now());
-        // Jito tip = min tip + a share of the detected profit (e.g. 1000 + 20%).
-        // On-chain output floor = input + network fee + tip, so the tx reverts
-        // unless it at least covers the fee and the tip (we keep the rest). Only
-        // opportunities whose realized profit exceeds fee+tip actually land.
-        let tip = self.params.jito_tip_min_lamports
-            + (net as f64 * self.params.jito_tip_profit_fraction) as u64;
-        let onchain_floor = best_x + self.params.network_fee_lamports + tip;
+        // `tip` was derived above from the surplus; the on-chain output floor is
+        // input + network fee + tip, which by construction equals best_out - net
+        // (≤ best_out) — so a detected opportunity always clears its own floor.
+        let onchain_floor = best_x + network_fee + tip;
         let recheck = Recheck {
             buy_on_pump: buy_on == BuyOn::Pump,
             token_is_a,
@@ -765,8 +783,10 @@ impl ShredArbEngine {
             return;
         }
 
-        // Set the on-chain floor to exactly the input (break-even) regardless of
-        // what Metis quoted (our data is ahead of Metis).
+        // Set the on-chain floor to exactly the input + fee + tip (break-even+)
+        // regardless of what Metis quoted — our shred-driven data is AHEAD of
+        // Metis (it hasn't ingested the observed trade yet), so we only take the
+        // instruction skeleton from Metis and override the amounts ourselves.
         let merged = match MetisClient::merge_quotes(&q1, &q2, floor) {
             Ok(m) => m,
             Err(e) => {
