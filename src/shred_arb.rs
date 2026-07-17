@@ -615,28 +615,29 @@ impl ShredArbEngine {
                 return;
             }
         };
-        // Surplus over the swap's OWN cost (input + network fee). Everything
-        // above this is split between the Jito tip and the profit we keep.
+        // ── Two-stage profit gate (exactly the flow you described) ──
+        // Base cost of a landed tx = input + network fee + the MINIMUM Jito tip.
+        // Example: buy 1 SOL → base cost = 1 SOL + 5000 + 1000 = 1 SOL + 6000.
         let network_fee = self.params.network_fee_lamports;
-        let surplus = best_out.saturating_sub(best_x + network_fee);
-        // Must at least cover the minimum tip, otherwise the bundle can't win.
-        if surplus <= self.params.jito_tip_min_lamports {
+        let base_cost = network_fee + self.params.jito_tip_min_lamports;
+        // Stage 1 — initial filter (this is min_net_profit's ONLY role, NOT the
+        // send floor): the profit OVER the base cost must clear the worth-it
+        // minimum. If output = 1 SOL + 7000, profit_over_base = 1000.
+        let profit_over_base = best_out.saturating_sub(best_x + base_cost);
+        if profit_over_base < self.params.min_net_profit_lamports.max(1) {
             self.not_profitable.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        // Split surplus into tip + kept profit, honouring tip = min + frac·kept:
-        //   surplus = tip + kept = min + frac·kept + kept  ⇒  kept = (surplus-min)/(1+frac)
-        // Built this way the on-chain floor (input+fee+tip) = best_out - kept, so
-        // the quote ALWAYS clears its own floor — a landed tx can only fail if a
-        // competitor moves the pool first, never because of our own arithmetic.
+        // Stage 2 — hand a share of the REMAINING profit to Jito as EXTRA tip and
+        // keep the rest. tip = min_tip + frac·profit_over_base (frac=0 ⇒ fixed
+        // tip = min_tip). Example: extra = 20%·1000 = 200 → tip = 1200, kept =
+        // 800. The on-chain floor becomes input + fee + tip = best_out - kept, so
+        // the quote ALWAYS clears its own floor; only a competitor moving the
+        // pool first can revert a sent tx — never our own arithmetic.
         let frac = self.params.jito_tip_profit_fraction.max(0.0);
-        let kept = (((surplus - self.params.jito_tip_min_lamports) as f64) / (1.0 + frac)) as u64;
-        let tip = surplus - kept; // = min tip + frac·kept
-        let net = kept;
-        if net < self.params.min_net_profit_lamports {
-            self.not_profitable.fetch_add(1, Ordering::Relaxed);
-            return; // real kept profit below the "worth it" gate
-        }
+        let extra_tip = (profit_over_base as f64 * frac) as u64;
+        let tip = self.params.jito_tip_min_lamports + extra_tip;
+        let net = profit_over_base - extra_tip; // profit we actually keep
 
         // Plausibility guard: a real cross-pool gap is small. A predicted net
         // above `max_profit_fraction` of the input is always a dead-pool

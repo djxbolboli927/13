@@ -212,8 +212,11 @@ alt_store_path = "/root/g/our_alt.txt"
 # انعام = jito_tip_min_lamports + jito_tip_profit_fraction × سودِ تشخیص‌داده‌شده.
 # کف خروجی روی‌زنجیره = ورودی + 5000 کارمزد شبکه + انعام. مثال: سود 1000 ⇒
 # انعام = 1000 + 0.20×1000 = 1200 لمپرت.
-jito_tip_min_lamports = 1000
-jito_tip_profit_fraction = 0.20
+# انعام جیتو (فعلاً ثابت برای عیب‌یابی). با fraction=0 انعام دقیقاً برابر
+# jito_tip_min_lamports می‌شود (ثابت ۲۰۰۰). اگر خواستید دوباره درصدی شود،
+# fraction را روی 0.20 بگذارید تا انعام = min + ۲۰٪ سودِ مازاد بر هزینهٔ پایه شود.
+jito_tip_min_lamports = 2000
+jito_tip_profit_fraction = 0.0
 
 # ─── سیاست بستن ولت‌ها ───
 # true = ربات هیچ‌وقت استخر/ATA را نمی‌بندد، فقط باز می‌کند (حتی اگر ریمو-لیکویدیتی
