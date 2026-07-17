@@ -113,6 +113,11 @@ pub struct ArbParams {
     pub send_dedup_ms: u64,
     /// Seconds to wait before polling a sent tx's on-chain fate.
     pub status_check_delay_secs: u64,
+    /// If true, simulate every tx against LIVE chain state right before sending
+    /// and DROP it on any error (mainly 0x1771 slippage) — i.e. a competitor
+    /// moved the pool and our tx would revert (negative slippage). Positive
+    /// slippage passes. Costs one RPC round-trip of latency per send.
+    pub simulate_before_send: bool,
     /// Never tear a pool down (route failures no longer drop/close it). Kept for
     /// config symmetry; teardown is gated in main.rs, so it's not read here.
     #[allow(dead_code)]
@@ -205,6 +210,9 @@ pub struct ShredArbEngine {
     /// Skipped at the last moment because the pool moved during our compute
     /// window (a competitor's trade landed) so the tx would now revert.
     nosend_preempted: AtomicU64,
+    /// Dropped by the pre-send simulation gate (would revert on live state,
+    /// mainly 0x1771 slippage).
+    nosend_sim_fail: AtomicU64,
     /// Best (max) net lamports the optimizer found in the current window,
     /// including negatives — shows how close we get when nothing is profitable.
     best_net_seen: AtomicI64,
@@ -319,6 +327,7 @@ impl ShredArbEngine {
             nosend_too_locks: AtomicU64::new(0),
             nosend_send_err: AtomicU64::new(0),
             nosend_preempted: AtomicU64::new(0),
+            nosend_sim_fail: AtomicU64::new(0),
             best_net_seen: AtomicI64::new(i64::MIN),
         }
     }
@@ -986,18 +995,53 @@ impl ShredArbEngine {
             return;
         }
 
-        // Diagnostic (sampled): simulate against LIVE chain state right before
-        // sending and log the real reason a bundle would fail. If sim is clean
-        // but the bundle still drops → we're losing the Jito auction (front-run),
-        // not reverting. If sim shows a program error → it's our tx (slippage/
-        // floor). Spawned so it never delays the actual send.
-        if SIM_SAMPLE_EVERY > 0
+        // Pre-send negative-slippage gate: simulate against LIVE chain state
+        // right before sending. If a competitor moved the pool so our min-out no
+        // longer clears, the sim reverts with 0x1771 (slippage) — DROP instead of
+        // sending a doomed bundle that just burns our rate limit. Positive
+        // slippage (better price) passes the sim, so only negative slippage is
+        // filtered. Costs one RPC round-trip; toggle with `simulate_before_send`.
+        if self.params.simulate_before_send {
+            let rpc_sim = self.rpc_client.clone();
+            let tx_sim = tx.clone();
+            let sim = tokio::task::spawn_blocking(move || {
+                use solana_client::rpc_config::RpcSimulateTransactionConfig;
+                rpc_sim.simulate_transaction_with_config(
+                    &tx_sim,
+                    RpcSimulateTransactionConfig {
+                        sig_verify: false,
+                        replace_recent_blockhash: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .await;
+            // Only a definite program error blocks the send; an RPC hiccup
+            // (Err) falls through so a transient failure doesn't stall trading.
+            if let Ok(Ok(resp)) = sim {
+                if let Some(err) = resp.value.err {
+                    self.nosend_sim_fail.fetch_add(1, Ordering::Relaxed);
+                    let tail: Vec<String> = resp
+                        .value
+                        .logs
+                        .as_ref()
+                        .map(|l| l.iter().rev().take(2).cloned().collect())
+                        .unwrap_or_default();
+                    crate::errlog::log(
+                        "not-sent",
+                        &format!("token={token} reason=sim-would-revert err={err:?} logs={tail:?}"),
+                    );
+                    return;
+                }
+            }
+        } else if SIM_SAMPLE_EVERY > 0
             && self.sim_sample.fetch_add(1, Ordering::Relaxed) % SIM_SAMPLE_EVERY == 0
         {
+            // Gate off → keep a sampled diagnostic so we still see WHY bundles
+            // drop (auction loss vs revert). Spawned; never delays the send.
             let rpc_sim = self.rpc_client.clone();
             let tx_sim = tx.clone();
             let tok = token.clone();
-            let net = recheck.min_out.saturating_sub(amount_in);
             tokio::spawn(async move {
                 let res = tokio::task::spawn_blocking(move || {
                     use solana_client::rpc_config::RpcSimulateTransactionConfig;
@@ -1013,17 +1057,9 @@ impl ShredArbEngine {
                 .await;
                 if let Ok(Ok(resp)) = res {
                     let v = resp.value;
-                    let tail: Vec<String> = v
-                        .logs
-                        .as_ref()
-                        .map(|l| l.iter().rev().take(3).cloned().collect())
-                        .unwrap_or_default();
                     crate::errlog::log(
                         "sim",
-                        &format!(
-                            "token={tok} floor_net={net} sim_err={:?} units={:?} logs_tail={:?}",
-                            v.err, v.units_consumed, tail
-                        ),
+                        &format!("token={tok} sim_err={:?} units={:?}", v.err, v.units_consumed),
                     );
                 }
             });
@@ -1188,7 +1224,7 @@ impl ShredArbEngine {
                     "\n[shred-arb 30s] watching_pools={}\n\
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} bad_price={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
-                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}",
+                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={} sim_fail={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
                     self.profitable.load(Ordering::Relaxed),
@@ -1211,6 +1247,7 @@ impl ShredArbEngine {
                     self.nosend_too_locks.load(Ordering::Relaxed),
                     self.nosend_send_err.load(Ordering::Relaxed),
                     self.nosend_preempted.load(Ordering::Relaxed),
+                    self.nosend_sim_fail.load(Ordering::Relaxed),
                 );
             }
         });

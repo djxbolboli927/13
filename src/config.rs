@@ -228,6 +228,11 @@ pub struct ShredArbConfig {
     /// every profitable eval sends — bounded only by the RPC rate). Default 150.
     #[serde(default = "default_send_dedup_ms")]
     pub send_dedup_ms: u64,
+    /// Simulate every tx against live chain state right before sending and drop
+    /// it on any error (mainly 0x1771 slippage) — the pre-send negative-slippage
+    /// gate. Costs one RPC round-trip of latency per send. Default true.
+    #[serde(default = "default_true")]
+    pub simulate_before_send: bool,
     /// Seconds to wait after a direct send before polling the tx's on-chain fate.
     #[serde(default = "default_status_check_delay_secs")]
     pub status_check_delay_secs: u64,
@@ -377,6 +382,7 @@ impl Default for ShredArbConfig {
             pool_idle_close_secs: default_pool_idle_close_secs(),
             min_trigger_reserve_frac: 0.0,
             send_dedup_ms: default_send_dedup_ms(),
+            simulate_before_send: default_true(),
             status_check_delay_secs: default_status_check_delay_secs(),
             error_log_dir: default_error_log_dir(),
             target_wallets: Vec::new(),
