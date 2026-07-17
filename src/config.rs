@@ -274,9 +274,11 @@ pub struct ShredArbConfig {
     /// route, so 1 is enough; raise only if a tx still comes back too large).
     #[serde(default = "default_alt_max_per_pool")]
     pub alt_max_per_pool: usize,
-    /// Route-account coverage at which a competitor ALT is accepted as a pool's
-    /// table and registered with Metis (of the 6 pool+vault accounts). Default 4.
+    /// (Retained for config compatibility; the ALT selector now uses a per-tx
+    /// greedy set-cover over the global public-ALT library instead of a per-pool
+    /// coverage threshold.)
     #[serde(default = "default_alt_min_coverage")]
+    #[allow(dead_code)]
     pub alt_min_coverage: usize,
     /// Minimum Jito tip (lamports) added on top of the profit share. Default 1000.
     #[serde(default = "default_jito_tip_min")]

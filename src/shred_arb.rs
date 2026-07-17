@@ -39,6 +39,11 @@ use crate::transaction;
 /// Metis). Stops the endless No-routes spam; the reason is written to /root/g.
 const LOAD_RETRY_LIMIT: u32 = 10;
 
+/// Max public ALTs to attach per transaction. Competitors use ~2 on a 2-hop and
+/// 5-6 on a 4-hop; 3 is plenty of headroom for our Pump↔Meteora route while
+/// keeping the per-ALT (~34-byte) overhead in check.
+const MAX_ALTS_PER_TX: usize = 3;
+
 /// A raw price gap larger than this is never a real arb — it's a decode
 /// artifact or a one-sided dead pool. Real cross-pool gaps are a few percent.
 const MAX_PLAUSIBLE_GAP_PCT: f64 = 300.0;
@@ -732,16 +737,9 @@ impl ShredArbEngine {
             }
         };
 
-        // Record the REAL route-account set for this pool so the ALT registry
-        // scores harvested competitor tables against exactly what THIS tx must
-        // compress (shared program/config/mint accounts included), not just the
-        // pool/vault pubkeys. This is what makes a harvested ALT actually reduce
-        // our tx size instead of contributing zero used entries.
-        self.alt_registry
-            .record_route_accounts(pool, harvest_accounts(&swap_ixs));
-
         // Teach our self-learning ALT every account in this route so subsequent
         // txs for this pool compress fully. Cheap: only unseen pubkeys enqueue.
+        // (Off by default — the library selector below is the primary path.)
         if let Some(ab) = &self.alt_builder {
             ab.note(harvest_accounts(&swap_ixs));
         }
@@ -756,14 +754,16 @@ impl ShredArbEngine {
         let alt = self.alt_cache.clone();
         let rpc = self.rpc_client.clone();
         let cu = self.params.cu_limit;
-        // ALTs folded into the tx so route accounts compress from 32 static bytes
-        // to a 1-byte index. Priority: the single max-coverage ALT the registry
-        // harvested for this pool from competitor shreds; then (as fallback) a
-        // free provider ALT and any ALT recorded on the pool itself.
-        let mut extra_alts: Vec<solana_sdk::pubkey::Pubkey> = Vec::new();
-        if let Some(a) = self.alt_registry.best_for(&pool) {
-            extra_alts.push(a);
-        }
+        // Pick the best public ALTs to compress THIS tx. We look at the REAL
+        // account list Metis just returned and select (from the global library
+        // harvested off the network) the fewest tables covering the most of it —
+        // exactly how competitors reuse public ALTs. Compression happens here in
+        // our v0 build, independent of Metis. Fallback (empty library / cold
+        // start): a free provider ALT and any ALT recorded on the pool itself.
+        let route_set: std::collections::HashSet<solana_sdk::pubkey::Pubkey> =
+            harvest_accounts(&swap_ixs).into_iter().collect();
+        let mut extra_alts: Vec<solana_sdk::pubkey::Pubkey> =
+            self.alt_registry.select(&route_set, MAX_ALTS_PER_TX);
         if extra_alts.is_empty() {
             if let Some(f) = &self.alt_fetcher {
                 extra_alts = f.tables_for(&pool);

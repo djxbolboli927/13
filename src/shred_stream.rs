@@ -62,9 +62,13 @@ pub struct ShredConsumer {
     /// Pool pubkeys we care about (Pump.fun side of each arb pair). Mutable at
     /// runtime so newly-discovered pools can be added without a restart.
     target_pools: std::sync::RwLock<HashSet<Pubkey>>,
-    /// Preloaded, UNFILTERED address-lookup-table contents for our pools, so we
-    /// can resolve ALT-provided accounts without an RPC call on the hot path.
-    alt_map: std::sync::RwLock<HashMap<Pubkey, Vec<Pubkey>>>,
+    /// Global library of address-lookup-table contents harvested from every
+    /// Pump tx we see on the network (key → member pubkeys). Two uses: (1)
+    /// resolving ALT-hidden accounts on the hot path, and (2) as the pool of
+    /// PUBLIC pre-built tables the engine picks from to compress its own tx —
+    /// exactly what competitors do (they reuse public ALTs, they don't mint
+    /// their own). Shared (Arc) so the engine can read the same live library.
+    alt_map: Arc<std::sync::RwLock<HashMap<Pubkey, Vec<Pubkey>>>>,
     pumpfun: Pubkey,
     /// Optional sink for detected remove-liquidity (`withdraw`) events on a
     /// watched pool — the Pump pool pubkey is sent so the manager can close it.
@@ -96,7 +100,7 @@ impl ShredConsumer {
         Self {
             endpoint,
             target_pools: std::sync::RwLock::new(target_pools),
-            alt_map: std::sync::RwLock::new(alt_map),
+            alt_map: Arc::new(std::sync::RwLock::new(alt_map)),
             pumpfun: pumpfun_program(),
             remove_tx: std::sync::RwLock::new(None),
             rpc,
@@ -108,8 +112,15 @@ impl ShredConsumer {
 
     /// Register the AltRegistry sink that receives `(pump_pool, alt_keys)` for
     /// each competitor tx seen on a watched pool.
+    #[allow(dead_code)]
     pub fn set_alt_candidate_sender(&self, tx: mpsc::Sender<(Pubkey, Vec<Pubkey>)>) {
         *self.alt_candidate_tx.write().unwrap() = Some(tx);
+    }
+
+    /// Share the live global ALT library (key → member pubkeys). The engine reads
+    /// this to pick the best public tables to compress its own transactions.
+    pub fn alt_library(&self) -> Arc<std::sync::RwLock<HashMap<Pubkey, Vec<Pubkey>>>> {
+        self.alt_map.clone()
     }
 
     /// Background task: periodically fetch ALT account contents we don't yet

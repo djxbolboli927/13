@@ -522,16 +522,13 @@ fn spawn_shred_arb(
             }
         }
 
-        // Per-pool best-ALT registry, fed by competitor shreds: picks the single
-        // highest-coverage ALT for each pool and registers it with Metis. This is
-        // the primary tx-size fix (aggregators only have ALTs for old pools).
-        let (alt_registry, alt_cand_tx) = alt_registry::AltRegistry::spawn(
-            registry.clone(),
-            metis.clone(),
-            rpc_client.clone(),
-            sa.alt_min_coverage,
-        );
-        consumer.set_alt_candidate_sender(alt_cand_tx);
+        // ALT selector backed by the GLOBAL library of public tables harvested
+        // from the network (shred_stream.alt_map). For each tx we build, it picks
+        // the best 1-3 public tables covering that route's real accounts — the
+        // same thing competitors do (reuse public ALTs, never mint their own).
+        // Compression happens in OUR v0 build step, not in Metis, so this needs
+        // no Metis registration and updates live as the library grows.
+        let alt_registry = alt_registry::AltRegistry::new(consumer.alt_library());
 
         // Automatic pool manager: add-market to Metis, extend the gRPC/shred
         // subscriptions, and manage ATAs — all at runtime, no restart. It holds
