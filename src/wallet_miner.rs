@@ -152,7 +152,8 @@ impl WalletMiner {
                 DexKind::PumpFunAmm => {
                     pumps.insert(info.token_mint, info);
                 }
-                DexKind::MeteoraDammV2 => {
+                // Any enabled counter venue pairs with the pump pool.
+                _ => {
                     meteoras.insert(info.token_mint, info);
                 }
             }
@@ -172,7 +173,7 @@ impl WalletMiner {
             let pair = ArbPair {
                 token_mint: token,
                 pump,
-                meteora,
+                counter: meteora,
             };
             if let Err(e) = self.manager.add_pair(pair).await {
                 warn!(%token, error = %e, "wallet miner add_pair failed");

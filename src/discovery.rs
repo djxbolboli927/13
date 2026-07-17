@@ -177,6 +177,9 @@ pub(crate) fn decode_pool(pool: Pubkey, owner: &Pubkey, data: &[u8]) -> Option<P
             read_pk(data, MET_OFF_VAULT_A)?,
             read_pk(data, MET_OFF_VAULT_B)?,
         ),
+        // Constant-product venues are added via mix.json / wallet-miner, not this
+        // RPC-scan discoverer (their account layouts differ); skip here.
+        DexKind::MeteoraDynamicAmm | DexKind::RaydiumV4 | DexKind::RaydiumCpmm => None,
     }
 }
 
@@ -341,7 +344,7 @@ impl Discovery {
                 }
                 match info.kind {
                     DexKind::PumpFunAmm => pump = Some(info),
-                    DexKind::MeteoraDammV2 => meteora = Some(info),
+                    _ => meteora = Some(info),
                 }
             }
         }
@@ -391,7 +394,7 @@ impl Discovery {
             let pair = ArbPair {
                 token_mint: mint,
                 pump,
-                meteora,
+                counter: meteora,
             };
             self.manager.add_pair(pair).await?;
             return Ok(true);

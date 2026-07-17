@@ -26,7 +26,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::ata;
-use crate::dex_ids::{METEORA_DAMM_V2_PROGRAM, PUMPFUN_AMM_PROGRAM};
+use crate::dex_ids::PUMPFUN_AMM_PROGRAM;
 use crate::metis::MetisClient;
 use crate::pool_registry::{ArbPair, PoolInfo};
 use crate::pool_state::PoolStateCache;
@@ -94,7 +94,7 @@ impl PoolManager {
         };
         let met_liq = self
             .rpc
-            .get_account(&pair.meteora.pool)
+            .get_account(&pair.counter.pool)
             .ok()
             .and_then(|a| Self::read_u128(&a.data, 360))
             .unwrap_or(0);
@@ -181,17 +181,18 @@ impl PoolManager {
         info!(
             token = %pair.token_mint,
             pump = %pair.pump.pool,
-            meteora = %pair.meteora.pool,
+            meteora = %pair.counter.pool,
             "adding shared pool"
         );
 
-        // 1. Metis markets for both legs.
+        // 1. Metis markets for both legs (counter registered under its own venue).
         self.register_metis(&pair.pump, PUMPFUN_AMM_PROGRAM).await;
-        self.register_metis(&pair.meteora, METEORA_DAMM_V2_PROGRAM).await;
+        self.register_metis(&pair.counter, pair.counter.kind.program_str())
+            .await;
 
         // 2. Live pool-state subscription: Meteora pool + Pump vault pair.
         let accounts = [
-            pair.meteora.pool,
+            pair.counter.pool,
             pair.pump.token_vault(),
             pair.pump.wsol_vault(),
         ];
@@ -211,7 +212,7 @@ impl PoolManager {
         if let Some(f) = &self.alt_fetcher {
             tokio::spawn(f.clone().fetch_for_pool(
                 pair.pump.pool,
-                pair.meteora.pool,
+                pair.counter.pool,
                 pair.token_mint,
             ));
         }
@@ -245,7 +246,7 @@ impl PoolManager {
                     let pair = entry.value();
 
                     // Idle timeout: no Meteora update for the whole window.
-                    if let Some(age) = self.pool_state.last_update_age(&pair.meteora.pool) {
+                    if let Some(age) = self.pool_state.last_update_age(&pair.counter.pool) {
                         if age >= idle_timeout {
                             dead.push(pair.pump.pool);
                             continue;
@@ -280,7 +281,7 @@ impl PoolManager {
         matches!(self.pool_state.spl_amount(&pair.pump.token_vault()), Some(0))
             || matches!(self.pool_state.spl_amount(&pair.pump.wsol_vault()), Some(0))
             || matches!(
-                self.pool_state.meteora_raw_liquidity(&pair.meteora.pool),
+                self.pool_state.meteora_raw_liquidity(&pair.counter.pool),
                 Some(0)
             )
     }

@@ -26,8 +26,64 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeRequestFilterAccounts, SubscribeRequestPing,
 };
 
+use crate::dex_ids::DexKind;
 use crate::meteora_math::{MeteoraPool, MAX_SQRT_PRICE, MIN_SQRT_PRICE};
+use crate::pool_registry::PoolInfo;
 use crate::pumpfun_math::PumpPool;
+
+/// The pricing model for the NON-Pump leg of an arb. Meteora DAMM v2 is
+/// concentrated liquidity (`MeteoraPool`); every other supported venue
+/// (Meteora Dynamic AMM, Raydium V4, Raydium CPMM) is a plain constant-product
+/// AMM priced from its two vault balances (`PumpPool` math with a per-DEX fee).
+/// A unified interface lets `assess` treat any counter venue the same way.
+#[derive(Clone, Copy)]
+pub enum CounterPool {
+    Concentrated(MeteoraPool),
+    ConstProduct(PumpPool),
+}
+
+impl CounterPool {
+    /// Raw WSOL-per-token price (quote-raw / base-raw), for direction + gap.
+    pub fn token_price_in_sol(&self, token_is_a: bool) -> f64 {
+        match self {
+            CounterPool::Concentrated(m) => m.token_price_in_sol(token_is_a, 0, 0),
+            CounterPool::ConstProduct(p) => {
+                if p.base_reserve == 0 {
+                    0.0
+                } else {
+                    p.quote_reserve as f64 / p.base_reserve as f64
+                }
+            }
+        }
+    }
+
+    /// Spend `wsol_in` lamports, receive token base. `None` if not tradeable.
+    pub fn buy_token_with_wsol(&self, wsol_in: u64, token_is_a: bool) -> Option<u64> {
+        match self {
+            CounterPool::Concentrated(m) => m.buy_token_with_wsol(wsol_in, token_is_a),
+            CounterPool::ConstProduct(p) => {
+                let out = p.quote_buy(wsol_in);
+                (out > 0).then_some(out)
+            }
+        }
+    }
+
+    /// Spend `token_in` base, receive WSOL lamports. `None` if not tradeable.
+    pub fn sell_token_for_wsol(&self, token_in: u64, token_is_a: bool) -> Option<u64> {
+        match self {
+            CounterPool::Concentrated(m) => m.sell_token_for_wsol(token_in, token_is_a),
+            CounterPool::ConstProduct(p) => Some(p.quote_sell(token_in)),
+        }
+    }
+
+    /// Current WSOL-side reserve (lamports), for the trade-size ceiling.
+    pub fn wsol_reserve(&self, token_is_a: bool) -> u64 {
+        match self {
+            CounterPool::Concentrated(m) => m.wsol_reserve(token_is_a),
+            CounterPool::ConstProduct(p) => p.quote_reserve,
+        }
+    }
+}
 
 // Meteora DAMM v2 Pool account field offsets (bytes, discriminator included).
 // Validated against a live pool whose account is 1112 bytes (INIT_SPACE 1104 +
@@ -205,6 +261,37 @@ impl PoolStateCache {
         let base = self.spl_amount(token_vault)?;
         let quote = self.spl_amount(wsol_vault)?;
         Some(PumpPool::new(base, quote))
+    }
+
+    /// Decode the NON-Pump leg of an arb into a unified `CounterPool`, branching
+    /// on the venue. Meteora DAMM v2 uses its concentrated-liquidity account;
+    /// every other supported venue is a constant-product AMM priced from its two
+    /// vault balances with `cp_fee_bps` (the exact quote still comes from Metis —
+    /// this is only the fast pre-check). `None` if not tradeable / not cached.
+    pub fn counter_pool(
+        &self,
+        info: &PoolInfo,
+        fallback_fee_numerator: u64,
+        cp_fee_bps: u64,
+    ) -> Option<CounterPool> {
+        match info.kind {
+            DexKind::MeteoraDammV2 => self
+                .meteora_pool(&info.pool, fallback_fee_numerator)
+                .map(CounterPool::Concentrated),
+            DexKind::PumpFunAmm => None, // Pump is never the counter leg.
+            // Constant-product venues: reserves = the two vault SPL balances.
+            DexKind::MeteoraDynamicAmm | DexKind::RaydiumV4 | DexKind::RaydiumCpmm => {
+                let base = self.spl_amount(&info.token_vault())?;
+                let quote = self.spl_amount(&info.wsol_vault())?;
+                if base == 0 || quote == 0 {
+                    return None;
+                }
+                let mut p = PumpPool::new(base, quote);
+                p.total_fee_bps = cp_fee_bps;
+                p.lp_fee_bps = cp_fee_bps;
+                Some(CounterPool::ConstProduct(p))
+            }
+        }
     }
 
     /// Spawn the subscription task with reconnect/backoff. `accounts` seeds the

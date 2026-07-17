@@ -97,6 +97,23 @@ pub struct ShredArbConfig {
     /// Effective Meteora fee in bps (dynamic fee not yet modelled — verify).
     #[serde(default = "default_meteora_fee_bps")]
     pub meteora_fee_bps: u64,
+    /// Effective fee (bps) used in the fast pre-check for constant-product
+    /// counter venues (Meteora Dynamic AMM / Raydium V4 / Raydium CPMM). The
+    /// exact quote still comes from Metis; this only sizes the pre-check.
+    #[serde(default = "default_cp_fee_bps")]
+    pub cp_fee_bps: u64,
+    // ── Counter-venue on/off toggles ─────────────────────────────────────────
+    // Pump.fun is always the trigger venue. Each flag enables pairing the Pump
+    // pool with that counter venue. Defaults preserve today's behaviour: only
+    // Meteora DAMM v2 on.
+    #[serde(default = "default_true")]
+    pub dex_meteora_damm_v2: bool,
+    #[serde(default)]
+    pub dex_meteora_dynamic_amm: bool,
+    #[serde(default)]
+    pub dex_raydium_v4: bool,
+    #[serde(default)]
+    pub dex_raydium_cpmm: bool,
     /// Ignore observed Pump trades whose SOL-side arg is below this (SOL).
     #[serde(default = "default_min_trigger_sol")]
     pub min_trigger_sol: f64,
@@ -357,6 +374,11 @@ impl Default for ShredArbConfig {
             tip_lamports: default_tip(),
             network_fee_lamports: default_net_fee(),
             meteora_fee_bps: default_meteora_fee_bps(),
+            cp_fee_bps: default_cp_fee_bps(),
+            dex_meteora_damm_v2: true,
+            dex_meteora_dynamic_amm: false,
+            dex_raydium_v4: false,
+            dex_raydium_cpmm: false,
             min_trigger_sol: default_min_trigger_sol(),
             min_amount_sol: default_min_amount_sol(),
             max_amount_sol: default_max_amount_sol(),
@@ -502,6 +524,9 @@ fn default_shred_keypair() -> String {
 }
 fn default_tip() -> u64 {
     1600
+}
+fn default_cp_fee_bps() -> u64 {
+    25
 }
 fn default_shred_cu_limit() -> u32 {
     300_000

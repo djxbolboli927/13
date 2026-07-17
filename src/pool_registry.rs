@@ -54,12 +54,14 @@ impl PoolInfo {
     }
 }
 
-/// A tradeable pair: the same token on both venues.
+/// A tradeable pair: the same token on the Pump.fun pool (`pump`) and one
+/// counter venue (`counter`) — historically Meteora DAMM v2, now any enabled
+/// venue (Meteora DAMM v2 / Meteora Dynamic AMM / Raydium V4 / Raydium CPMM).
 #[derive(Debug, Clone)]
 pub struct ArbPair {
     pub token_mint: Pubkey,
     pub pump: PoolInfo,
-    pub meteora: PoolInfo,
+    pub counter: PoolInfo,
 }
 
 fn parse_pk(v: Option<&Value>) -> Option<Pubkey> {
@@ -151,8 +153,16 @@ pub fn load_all_token_mints(path: &str) -> Result<Vec<Pubkey>> {
     Ok(mints)
 }
 
-/// Load `mix.json` and return the paired Pump.fun / Meteora pools.
-pub fn load_pairs(path: &str) -> Result<Vec<ArbPair>> {
+/// Load `mix.json` and return the paired Pump.fun / counter-venue pools. A pump
+/// pool is paired with a counter pool sharing the same token, where the counter
+/// venue's `DexKind` is in `enabled_counters`. If several counter pools exist
+/// for a token, the one from the highest-priority enabled venue wins (Meteora
+/// DAMM v2 first, then the order they appear) — multi-pool-per-token is a
+/// separate phase.
+pub fn load_pairs(
+    path: &str,
+    enabled_counters: &std::collections::HashSet<DexKind>,
+) -> Result<Vec<ArbPair>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read mix cache file {path}"))?;
     let root: Value =
@@ -162,15 +172,19 @@ pub fn load_pairs(path: &str) -> Result<Vec<ArbPair>> {
     collect_entries(&root, &mut raw);
 
     let mut pumps: HashMap<Pubkey, PoolInfo> = HashMap::new();
-    let mut meteoras: HashMap<Pubkey, PoolInfo> = HashMap::new();
+    // token → best counter pool found so far.
+    let mut counters: HashMap<Pubkey, PoolInfo> = HashMap::new();
     for e in raw {
         if let Some(p) = entry_to_pool(e) {
-            match p.kind {
-                DexKind::PumpFunAmm => {
-                    pumps.insert(p.token_mint, p);
-                }
-                DexKind::MeteoraDammV2 => {
-                    meteoras.insert(p.token_mint, p);
+            if p.kind == DexKind::PumpFunAmm {
+                pumps.insert(p.token_mint, p);
+            } else if enabled_counters.contains(&p.kind) {
+                // Prefer Meteora DAMM v2 if multiple venues are present.
+                match counters.get(&p.token_mint) {
+                    Some(existing) if existing.kind == DexKind::MeteoraDammV2 => {}
+                    _ => {
+                        counters.insert(p.token_mint, p);
+                    }
                 }
             }
         }
@@ -178,23 +192,23 @@ pub fn load_pairs(path: &str) -> Result<Vec<ArbPair>> {
 
     let mut pairs = Vec::new();
     for (token, pump) in &pumps {
-        if let Some(meteora) = meteoras.get(token) {
+        if let Some(counter) = counters.get(token) {
             pairs.push(ArbPair {
                 token_mint: *token,
                 pump: pump.clone(),
-                meteora: meteora.clone(),
+                counter: counter.clone(),
             });
         }
     }
 
     info!(
         pump_pools = pumps.len(),
-        meteora_pools = meteoras.len(),
+        counter_pools = counters.len(),
         pairs = pairs.len(),
         "mix.json pool registry loaded"
     );
     if pairs.is_empty() {
-        warn!("no Pump.fun/Meteora token pairs found in mix.json — strategy will idle");
+        warn!("no Pump.fun/counter token pairs found in mix.json — strategy will idle");
     }
     Ok(pairs)
 }

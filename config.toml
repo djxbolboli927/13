@@ -155,6 +155,20 @@ tip_lamports = 1600
 network_fee_lamports = 5000
 # کارمزد مؤثر متورا (bps). کارمزد داینامیک هنوز مدل نشده — با کوت زنده راستی‌آزمایی شود.
 meteora_fee_bps = 25
+# کارمزد مؤثر (bps) برای پیش‌چکِ صرافی‌های constant-product (Meteora Dynamic AMM /
+# Raydium V4 / Raydium CPMM). کوت دقیق همچنان از متیس می‌آید؛ این فقط برای تخمین
+# سریعِ اندازهٔ تراکنش است.
+cp_fee_bps = 25
+
+# ─── روشن/خاموش کردن صرافی‌ها (لگ مقابلِ پامپ‌فان) ───
+# پامپ‌فان همیشه صرافیِ «ماشه» است. هر گزینه، جفت‌کردن استخر پامپ با آن صرافی را
+# فعال می‌کند. پیش‌فرض‌ها رفتار فعلی را حفظ می‌کنند: فقط Meteora DAMM v2 روشن.
+# برای فعال‌کردن یک صرافی جدید، مقدارش را true کنید و مطمئن شوید استخرهای آن در
+# mix.json/Metis موجودند.
+dex_meteora_damm_v2 = true       # Meteora DAMM v2 (نقدینگی متمرکز)
+dex_meteora_dynamic_amm = false  # Meteora pool (Dynamic AMM) — constant product
+dex_raydium_v4 = false           # Raydium Liquidity Pool V4 — constant product
+dex_raydium_cpmm = false         # Raydium CPMM — constant product
 # نادیده‌گرفتن تریدهای کوچک پامپ (سمت SOL کمتر از این مقدار). قبلاً 1.0 SOL بود که
 # تقریباً همه‌ی تریدها را رد می‌کرد و ربات هیچ سیگنالی نمی‌دید. 0.05 = سیگنال‌های
 # خیلی بیشتر (هر تریدِ ≥ ۰.۰۵ SOL بررسی می‌شود). برای شل‌تر شدن کمترش کنید.

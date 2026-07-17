@@ -26,7 +26,7 @@ use crate::dex_ids::DexKind;
 use crate::jito::JitoClient;
 use crate::jito_grpc::JitoGrpcClient;
 use crate::metis::MetisClient;
-use crate::pool_registry::ArbPair;
+use crate::pool_registry::{ArbPair, PoolInfo};
 use crate::pool_state::PoolStateCache;
 use crate::pumpfun_math::PumpPool;
 use crate::rate_limiter::RateLimiter;
@@ -69,6 +69,8 @@ pub struct ArbParams {
     /// Fraction of detected net profit paid to Jito as tip (0.20 = 20%).
     pub jito_tip_profit_fraction: f64,
     pub meteora_fee_bps: u64,
+    /// Fee (bps) used in the fast pre-check for constant-product counter venues.
+    pub cp_fee_bps: u64,
     /// Ignore observed trades whose SOL-side arg is below this (small trades
     /// barely move price).
     pub min_trigger_lamports: u64,
@@ -222,7 +224,7 @@ pub struct ShredArbEngine {
 #[derive(Clone, Copy, PartialEq)]
 enum BuyOn {
     Pump,
-    Meteora,
+    Counter,
 }
 
 /// Everything needed to re-check, at the very last moment before sending,
@@ -235,8 +237,9 @@ struct Recheck {
     buy_on_pump: bool,
     token_is_a: bool,
     pump_after: PumpPool,
-    met_pool: solana_sdk::pubkey::Pubkey,
+    counter_info: PoolInfo,
     fallback_fee: u64,
+    cp_fee_bps: u64,
     amount_in: u64,
     /// Minimum WSOL out we need (input + network fee + tip).
     min_out: u64,
@@ -366,7 +369,7 @@ impl ShredArbEngine {
                 for (pool, pair) in pairs {
                     // Freshness: did any relevant account update recently?
                     let recent = [
-                        pair.meteora.pool,
+                        pair.counter.pool,
                         pair.pump.token_vault(),
                         pair.pump.wsol_vault(),
                     ]
@@ -456,17 +459,18 @@ impl ShredArbEngine {
         }
         self.evaluated.fetch_add(1, Ordering::Relaxed);
 
-        // 2) Meteora state.
+        // 2) Counter-venue state (Meteora DAMM v2 / Dynamic AMM / Raydium V4/CPMM).
         // config fallback fee is in bps; convert to the 1e9-denominated numerator.
         let fallback_fee_numerator = self.params.meteora_fee_bps.saturating_mul(100_000);
-        let meteora = match self
-            .pool_state
-            .meteora_pool(&pair.meteora.pool, fallback_fee_numerator)
-        {
+        let counter = match self.pool_state.counter_pool(
+            &pair.counter,
+            fallback_fee_numerator,
+            self.params.cp_fee_bps,
+        ) {
             Some(m) => m,
             None => {
                 self.skip_no_meteora_state.fetch_add(1, Ordering::Relaxed);
-                debug!(pool = %pair.meteora.pool, "meteora state not cached yet");
+                debug!(pool = %pair.counter.pool, "counter state not cached yet");
                 return;
             }
         };
@@ -478,7 +482,7 @@ impl ShredArbEngine {
         } else {
             pump_after.quote_reserve as f64 / pump_after.base_reserve as f64
         };
-        let met_price = meteora.token_price_in_sol(pair.meteora.token_is_a, 0, 0);
+        let met_price = counter.token_price_in_sol(pair.counter.token_is_a);
         if met_price <= 0.0 {
             self.skip_bad_price.fetch_add(1, Ordering::Relaxed);
             return;
@@ -486,11 +490,11 @@ impl ShredArbEngine {
         let buy_on = if pump_price < met_price {
             BuyOn::Pump // token cheaper on pump
         } else {
-            BuyOn::Meteora
+            BuyOn::Counter
         };
 
         // 4) Optimal size.
-        let token_is_a = pair.meteora.token_is_a;
+        let token_is_a = pair.counter.token_is_a;
         let eval = |x: u64| -> Option<u64> {
             match buy_on {
                 BuyOn::Pump => {
@@ -498,10 +502,10 @@ impl ShredArbEngine {
                     if base_out == 0 {
                         return None;
                     }
-                    meteora.sell_token_for_wsol(base_out, token_is_a)
+                    counter.sell_token_for_wsol(base_out, token_is_a)
                 }
-                BuyOn::Meteora => {
-                    let base_out = meteora.buy_token_with_wsol(x, token_is_a)?;
+                BuyOn::Counter => {
+                    let base_out = counter.buy_token_with_wsol(x, token_is_a)?;
                     if base_out == 0 {
                         return None;
                     }
@@ -526,7 +530,7 @@ impl ShredArbEngine {
         // the real "optimal volume".
         let buy_wsol_reserve = match buy_on {
             BuyOn::Pump => pump_after.quote_reserve,
-            BuyOn::Meteora => meteora.wsol_reserve(token_is_a),
+            BuyOn::Counter => counter.wsol_reserve(token_is_a),
         };
         // Dead-pool guards — skip empty/broken pools early (they were flooding
         // the logs and wasting cycles): the BUY side must hold real WSOL depth,
@@ -568,7 +572,7 @@ impl ShredArbEngine {
                 gap_pct,
                 pump_after_price = pump_price,
                 met_price,
-                met_wsol_depth = meteora.wsol_reserve(token_is_a),
+                met_wsol_depth = counter.wsol_reserve(token_is_a),
                 buy_wsol_reserve,
                 hi,
                 opt_x,
@@ -621,8 +625,8 @@ impl ShredArbEngine {
         self.profitable.fetch_add(1, Ordering::Relaxed);
 
         let (buy_kind, sell_kind) = match buy_on {
-            BuyOn::Pump => (DexKind::PumpFunAmm, DexKind::MeteoraDammV2),
-            BuyOn::Meteora => (DexKind::MeteoraDammV2, DexKind::PumpFunAmm),
+            BuyOn::Pump => (pair.pump.kind, pair.counter.kind),
+            BuyOn::Counter => (pair.counter.kind, pair.pump.kind),
         };
         info!(
             pool = %pool,
@@ -646,8 +650,9 @@ impl ShredArbEngine {
             buy_on_pump: buy_on == BuyOn::Pump,
             token_is_a,
             pump_after,
-            met_pool: pair.meteora.pool,
+            counter_info: pair.counter.clone(),
             fallback_fee: fallback_fee_numerator,
+            cp_fee_bps: self.params.cp_fee_bps,
             amount_in: best_x,
             min_out: onchain_floor,
         };
@@ -785,7 +790,7 @@ impl ShredArbEngine {
             if let Some(f) = &self.alt_fetcher {
                 extra_alts = f.tables_for(&pool);
             }
-            for a in [pair.pump.alt, pair.meteora.alt].into_iter().flatten() {
+            for a in [pair.pump.alt, pair.counter.alt].into_iter().flatten() {
                 if !extra_alts.contains(&a) {
                     extra_alts.push(a);
                 }
@@ -859,7 +864,7 @@ impl ShredArbEngine {
                     &format!(
                         "token={token} reason=tx-too-large bytes={raw} locks={locks} \
                          alts_used={alts_used} pump_alt={:?} met_alt={:?}",
-                        pair.pump.alt, pair.meteora.alt
+                        pair.pump.alt, pair.counter.alt
                     ),
                 );
                 return;
@@ -1109,7 +1114,11 @@ impl ShredArbEngine {
     /// Meteora reading we do NOT block (return true) — better to try than to
     /// stall on a cache gap.
     fn still_profitable(&self, r: &Recheck) -> bool {
-        let met = match self.pool_state.meteora_pool(&r.met_pool, r.fallback_fee) {
+        let met = match self.pool_state.counter_pool(
+            &r.counter_info,
+            r.fallback_fee,
+            r.cp_fee_bps,
+        ) {
             Some(m) => m,
             None => return true,
         };
@@ -1128,11 +1137,14 @@ impl ShredArbEngine {
         matches!(out, Some(o) if o >= r.min_out)
     }
 
-    /// The configurable Metis `dexes=` label for a venue.
+    /// The configurable Metis `dexes=` label for a venue. Pump and the classic
+    /// Meteora DAMM v2 come from config (so they can be tuned); the newer venues
+    /// use their built-in `dex_ids` label.
     fn label_for(&self, kind: DexKind) -> &str {
         match kind {
             DexKind::PumpFunAmm => &self.params.pump_label,
             DexKind::MeteoraDammV2 => &self.params.meteora_label,
+            other => other.metis_label(),
         }
     }
 
@@ -1164,8 +1176,8 @@ impl ShredArbEngine {
                 "error",
                 &format!(
                     "token={} pool={} reason=disabled-after-{}-load-failures leg={leg} venue={venue} \
-                     pump_pool={} meteora_pool={} last_err={err}",
-                    pair.token_mint, pool, n, pair.pump.pool, pair.meteora.pool
+                     pump_pool={} counter_pool={} last_err={err}",
+                    pair.token_mint, pool, n, pair.pump.pool, pair.counter.pool
                 ),
             );
         } else {
@@ -1184,10 +1196,13 @@ impl ShredArbEngine {
     /// restarted. Cheap and idempotent; the route-failure counter still drops
     /// the pool if it keeps failing.
     async fn readd_market(&self, pair: &ArbPair, kind: DexKind) {
-        let (info, owner) = match kind {
-            DexKind::PumpFunAmm => (&pair.pump, crate::dex_ids::PUMPFUN_AMM_PROGRAM),
-            DexKind::MeteoraDammV2 => (&pair.meteora, crate::dex_ids::METEORA_DAMM_V2_PROGRAM),
+        // `kind` is either the pump leg or the counter leg of this pair.
+        let info = if kind == pair.pump.kind {
+            &pair.pump
+        } else {
+            &pair.counter
         };
+        let owner = info.kind.program_str();
         let alt = info.alt.map(|a| a.to_string());
         if let Err(e) = self
             .metis
@@ -1347,6 +1362,7 @@ fn buy_kind_label(k: DexKind) -> &'static str {
     match k {
         DexKind::PumpFunAmm => "PumpFun",
         DexKind::MeteoraDammV2 => "Meteora",
+        other => other.short(),
     }
 }
 
