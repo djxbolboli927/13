@@ -106,6 +106,10 @@ pub struct ShredArbConfig {
     // Pump.fun is always the trigger venue. Each flag enables pairing the Pump
     // pool with that counter venue. Defaults preserve today's behaviour: only
     // Meteora DAMM v2 on.
+    /// Pump pools (or their tokens) to NEVER trade — pasted pubkeys. Checked at
+    /// startup; matching pools are disabled so no tx is ever built for them.
+    #[serde(default)]
+    pub blacklist_pools: Vec<String>,
     #[serde(default = "default_true")]
     pub dex_meteora_damm_v2: bool,
     #[serde(default)]
@@ -375,6 +379,7 @@ impl Default for ShredArbConfig {
             network_fee_lamports: default_net_fee(),
             meteora_fee_bps: default_meteora_fee_bps(),
             cp_fee_bps: default_cp_fee_bps(),
+            blacklist_pools: Vec::new(),
             dex_meteora_damm_v2: true,
             dex_meteora_dynamic_amm: false,
             dex_raydium_v4: false,

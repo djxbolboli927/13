@@ -165,6 +165,10 @@ cp_fee_bps = 25
 # فعال می‌کند. پیش‌فرض‌ها رفتار فعلی را حفظ می‌کنند: فقط Meteora DAMM v2 روشن.
 # برای فعال‌کردن یک صرافی جدید، مقدارش را true کنید و مطمئن شوید استخرهای آن در
 # mix.json/Metis موجودند.
+# استخرهایی که هیچ‌وقت روی آن‌ها ترید نشود (pubkey استخر پامپ).
+blacklist_pools = [
+  "7hPS3ViQKLKQmia2PGtMd9iwHY1HTb1TCrz2NLLbnuYy",
+]
 dex_meteora_damm_v2 = true       # Meteora DAMM v2 (نقدینگی متمرکز)
 dex_meteora_dynamic_amm = false  # Meteora pool (Dynamic AMM) — constant product
 dex_raydium_v4 = false           # Raydium Liquidity Pool V4 — constant product

@@ -86,18 +86,34 @@ impl CounterPool {
 }
 
 // Meteora DAMM v2 Pool account field offsets (bytes, discriminator included).
-// Validated against a live pool whose account is 1112 bytes (INIT_SPACE 1104 +
-// 8 discriminator), which matches this layout. The fee sub-struct size is the
-// fragile part if the deployed layout ever drifts.
+// Validated byte-for-byte against the cp-amm source (PoolFeesStruct = 160B:
+// BaseFeeStruct 40B + 3 fee-percent bytes + 5 pad + DynamicFeeStruct 96B +
+// 16B padding) and against a live 1112-byte pool account (INIT_SPACE 1104 + 8
+// discriminator). The decoded state reproduces on-chain reserves exactly.
 //
 // `pool_fees` is the first field (offset 8); its first member is
 // `base_fee.cliff_fee_numerator: u64`, i.e. the flat swap fee numerator
 // (denominator 1e9).
 const MET_OFF_CLIFF_FEE: usize = 8;
+// DynamicFeeStruct begins at 8 (disc) + 40 (BaseFeeStruct) + 8 (fee percents +
+// padding) = 56:
+//   initialized u8 @56, pad[7], max_volatility_accumulator u32 @64,
+//   variable_fee_control u32 @68, bin_step u16 @72, filter/decay/reduction u16
+//   @74/76/78, last_update_timestamp u64 @80, bin_step_u128 @88,
+//   sqrt_price_reference @104, volatility_accumulator u128 @120,
+//   volatility_reference @136.
+const MET_OFF_DYNFEE_INITIALIZED: usize = 56;
+const MET_OFF_DYNFEE_VAR_CONTROL: usize = 68;
+const MET_OFF_DYNFEE_BIN_STEP: usize = 72;
+const MET_OFF_DYNFEE_VOL_ACC: usize = 120;
 const MET_OFF_LIQUIDITY: usize = 360;
 const MET_OFF_SQRT_MIN: usize = 424;
 const MET_OFF_SQRT_MAX: usize = 440;
 const MET_OFF_SQRT_PRICE: usize = 456;
+
+/// Max plausible TOTAL swap fee we are willing to trade against (50%, in 1e9
+/// units). A pool whose current fee reads above this is skipped outright.
+const MAX_TRADEABLE_FEE_NUMERATOR: u64 = 500_000_000;
 
 // SPL token account: amount is a u64 LE at offset 64.
 const SPL_AMOUNT_OFFSET: usize = 64;
@@ -125,6 +141,20 @@ fn read_u128_le(data: &[u8], off: usize) -> Option<u128> {
 fn read_u64_le(data: &[u8], off: usize) -> Option<u64> {
     data.get(off..off + 8)
         .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+}
+
+fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
+    data.get(off..off + 4)
+        .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+}
+
+fn read_u16_le(data: &[u8], off: usize) -> Option<u16> {
+    data.get(off..off + 2)
+        .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+}
+
+fn read_u8(data: &[u8], off: usize) -> Option<u8> {
+    data.get(off).copied()
 }
 
 impl PoolStateCache {
@@ -203,23 +233,60 @@ impl PoolStateCache {
         self.last_update.get(account).map(|t| t.elapsed())
     }
 
-    /// Decode a Meteora pool account into its pricing slice. The fee is read
-    /// straight from the pool's `cliff_fee_numerator`; `fallback_fee_numerator`
-    /// (from config) is used only if that read looks implausible.
+    /// Decode a Meteora pool account into its pricing slice.
+    ///
+    /// FEE: the effective swap fee is the base `cliff_fee_numerator` PLUS the
+    /// DYNAMIC (volatility) fee — DAMM v2 adds the variable fee on top on-chain,
+    /// and omitting it made us over-estimate the output of volatile pools (the
+    /// ~2% that turned a modelled edge into a 0x1771 slippage revert). We now
+    /// decode the DynamicFeeStruct and add it. If the base fee reads implausibly
+    /// (0 or > 50%, e.g. a high anti-sniper scheduled fee), we SKIP the pool
+    /// rather than silently substituting a cheap 0.25% — trading it on a wrong
+    /// fee guarantees a revert. `fallback_fee_numerator` is unused now (kept for
+    /// signature stability).
     ///
     /// Returns `None` if the decoded state is not tradeable — a drained pool
-    /// (`liquidity == 0`), a sqrt-price outside the on-chain valid range, or a
-    /// mangled/partial read — so the engine never sizes a trade off garbage.
-    pub fn meteora_pool(&self, pool: &Pubkey, fallback_fee_numerator: u64) -> Option<MeteoraPool> {
+    /// (`liquidity == 0`), a sqrt-price outside the on-chain valid range, an
+    /// implausible fee, or a mangled/partial read.
+    pub fn meteora_pool(&self, pool: &Pubkey, _fallback_fee_numerator: u64) -> Option<MeteoraPool> {
         let entry = self.inner.get(pool)?;
         let data = entry.value();
         let cliff = read_u64_le(data, MET_OFF_CLIFF_FEE).unwrap_or(0);
-        // Plausible static fee: (0, 50%]. Otherwise fall back to config.
-        let fee_numerator = if cliff > 0 && (cliff as u128) <= 500_000_000 {
-            cliff
+        // Base fee must be plausible (0, 50%]; otherwise skip (don't fake it).
+        if cliff == 0 || (cliff as u128) > MAX_TRADEABLE_FEE_NUMERATOR as u128 {
+            return None;
+        }
+        // Dynamic (volatility) fee, per cp-amm: with variable_fee_control > 0,
+        //   square_vfa_bin = (volatility_accumulator · bin_step)^2
+        //   v_fee          = square_vfa_bin · variable_fee_control
+        //   scaled_v_fee   = (v_fee + 99_999_999_999) / 100_000_000_000
+        // Total fee numerator = cliff + scaled_v_fee (denominator 1e9).
+        let var_control = read_u32_le(data, MET_OFF_DYNFEE_VAR_CONTROL).unwrap_or(0) as u128;
+        let variable_fee = if read_u8(data, MET_OFF_DYNFEE_INITIALIZED).unwrap_or(0) != 0
+            && var_control > 0
+        {
+            let bin_step = read_u16_le(data, MET_OFF_DYNFEE_BIN_STEP).unwrap_or(0) as u128;
+            let vol_acc = read_u128_le(data, MET_OFF_DYNFEE_VOL_ACC).unwrap_or(0);
+            let scaled = vol_acc
+                .checked_mul(bin_step)
+                .and_then(|v| v.checked_pow(2))
+                .and_then(|sq| sq.checked_mul(var_control))
+                .map(|v_fee| (v_fee + 99_999_999_999) / 100_000_000_000);
+            match scaled {
+                Some(s) => s,
+                // Overflow ⇒ the dynamic fee is enormous ⇒ untradeable, skip.
+                None => return None,
+            }
         } else {
-            fallback_fee_numerator
+            0
         };
+        let total_fee = cliff as u128 + variable_fee;
+        // A total fee above our cap means the pool is currently too expensive to
+        // arb (usually a fresh high-volatility/anti-sniper window) — skip it.
+        if total_fee > MAX_TRADEABLE_FEE_NUMERATOR as u128 {
+            return None;
+        }
+        let fee_numerator = total_fee as u64;
         let p = MeteoraPool {
             liquidity: read_u128_le(data, MET_OFF_LIQUIDITY)?,
             sqrt_min_price: read_u128_le(data, MET_OFF_SQRT_MIN)?,

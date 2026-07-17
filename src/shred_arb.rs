@@ -1180,6 +1180,12 @@ impl ShredArbEngine {
         }
     }
 
+    /// Permanently skip a pool (blacklist). Reuses the `disabled` set that
+    /// `assess` already short-circuits on, so no tx is ever built for it.
+    pub fn blacklist_pool(&self, pool: solana_sdk::pubkey::Pubkey) {
+        self.disabled.insert(pool);
+    }
+
     /// Final gate: using the LATEST cached Meteora state, would the trade still
     /// clear `min_out`? Returns false if a competitor moved the pool against us
     /// during the compute window (the tx would revert). If we have no fresh

@@ -742,6 +742,13 @@ fn spawn_shred_arb(
             alt_fetcher,
             alt_registry,
         ));
+        // Blacklist: never trade these pools (parsed from config).
+        for s in &sa.blacklist_pools {
+            if let Ok(pk) = s.trim().parse::<solana_sdk::pubkey::Pubkey>() {
+                engine.blacklist_pool(pk);
+                eprintln!("[shred-arb] blacklisted pool {pk}");
+            }
+        }
         engine.clone().spawn_reporter();
         // Second opportunity source: re-assess all pairs from current state
         // every 200ms, not only when a Pump shred fires.
