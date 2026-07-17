@@ -655,6 +655,17 @@ impl ShredArbEngine {
             BuyOn::Pump => (pair.pump.kind, pair.counter.kind),
             BuyOn::Counter => (pair.counter.kind, pair.pump.kind),
         };
+        // Diagnostic fields so we can PROVE (with data, not guesses) why a trade
+        // is detected as profitable: the raw prices + gap we computed, the depth
+        // of the counter (shallow) pool we'd trade against, and how stale that
+        // counter state is. If gap_pct is smaller than the fees yet net>0, or the
+        // counter state is old, the numbers show exactly where the model is off.
+        let counter_wsol = counter.wsol_reserve(token_is_a);
+        let counter_age_ms = self
+            .pool_state
+            .last_update_age(&pair.counter.pool)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(u64::MAX);
         info!(
             pool = %pool,
             token = %pair.token_mint,
@@ -662,6 +673,11 @@ impl ShredArbEngine {
             input = best_x,
             predicted_out = best_out,
             net_lamports = net,
+            gap_pct = format!("{:.4}", gap_pct),
+            pump_price = format!("{:.9}", pump_price),
+            counter_price = format!("{:.9}", met_price),
+            counter_wsol_reserve = counter_wsol,
+            counter_age_ms,
             "shred-arb opportunity"
         );
 
