@@ -215,6 +215,10 @@ pub struct ShredArbEngine {
     /// Dropped by the pre-send simulation gate (would revert on live state,
     /// mainly 0x1771 slippage).
     nosend_sim_fail: AtomicU64,
+    /// Metis routed a leg through a DIFFERENT pool than the one we modelled
+    /// (token has several pools on that DEX) — our predicted profit was against
+    /// the wrong reserves, so we skip.
+    nosend_wrong_pool: AtomicU64,
     /// Best (max) net lamports the optimizer found in the current window,
     /// including negatives — shows how close we get when nothing is profitable.
     best_net_seen: AtomicI64,
@@ -331,6 +335,7 @@ impl ShredArbEngine {
             nosend_send_err: AtomicU64::new(0),
             nosend_preempted: AtomicU64::new(0),
             nosend_sim_fail: AtomicU64::new(0),
+            nosend_wrong_pool: AtomicU64::new(0),
             best_net_seen: AtomicI64::new(i64::MIN),
         }
     }
@@ -729,6 +734,36 @@ impl ShredArbEngine {
         // Both legs routed — clear any load-failure strikes.
         self.load_fail.remove(&pool);
         self.note_route_success(pool);
+
+        // Verify Metis routed each leg through the EXACT pool we modelled. The
+        // `dexes=` filter only pins the DEX, not the pool — a token with several
+        // pools on one venue (common on Meteora) can route through a DIFFERENT
+        // pool than the one we detected the gap on, so our predicted profit is
+        // against the wrong reserves and the tx reverts. If either leg didn't
+        // route through our pool, skip (the opportunity is not real for us).
+        let (pump_q, counter_q) = if buy_kind == pair.pump.kind {
+            (&q1, &q2)
+        } else {
+            (&q2, &q1)
+        };
+        let pump_ok = route_first_amm_key(pump_q)
+            .map(|k| k == pair.pump.pool.to_string())
+            .unwrap_or(false);
+        let counter_ok = route_first_amm_key(counter_q)
+            .map(|k| k == pair.counter.pool.to_string())
+            .unwrap_or(false);
+        if !pump_ok || !counter_ok {
+            self.nosend_wrong_pool.fetch_add(1, Ordering::Relaxed);
+            crate::errlog::log(
+                "not-sent",
+                &format!(
+                    "token={token} reason=routed-wrong-pool pump_ok={pump_ok} counter_ok={counter_ok} \
+                     want_pump={} want_counter={}",
+                    pair.pump.pool, pair.counter.pool
+                ),
+            );
+            return;
+        }
 
         // Set the on-chain floor to exactly the input (break-even) regardless of
         // what Metis quoted (our data is ahead of Metis).
@@ -1239,7 +1274,7 @@ impl ShredArbEngine {
                     "\n[shred-arb 30s] watching_pools={}\n\
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} bad_price={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
-                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={} sim_fail={}",
+                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={} sim_fail={} wrong_pool={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
                     self.profitable.load(Ordering::Relaxed),
@@ -1263,6 +1298,7 @@ impl ShredArbEngine {
                     self.nosend_send_err.load(Ordering::Relaxed),
                     self.nosend_preempted.load(Ordering::Relaxed),
                     self.nosend_sim_fail.load(Ordering::Relaxed),
+                    self.nosend_wrong_pool.load(Ordering::Relaxed),
                 );
             }
         });
@@ -1356,6 +1392,18 @@ fn harvest_accounts(
         visit(ix);
     }
     out
+}
+
+/// The `ammKey` (pool) of the FIRST hop in a Metis quote's route plan. For our
+/// single-hop forced quotes this is the pool Metis actually routed through.
+fn route_first_amm_key(q: &crate::metis::QuoteResponse) -> Option<String> {
+    q.route_plan
+        .as_array()?
+        .first()?
+        .get("swapInfo")?
+        .get("ammKey")?
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 fn buy_kind_label(k: DexKind) -> &'static str {
