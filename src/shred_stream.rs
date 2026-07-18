@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::dex_ids::pumpfun_program;
+use crate::dex_ids::{meteora_program, pumpfun_program};
 
 mod pb {
     tonic::include_proto!("shredstream");
@@ -69,6 +69,17 @@ pub struct ShredConsumer {
     /// reads the same live library.
     alt_map: Arc<std::sync::RwLock<HashMap<Pubkey, Vec<Pubkey>>>>,
     pumpfun: Pubkey,
+    meteora: Pubkey,
+    /// Meteora pool pubkeys we track (the counter-pool of each arb pair). Any
+    /// tx touching one of these — a direct swap OR a multi-hop arb routed
+    /// through it — is recorded in `meteora_activity` so the engine can drop a
+    /// bundle that an in-flight Meteora trade would revert.
+    meteora_pools: std::sync::RwLock<HashSet<Pubkey>>,
+    /// Last time an in-flight (shred-observed) tx touched each watched Meteora
+    /// pool. Shared with the engine's pre-send freshness gate.
+    meteora_activity: Arc<dashmap::DashMap<Pubkey, std::time::Instant>>,
+    /// Our own fee payer — our txs also touch these pools, so skip them.
+    self_signer: Pubkey,
     /// Optional sink for detected remove-liquidity (`withdraw`) events on a
     /// watched pool — the Pump pool pubkey is sent so the manager can close it.
     remove_tx: std::sync::RwLock<Option<mpsc::Sender<Pubkey>>>,
@@ -91,6 +102,7 @@ impl ShredConsumer {
         target_pools: HashSet<Pubkey>,
         alt_map: HashMap<Pubkey, Vec<Pubkey>>,
         rpc: Arc<solana_client::rpc_client::RpcClient>,
+        self_signer: Pubkey,
     ) -> Self {
         let metrics = Arc::new(ShredMetrics::default());
         metrics
@@ -101,6 +113,10 @@ impl ShredConsumer {
             target_pools: std::sync::RwLock::new(target_pools),
             alt_map: Arc::new(std::sync::RwLock::new(alt_map)),
             pumpfun: pumpfun_program(),
+            meteora: meteora_program(),
+            meteora_pools: std::sync::RwLock::new(HashSet::new()),
+            meteora_activity: Arc::new(dashmap::DashMap::new()),
+            self_signer,
             remove_tx: std::sync::RwLock::new(None),
             rpc,
             pending_alts: std::sync::Mutex::new(HashSet::new()),
@@ -194,6 +210,23 @@ impl ShredConsumer {
         }
     }
 
+    /// Shared map of "last in-flight tx touching each watched Meteora pool" —
+    /// the engine reads this right before sending to drop doomed bundles.
+    pub fn meteora_activity(&self) -> Arc<dashmap::DashMap<Pubkey, std::time::Instant>> {
+        self.meteora_activity.clone()
+    }
+
+    /// Watch a Meteora pool for in-flight competing txs.
+    pub fn add_meteora_target(&self, pool: Pubkey) {
+        self.meteora_pools.write().unwrap().insert(pool);
+    }
+
+    /// Stop watching a Meteora pool.
+    pub fn remove_meteora_target(&self, pool: &Pubkey) {
+        self.meteora_pools.write().unwrap().remove(pool);
+        self.meteora_activity.remove(pool);
+    }
+
     /// Remove a pool from the watch set (dead/rugged pool).
     pub fn remove_target(&self, pool: &Pubkey) {
         let mut set = self.target_pools.write().unwrap();
@@ -258,15 +291,44 @@ impl ShredConsumer {
         let msg = &vtx.message;
         let static_keys = msg.static_account_keys();
 
-        // Quick reject: the invoked program must appear as a static key.
-        if !static_keys.iter().any(|k| *k == self.pumpfun) {
+        // Quick reject: one of the two programs we care about must appear as a
+        // static key (Pump.fun for swap signals, Meteora for in-flight
+        // competing-tx detection on our counter-pools).
+        let has_pump = static_keys.iter().any(|k| *k == self.pumpfun);
+        let has_meteora = static_keys.iter().any(|k| *k == self.meteora);
+        if !has_pump && !has_meteora {
             return;
         }
-        self.metrics.pump_txns.fetch_add(1, Ordering::Relaxed);
+        // Our own txs touch our pools too — never treat them as competition.
+        if static_keys.first() == Some(&self.self_signer) {
+            return;
+        }
+        if has_pump {
+            self.metrics.pump_txns.fetch_add(1, Ordering::Relaxed);
+        }
 
         // Resolve the full ordered account list (static + ALT writable + ALT
         // readonly), filling unknown-ALT slots with a placeholder.
         let full_keys = self.resolve_keys(msg);
+
+        // In-flight Meteora activity: any tx invoking the Meteora program that
+        // references one of our watched counter-pools (direct swap or a
+        // multi-hop arb routed through it) very likely moves the price against
+        // our pending bundle — record it so the engine's pre-send gate can act.
+        if has_meteora {
+            let watched = self.meteora_pools.read().unwrap();
+            if !watched.is_empty() {
+                let now = std::time::Instant::now();
+                for k in &full_keys {
+                    if watched.contains(k) {
+                        self.meteora_activity.insert(*k, now);
+                    }
+                }
+            }
+            if !has_pump {
+                return; // nothing else to decode in a Meteora-only tx
+            }
+        }
 
         // The ALT keys this tx used — candidates for whichever watched pool it
         // touches (fed to the AltRegistry, which picks the best-coverage table).

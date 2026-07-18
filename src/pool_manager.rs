@@ -34,7 +34,7 @@ use crate::shred_stream::ShredConsumer;
 use crate::transaction;
 
 pub struct PoolManager {
-    registry: Arc<DashMap<Pubkey, ArbPair>>,
+    registry: Arc<DashMap<Pubkey, Vec<ArbPair>>>,
     pool_state: PoolStateCache,
     consumer: Arc<ShredConsumer>,
     metis: Arc<MetisClient>,
@@ -51,7 +51,7 @@ pub struct PoolManager {
 impl PoolManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        registry: Arc<DashMap<Pubkey, ArbPair>>,
+        registry: Arc<DashMap<Pubkey, Vec<ArbPair>>>,
         pool_state: PoolStateCache,
         consumer: Arc<ShredConsumer>,
         metis: Arc<MetisClient>,
@@ -88,16 +88,20 @@ impl PoolManager {
     /// A pool is dead when Meteora `liquidity == 0`, or the Pump WSOL reserve
     /// has fallen below `min_pump_wsol` (untradeable / rugged).
     pub fn check_and_close(&self, pump_pool: &Pubkey) {
-        let pair = match self.registry.get(pump_pool) {
+        let pairs = match self.registry.get(pump_pool) {
             Some(e) => e.value().clone(),
             None => return,
         };
-        let met_liq = self
-            .rpc
-            .get_account(&pair.meteora.pool)
-            .ok()
-            .and_then(|a| Self::read_u128(&a.data, 360))
-            .unwrap_or(0);
+        let Some(pair) = pairs.first() else { return };
+        // A pump pool is dead only when EVERY Meteora counter-pool is drained.
+        let all_met_drained = pairs.iter().all(|p| {
+            self.rpc
+                .get_account(&p.meteora.pool)
+                .ok()
+                .and_then(|a| Self::read_u128(&a.data, 360))
+                .unwrap_or(0)
+                == 0
+        });
         let pump_wsol = self
             .rpc
             .get_account(&pair.pump.wsol_vault())
@@ -107,7 +111,8 @@ impl PoolManager {
         // Close ONLY on a genuine full drain — Meteora liquidity gone, or the
         // Pump WSOL reserve emptied to dust. A partial remove that leaves the
         // pool liquid keeps it (never close on a mere reduction).
-        let dead = met_liq == 0 || pump_wsol < 1_000;
+        let dead = all_met_drained || pump_wsol < 1_000;
+        let met_liq = if all_met_drained { 0u128 } else { 1 };
         if dead {
             info!(pump = %pump_pool, met_liq, pump_wsol, "confirmed dead pool — closing");
             self.remove_pair(pump_pool);
@@ -124,7 +129,7 @@ impl PoolManager {
             loop {
                 tokio::time::sleep(interval).await;
                 let pools: Vec<Pubkey> =
-                    self.registry.iter().map(|e| e.value().pump.pool).collect();
+                    self.registry.iter().map(|e| *e.key()).collect();
                 info!(count = pools.len(), "hourly pool sweep starting");
                 for pool in pools {
                     let me = self.clone();
@@ -139,6 +144,41 @@ impl PoolManager {
     /// Whether the given Pump pool is already tracked.
     pub fn contains(&self, pump_pool: &Pubkey) -> bool {
         self.registry.contains_key(pump_pool)
+    }
+
+    /// Whether `pool` is already tracked on EITHER side (as a Pump pool or as a
+    /// Meteora counter-pool of any pair). Used by discovery/wallet-miner so a
+    /// known pool is never re-resolved or re-added.
+    pub fn contains_pool(&self, pool: &Pubkey) -> bool {
+        if self.registry.contains_key(pool) {
+            return true;
+        }
+        self.registry
+            .iter()
+            .any(|e| e.value().iter().any(|p| p.meteora.pool == *pool))
+    }
+
+    /// Snapshot of every tracked token with its known Pump and Meteora pools.
+    /// The periodic new-pool recheck iterates this to ask the APIs whether a
+    /// NEW counter-pool has appeared for a token we already trade.
+    pub fn tracked_tokens(&self) -> Vec<(Pubkey, Vec<PoolInfo>, Vec<PoolInfo>)> {
+        use std::collections::HashMap;
+        let mut by_token: HashMap<Pubkey, (Vec<PoolInfo>, Vec<PoolInfo>)> = HashMap::new();
+        for e in self.registry.iter() {
+            for pair in e.value() {
+                let entry = by_token.entry(pair.token_mint).or_default();
+                if !entry.0.iter().any(|p| p.pool == pair.pump.pool) {
+                    entry.0.push(pair.pump.clone());
+                }
+                if !entry.1.iter().any(|p| p.pool == pair.meteora.pool) {
+                    entry.1.push(pair.meteora.clone());
+                }
+            }
+        }
+        by_token
+            .into_iter()
+            .map(|(t, (p, m))| (t, p, m))
+            .collect()
     }
 
     /// Register a Metis market for a single pool, logging failures without
@@ -175,8 +215,12 @@ impl PoolManager {
     /// Bring a newly-discovered shared pool fully online. Idempotent: a pool
     /// already in the registry is skipped.
     pub async fn add_pair(&self, pair: ArbPair) -> Result<()> {
-        if self.registry.contains_key(&pair.pump.pool) {
-            return Ok(());
+        // Idempotent per (pump, meteora) COMBINATION — the same Pump pool with a
+        // NEW Meteora counter-pool is a new tradeable pair and is added.
+        if let Some(existing) = self.registry.get(&pair.pump.pool) {
+            if existing.iter().any(|p| p.meteora.pool == pair.meteora.pool) {
+                return Ok(());
+            }
         }
         info!(
             token = %pair.token_mint,
@@ -197,9 +241,11 @@ impl PoolManager {
         ];
         self.pool_state.add_accounts(&self.rpc, &accounts);
 
-        // 3. ShredStream watch set (+ ALT contents for account resolution).
+        // 3. ShredStream watch set (+ ALT contents for account resolution),
+        // and the Meteora pool for in-flight competing-tx detection.
         let alt = pair.pump.alt.and_then(|a| self.load_alt(a));
         self.consumer.add_target(pair.pump.pool, alt);
+        self.consumer.add_meteora_target(pair.meteora.pool);
 
         // 4. Token ATA so we can hold the asset.
         match ata::ensure_ata(&self.rpc, &self.keypair, &pair.token_mint) {
@@ -217,7 +263,7 @@ impl PoolManager {
         }
 
         // 6. Register with the engine.
-        self.registry.insert(pair.pump.pool, pair);
+        self.registry.entry(pair.pump.pool).or_default().push(pair);
         Ok(())
     }
 
@@ -242,25 +288,32 @@ impl PoolManager {
                 tokio::time::sleep(interval).await;
                 let mut dead: Vec<Pubkey> = Vec::new();
                 for entry in self.registry.iter() {
-                    let pair = entry.value();
+                    let pump_pool = *entry.key();
+                    let pairs = entry.value();
 
-                    // Idle timeout: no Meteora update for the whole window.
-                    if let Some(age) = self.pool_state.last_update_age(&pair.meteora.pool) {
-                        if age >= idle_timeout {
-                            dead.push(pair.pump.pool);
-                            continue;
-                        }
+                    // Idle timeout: EVERY Meteora counter-pool idle for the
+                    // whole window.
+                    let all_idle = !pairs.is_empty()
+                        && pairs.iter().all(|pair| {
+                            matches!(
+                                self.pool_state.last_update_age(&pair.meteora.pool),
+                                Some(age) if age >= idle_timeout
+                            )
+                        });
+                    if all_idle {
+                        dead.push(pump_pool);
+                        continue;
                     }
 
-                    // Full drain (confirmed over N sweeps).
-                    if self.is_fully_drained(pair) {
-                        let c = strikes.entry(pair.pump.pool).or_insert(0);
+                    // Full drain (confirmed over N sweeps) across all pairs.
+                    if pairs.iter().all(|pair| self.is_fully_drained(pair)) {
+                        let c = strikes.entry(pump_pool).or_insert(0);
                         *c += 1;
                         if *c >= confirm_ticks {
-                            dead.push(pair.pump.pool);
+                            dead.push(pump_pool);
                         }
                     } else {
-                        strikes.remove(&pair.pump.pool);
+                        strikes.remove(&pump_pool);
                     }
                 }
                 for pool in dead {
@@ -287,17 +340,22 @@ impl PoolManager {
 
     /// Tear down a rugged/dead pool: stop trading it, unwatch it, reclaim rent.
     pub fn remove_pair(&self, pump_pool: &Pubkey) {
-        let Some((_, pair)) = self.registry.remove(pump_pool) else {
+        let Some((_, pairs)) = self.registry.remove(pump_pool) else {
             return;
         };
+        let Some(first) = pairs.first() else { return };
         info!(
-            token = %pair.token_mint,
-            pump = %pair.pump.pool,
+            token = %first.token_mint,
+            pump = %pump_pool,
+            pairs = pairs.len(),
             "removing pool (rug/dead)"
         );
         self.consumer.remove_target(pump_pool);
-        if let Err(e) = ata::close_ata(&self.rpc, &self.keypair, &pair.token_mint) {
-            warn!(token = %pair.token_mint, error = %e, "close_ata failed");
+        for pair in &pairs {
+            self.consumer.remove_meteora_target(&pair.meteora.pool);
+        }
+        if let Err(e) = ata::close_ata(&self.rpc, &self.keypair, &first.token_mint) {
+            warn!(token = %first.token_mint, error = %e, "close_ata failed");
         }
     }
 }

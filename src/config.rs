@@ -178,6 +178,11 @@ pub struct ShredArbConfig {
     /// Discovery poll interval (seconds). Latency-tolerant — arb, not sniper.
     #[serde(default = "default_discovery_interval")]
     pub discovery_interval_secs: u64,
+    /// Re-check EVERY tracked token for newly-created counter pools this often
+    /// (seconds). A token we already trade can get a brand-new Meteora pool at
+    /// any time; this is how the bot notices and adds it. Default 60.
+    #[serde(default = "default_discovery_recheck_interval")]
+    pub discovery_recheck_interval_secs: u64,
     /// GeckoTerminal "new pools" feed (the new-token source).
     #[serde(default = "default_gecko_new_pools_url")]
     pub discovery_new_pools_url: String,
@@ -366,6 +371,7 @@ impl Default for ShredArbConfig {
             always_exist_mints: default_always_exist_mints(),
             discovery_enabled: true,
             discovery_interval_secs: default_discovery_interval(),
+            discovery_recheck_interval_secs: default_discovery_recheck_interval(),
             discovery_new_pools_url: default_gecko_new_pools_url(),
             discovery_token_pairs_url: default_dexscreener_token_url(),
             discovery_seed_urls: default_discovery_seed_urls(),
@@ -439,6 +445,10 @@ fn default_bootstrap_max() -> usize {
 
 fn default_discovery_interval() -> u64 {
     5
+}
+
+fn default_discovery_recheck_interval() -> u64 {
+    60
 }
 fn default_min_net_profit() -> u64 {
     5000

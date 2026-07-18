@@ -51,6 +51,10 @@ const MET_OFF_VAULT_B: usize = 264;
 
 pub struct DiscoveryConfig {
     pub interval: Duration,
+    /// How often to re-check EVERY tracked token for newly-created counter
+    /// pools (a token we trade can grow a second/third Meteora pool at any
+    /// time; without this we would never notice it).
+    pub recheck_interval: Duration,
     pub new_pools_url: String,
     /// DexScreener token endpoint with a literal `{mint}` placeholder.
     pub token_pairs_url: String,
@@ -209,9 +213,17 @@ impl Discovery {
             );
             // One-time seed of hot/top tokens so the strategy starts full.
             self.bootstrap().await;
+            let mut last_recheck = std::time::Instant::now();
             loop {
                 if let Err(e) = self.tick().await {
                     warn!(error = %e, "discovery tick failed");
+                }
+                // Periodic new-pool recheck for ALREADY-TRACKED tokens: a token
+                // we trade can get a brand-new Meteora (or Pump) pool at any
+                // moment — pick it up and bring it online (Metis + engine).
+                if last_recheck.elapsed() >= self.cfg.recheck_interval {
+                    last_recheck = std::time::Instant::now();
+                    self.recheck_tracked().await;
                 }
                 tokio::time::sleep(self.cfg.interval).await;
             }
@@ -310,22 +322,87 @@ impl Discovery {
         Ok(out)
     }
 
-    /// Resolve a token to a Pump↔Meteora `ArbPair` and add it, if one exists.
-    /// Returns `Ok(true)` when a shared pool was found and added.
-    async fn try_resolve_pair(&self, mint: Pubkey) -> Result<bool> {
-        let candidates = self.fetch_candidate_pools(&mint).await?;
-        if candidates.len() < 2 {
-            return Ok(false);
+    /// Re-check every ALREADY-TRACKED token for freshly-created counter pools:
+    /// ask DexScreener for all of the token's pairs, decode any pool we do not
+    /// yet track, and pair each new Meteora pool with the known Pump pools (and
+    /// each new Pump pool with the known Meteora pools). New pairs go through
+    /// the normal liquidity gates and `PoolManager::add_pair` (Metis add-market,
+    /// gRPC subscription, shred watch, ATA) — fully online, no restart.
+    async fn recheck_tracked(&self) {
+        let tracked = self.manager.tracked_tokens();
+        if tracked.is_empty() {
+            return;
         }
+        debug!(tokens = tracked.len(), "rechecking tracked tokens for new pools");
+        for (mint, known_pumps, known_meteoras) in tracked {
+            match self.resolve_new_pools(mint, &known_pumps, &known_meteoras).await {
+                Ok(added) if added > 0 => {
+                    info!(token = %mint, added, "new counter-pool(s) added for tracked token");
+                }
+                Ok(_) => {}
+                Err(e) => debug!(token = %mint, error = %e, "recheck failed"),
+            }
+            // Gentle pacing so we stay within API/RPC budgets.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
 
+    /// Fetch + decode this token's untracked pools, then add every viable new
+    /// (pump, meteora) combination formed with the pools we already know.
+    async fn resolve_new_pools(
+        &self,
+        mint: Pubkey,
+        known_pumps: &[PoolInfo],
+        known_meteoras: &[PoolInfo],
+    ) -> Result<usize> {
+        let (new_pumps, new_meteoras) = self.decode_untracked_pools(mint).await?;
+        if new_pumps.is_empty() && new_meteoras.is_empty() {
+            return Ok(0);
+        }
+        let mut added = 0usize;
+        // New Meteora pool × every Pump pool (known + new).
+        let all_pumps: Vec<&PoolInfo> = known_pumps.iter().chain(new_pumps.iter()).collect();
+        let all_meteoras: Vec<&PoolInfo> =
+            known_meteoras.iter().chain(new_meteoras.iter()).collect();
+        for pump in &all_pumps {
+            for meteora in &all_meteoras {
+                // At least one side must be new — known×known already exists.
+                let is_new = new_pumps.iter().any(|p| p.pool == pump.pool)
+                    || new_meteoras.iter().any(|m| m.pool == meteora.pool);
+                if !is_new {
+                    continue;
+                }
+                if self.passes_gates(&mint, pump, meteora) {
+                    let pair = ArbPair {
+                        token_mint: mint,
+                        pump: (*pump).clone(),
+                        meteora: (*meteora).clone(),
+                    };
+                    if let Err(e) = self.manager.add_pair(pair).await {
+                        warn!(token = %mint, error = %e, "add_pair failed on recheck");
+                    } else {
+                        added += 1;
+                    }
+                }
+            }
+        }
+        Ok(added)
+    }
+
+    /// Fetch this token's candidate pools and decode the ones we don't track
+    /// yet, split by venue.
+    async fn decode_untracked_pools(
+        &self,
+        mint: Pubkey,
+    ) -> Result<(Vec<PoolInfo>, Vec<PoolInfo>)> {
+        let candidates = self.fetch_candidate_pools(&mint).await?;
         let pump_program = pumpfun_program();
         let met_program = meteora_program();
-        let mut pump: Option<PoolInfo> = None;
-        let mut meteora: Option<PoolInfo> = None;
-
+        let mut pumps: Vec<PoolInfo> = Vec::new();
+        let mut meteoras: Vec<PoolInfo> = Vec::new();
         for pool in candidates {
-            // Already tracked? Skip the RPC read.
-            if self.manager.contains(&pool) {
+            // Already tracked (either side)? Skip the RPC read.
+            if self.manager.contains_pool(&pool) {
                 continue;
             }
             let acct = match self.rpc.get_account(&pool) {
@@ -340,63 +417,82 @@ impl Discovery {
                     continue; // paired against a different token / not WSOL
                 }
                 match info.kind {
-                    DexKind::PumpFunAmm => pump = Some(info),
-                    DexKind::MeteoraDammV2 => meteora = Some(info),
+                    DexKind::PumpFunAmm => pumps.push(info),
+                    DexKind::MeteoraDammV2 => meteoras.push(info),
                 }
             }
         }
+        Ok((pumps, meteoras))
+    }
 
-        if let (Some(pump), Some(meteora)) = (pump, meteora) {
-            // Liquidity + not-rugged gates. Liquidity matters mostly on the Pump
-            // side; Meteora just needs to still hold liquidity (not rugged).
-            if self.cfg.min_pump_wsol_lamports > 0 {
-                let wsol = self
-                    .rpc
-                    .get_account(&pump.wsol_vault())
-                    .ok()
-                    .and_then(|a| read_u64(&a.data, 64))
-                    .unwrap_or(0);
-                if wsol < self.cfg.min_pump_wsol_lamports {
-                    debug!(token = %mint, wsol, "skip: Pump liquidity below threshold");
-                    return Ok(false);
-                }
-            }
-            // Meteora must still have liquidity (offset 360, u128) — skip rugs.
-            let met_liq = self
+    /// Liquidity + not-rugged gates for one (pump, meteora) combination.
+    fn passes_gates(&self, mint: &Pubkey, pump: &PoolInfo, meteora: &PoolInfo) -> bool {
+        // Liquidity matters mostly on the Pump side; Meteora just needs to
+        // still hold liquidity (not rugged).
+        if self.cfg.min_pump_wsol_lamports > 0 {
+            let wsol = self
                 .rpc
-                .get_account(&meteora.pool)
+                .get_account(&pump.wsol_vault())
                 .ok()
-                .and_then(|a| read_u128(&a.data, 360))
+                .and_then(|a| read_u64(&a.data, 64))
                 .unwrap_or(0);
-            if met_liq == 0 {
-                debug!(token = %mint, "skip: Meteora pool already drained");
-                return Ok(false);
+            if wsol < self.cfg.min_pump_wsol_lamports {
+                debug!(token = %mint, wsol, "skip: Pump liquidity below threshold");
+                return false;
             }
-            // Meteora depth gate: the arb is capped by the thin side, so a
-            // near-empty Meteora WSOL vault can never clear the fee. Skip those.
-            if self.cfg.min_meteora_wsol_lamports > 0 {
-                let met_wsol = self
-                    .rpc
-                    .get_account(&meteora.wsol_vault())
-                    .ok()
-                    .and_then(|a| read_u64(&a.data, 64))
-                    .unwrap_or(0);
-                if met_wsol < self.cfg.min_meteora_wsol_lamports {
-                    debug!(token = %mint, met_wsol, "skip: Meteora depth too thin");
-                    return Ok(false);
+        }
+        // Meteora must still have liquidity (offset 360, u128) — skip rugs.
+        let met_liq = self
+            .rpc
+            .get_account(&meteora.pool)
+            .ok()
+            .and_then(|a| read_u128(&a.data, 360))
+            .unwrap_or(0);
+        if met_liq == 0 {
+            debug!(token = %mint, "skip: Meteora pool already drained");
+            return false;
+        }
+        // Meteora depth gate: the arb is capped by the thin side, so a
+        // near-empty Meteora WSOL vault can never clear the fee. Skip those.
+        if self.cfg.min_meteora_wsol_lamports > 0 {
+            let met_wsol = self
+                .rpc
+                .get_account(&meteora.wsol_vault())
+                .ok()
+                .and_then(|a| read_u64(&a.data, 64))
+                .unwrap_or(0);
+            if met_wsol < self.cfg.min_meteora_wsol_lamports {
+                debug!(token = %mint, met_wsol, "skip: Meteora depth too thin");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Resolve a token to its Pump↔Meteora `ArbPair`s and add them, if any
+    /// exist. Returns `Ok(true)` when at least one pair was found and added.
+    async fn try_resolve_pair(&self, mint: Pubkey) -> Result<bool> {
+        let (pumps, meteoras) = self.decode_untracked_pools(mint).await?;
+        let mut added = 0usize;
+        for pump in &pumps {
+            for meteora in &meteoras {
+                if self.passes_gates(&mint, pump, meteora) {
+                    info!(token = %mint, pump = %pump.pool, meteora = %meteora.pool,
+                          "discovered shared Pump/Meteora pool");
+                    let pair = ArbPair {
+                        token_mint: mint,
+                        pump: pump.clone(),
+                        meteora: meteora.clone(),
+                    };
+                    if let Err(e) = self.manager.add_pair(pair).await {
+                        warn!(token = %mint, error = %e, "add_pair failed");
+                    } else {
+                        added += 1;
+                    }
                 }
             }
-
-            info!(token = %mint, "discovered shared Pump/Meteora pool");
-            let pair = ArbPair {
-                token_mint: mint,
-                pump,
-                meteora,
-            };
-            self.manager.add_pair(pair).await?;
-            return Ok(true);
         }
-        Ok(false)
+        Ok(added > 0)
     }
 }
 

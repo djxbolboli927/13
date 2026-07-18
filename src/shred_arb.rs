@@ -50,6 +50,12 @@ const MAX_PLAUSIBLE_GAP_PCT: f64 = 300.0;
 /// Log at most 1 in this many `eval-detail` traces (profitable ones always log).
 const EVAL_LOG_SAMPLE: u64 = 50;
 
+/// Identity of one tradeable pair: (pump pool, meteora pool). A token can have
+/// SEVERAL Meteora pools (and even several Pump pools), so per-pair bookkeeping
+/// (cooldown, dedup, failure strikes) must key on the combination, not just the
+/// Pump pool.
+type PairKey = (solana_sdk::pubkey::Pubkey, solana_sdk::pubkey::Pubkey);
+
 /// Tunables sourced from `[shred_arb]` config.
 #[derive(Clone)]
 pub struct ArbParams {
@@ -125,9 +131,11 @@ pub struct ShredArbEngine {
     pub jito_grpc_limiter: Option<Arc<Mutex<RateLimiter>>>,
     pub user_pubkey: String,
     pub pool_state: PoolStateCache,
-    /// Keyed by Pump.fun pool pubkey (what the signal carries). Shared, mutable
+    /// Keyed by Pump.fun pool pubkey (what the signal carries). Each entry holds
+    /// EVERY pair for that Pump pool — one per Meteora counter-pool, since a
+    /// token can grow additional Meteora pools over time. Shared, mutable
     /// registry so pools can be added/removed at runtime.
-    pub registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, ArbPair>>,
+    pub registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, Vec<ArbPair>>>,
     pub params: ArbParams,
     pub shred_metrics: Arc<crate::shred_stream::ShredMetrics>,
     /// Optional pool manager (teardown is now gated off by never_close, so this
@@ -143,22 +151,25 @@ pub struct ShredArbEngine {
     /// Best-ALT-per-pool registry harvested from competitor shreds (primary
     /// source for fresh pools). One max-coverage ALT per pool.
     pub alt_registry: Arc<crate::alt_registry::AltRegistry>,
-    last_fired: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
-    /// Last time we actually SENT a tx for a pool — de-dupes the spam of
+    /// Last in-flight (shred-observed) competing tx per watched Meteora pool —
+    /// fed by the ShredConsumer, read by the pre-send freshness gate.
+    meteora_activity: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>>,
+    last_fired: dashmap::DashMap<PairKey, Instant>,
+    /// Last time we actually SENT a tx for a pair — de-dupes the spam of
     /// re-firing the same standing gap every 100ms.
-    last_sent: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
+    last_sent: dashmap::DashMap<PairKey, Instant>,
     /// On-chain fate of sent txs.
     sent_stats: Arc<SentStats>,
-    /// Consecutive forced-quote route failures per pool. A pool that can't be
+    /// Consecutive forced-quote route failures per pair. A pair that can't be
     /// routed on both venues repeatedly is dropped (see `ROUTE_FAIL_LIMIT`).
-    route_fail: dashmap::DashMap<solana_sdk::pubkey::Pubkey, u32>,
-    /// Consecutive "No routes found" load failures per pool while we retry
-    /// add-market on BOTH legs. After `LOAD_RETRY_LIMIT` the pool is disabled.
-    load_fail: dashmap::DashMap<solana_sdk::pubkey::Pubkey, u32>,
-    /// Pools disabled after repeated failed Metis loads (only one leg ever
+    route_fail: dashmap::DashMap<PairKey, u32>,
+    /// Consecutive "No routes found" load failures per pair while we retry
+    /// add-market on BOTH legs. After `LOAD_RETRY_LIMIT` the pair is disabled.
+    load_fail: dashmap::DashMap<PairKey, u32>,
+    /// Pairs disabled after repeated failed Metis loads (only one leg ever
     /// loaded). Skipped in `assess` so they stop producing No-routes spam. Never
     /// closed (per never_close policy) — just not traded.
-    disabled: dashmap::DashSet<solana_sdk::pubkey::Pubkey>,
+    disabled: dashmap::DashSet<PairKey>,
     // ── diagnostics ──
     signals_received: AtomicU64,
     skip_min_trigger: AtomicU64,
@@ -218,12 +229,23 @@ enum BuyOn {
 struct Recheck {
     buy_on_pump: bool,
     token_is_a: bool,
+    /// Predicted Pump reserves at detection time (post-observed-trade).
     pump_after: PumpPool,
+    /// LIVE Pump reserves at detection time — if the cached vaults have moved
+    /// past this snapshot by send time, other Pump txs landed and we re-price
+    /// against the live reserves instead of the frozen prediction.
+    pump_before: PumpPool,
+    pump_token_vault: solana_sdk::pubkey::Pubkey,
+    pump_wsol_vault: solana_sdk::pubkey::Pubkey,
     met_pool: solana_sdk::pubkey::Pubkey,
     fallback_fee: u64,
     amount_in: u64,
     /// Minimum WSOL out we need (input + network fee + tip).
     min_out: u64,
+    /// When this opportunity was detected — any in-flight Meteora tx observed
+    /// after this instant is treated as adverse (it almost always closes the
+    /// gap our bundle depends on).
+    started: Instant,
 }
 
 /// On-chain fate of the direct-sent transactions (checked a few seconds after
@@ -255,13 +277,14 @@ impl ShredArbEngine {
         jito_grpc_limiter: Option<Arc<Mutex<RateLimiter>>>,
         user_pubkey: String,
         pool_state: PoolStateCache,
-        registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, ArbPair>>,
+        registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, Vec<ArbPair>>>,
         params: ArbParams,
         shred_metrics: Arc<crate::shred_stream::ShredMetrics>,
         manager: Option<Arc<crate::pool_manager::PoolManager>>,
         alt_builder: Option<Arc<crate::alt_builder::AltBuilder>>,
         alt_fetcher: Option<Arc<crate::alt_fetch::AltFetcher>>,
         alt_registry: Arc<crate::alt_registry::AltRegistry>,
+        meteora_activity: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>>,
     ) -> Self {
         Self {
             metis,
@@ -282,6 +305,7 @@ impl ShredArbEngine {
             alt_builder,
             alt_fetcher,
             alt_registry,
+            meteora_activity,
             last_fired: dashmap::DashMap::new(),
             last_sent: dashmap::DashMap::new(),
             sent_stats: Arc::new(SentStats::default()),
@@ -314,9 +338,12 @@ impl ShredArbEngine {
         }
     }
 
-    /// Consume signals forever.
+    /// Consume signals forever. Every signal is handled on its OWN spawned task
+    /// (and inside `handle` every pair of that pool gets its own task too), so
+    /// nothing queues: signals are processed fully in parallel and a slow Metis
+    /// round-trip on one pool never delays another.
     pub async fn run(self: Arc<Self>, mut rx: mpsc::Receiver<PumpSwapSignal>) {
-        info!(pairs = self.registry.len(), "shred-arb engine running");
+        info!(pools = self.registry.len(), "shred-arb engine running");
         while let Some(sig) = rx.recv().await {
             let me = self.clone();
             tokio::spawn(async move {
@@ -340,12 +367,12 @@ impl ShredArbEngine {
             let fresh = Duration::from_millis(interval_ms.saturating_mul(4).max(800));
             loop {
                 ticker.tick().await;
-                let pairs: Vec<(solana_sdk::pubkey::Pubkey, ArbPair)> = self
+                let pairs: Vec<ArbPair> = self
                     .registry
                     .iter()
-                    .map(|e| (*e.key(), e.value().clone()))
+                    .flat_map(|e| e.value().clone())
                     .collect();
-                for (pool, pair) in pairs {
+                for pair in pairs {
                     // Freshness: did any relevant account update recently?
                     let recent = [
                         pair.meteora.pool,
@@ -366,30 +393,40 @@ impl ShredArbEngine {
                         None => continue,
                     };
                     // No prediction — price against the current Pump state.
-                    self.assess(&pair, pool, pump_now).await;
+                    // Each pair on its own task so a Metis round-trip on one
+                    // pool never serializes the sweep.
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        me.assess(&pair, pump_now).await;
+                    });
                 }
             }
         });
     }
 
-    async fn handle(&self, sig: PumpSwapSignal) {
+    async fn handle(self: Arc<Self>, sig: PumpSwapSignal) {
         self.signals_received.fetch_add(1, Ordering::Relaxed);
         if sig.quote_amount < self.params.min_trigger_lamports {
             self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let pair = match self.registry.get(&sig.pool) {
+        let pairs = match self.registry.get(&sig.pool) {
             Some(p) => p.clone(),
             None => {
                 self.skip_no_pair.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         };
+        let Some(first) = pairs.first() else {
+            self.skip_no_pair.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
 
-        // 1) Current Pump reserves → predicted post-trade reserves.
+        // 1) Current Pump reserves → predicted post-trade reserves (the Pump
+        // vaults are identical across every pair of this pool).
         let pump_now = match self
             .pool_state
-            .pump_pool(&pair.pump.token_vault(), &pair.pump.wsol_vault())
+            .pump_pool(&first.pump.token_vault(), &first.pump.wsol_vault())
         {
             Some(p) => p,
             None => {
@@ -415,22 +452,33 @@ impl ShredArbEngine {
         } else {
             pump_now.after_observed_sell(sig.base_amount)
         };
-        self.assess(&pair, sig.pool, pump_after).await;
+        // Assess every Meteora counter-pool of this token IN PARALLEL — each on
+        // its own task, sends go straight out with no shared queue.
+        let mut rest = pairs.into_iter();
+        let first_pair = rest.next().unwrap();
+        for pair in rest {
+            let me = self.clone();
+            tokio::spawn(async move {
+                me.assess(&pair, pump_after).await;
+            });
+        }
+        self.assess(&first_pair, pump_after).await;
     }
 
     /// Shared assessment core: read Meteora, choose direction, size the trade,
     /// and execute if it clears the profit gate. `pump_after` is the Pump state
     /// to price/quote against — predicted post-trade reserves for a shred
     /// trigger, or the current reserves for a pool-state-update trigger.
-    async fn assess(&self, pair: &ArbPair, pool: solana_sdk::pubkey::Pubkey, pump_after: PumpPool) {
-        // Skip pools we disabled after repeated Metis load failures (only one leg
+    async fn assess(&self, pair: &ArbPair, pump_after: PumpPool) {
+        let key: PairKey = (pair.pump.pool, pair.meteora.pool);
+        // Skip pairs we disabled after repeated Metis load failures (only one leg
         // ever loaded) — they'd only produce No-routes spam.
-        if self.disabled.contains(&pool) {
+        if self.disabled.contains(&key) {
             return;
         }
-        // Cooldown per pool — applies only after a fire, so the state evaluator
-        // can keep re-checking a not-yet-profitable pool every tick.
-        if let Some(prev) = self.last_fired.get(&pool) {
+        // Cooldown per pair — applies only after a fire, so the state evaluator
+        // can keep re-checking a not-yet-profitable pair every tick.
+        if let Some(prev) = self.last_fired.get(&key) {
             if prev.elapsed() < Duration::from_millis(self.params.cooldown_ms) {
                 self.skip_cooldown.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -596,7 +644,7 @@ impl ShredArbEngine {
         if net as f64 > best_x as f64 * self.params.max_profit_fraction {
             self.skip_implausible.fetch_add(1, Ordering::Relaxed);
             debug!(
-                pool = %pool, input = best_x, net, "skip implausible profit (mispriced pool)"
+                pool = %pair.pump.pool, input = best_x, net, "skip implausible profit (mispriced pool)"
             );
             return;
         }
@@ -607,7 +655,8 @@ impl ShredArbEngine {
             BuyOn::Meteora => (DexKind::MeteoraDammV2, DexKind::PumpFunAmm),
         };
         info!(
-            pool = %pool,
+            pool = %pair.pump.pool,
+            meteora = %pair.meteora.pool,
             token = %pair.token_mint,
             buy = ?buy_kind_label(buy_kind),
             input = best_x,
@@ -616,7 +665,7 @@ impl ShredArbEngine {
             "shred-arb opportunity"
         );
 
-        self.last_fired.insert(pool, Instant::now());
+        self.last_fired.insert(key, Instant::now());
         // Jito tip = min tip + a share of the detected profit (e.g. 1000 + 20%).
         // On-chain output floor = input + network fee + tip, so the tx reverts
         // unless it at least covers the fee and the tip (we keep the rest). Only
@@ -624,16 +673,27 @@ impl ShredArbEngine {
         let tip = self.params.jito_tip_min_lamports
             + (net as f64 * self.params.jito_tip_profit_fraction) as u64;
         let onchain_floor = best_x + self.params.network_fee_lamports + tip;
+        // Live Pump snapshot at detection time — the pre-send gate compares the
+        // cached vaults against this to know whether OTHER Pump txs landed
+        // during our compute window (and re-prices from live state if so).
+        let pump_before = self
+            .pool_state
+            .pump_pool(&pair.pump.token_vault(), &pair.pump.wsol_vault())
+            .unwrap_or(pump_after);
         let recheck = Recheck {
             buy_on_pump: buy_on == BuyOn::Pump,
             token_is_a,
             pump_after,
+            pump_before,
+            pump_token_vault: pair.pump.token_vault(),
+            pump_wsol_vault: pair.pump.wsol_vault(),
             met_pool: pair.meteora.pool,
             fallback_fee: fallback_fee_numerator,
             amount_in: best_x,
             min_out: onchain_floor,
+            started: Instant::now(),
         };
-        self.execute(pair, pool, buy_kind, sell_kind, best_x, onchain_floor, tip, recheck)
+        self.execute(pair, key, buy_kind, sell_kind, best_x, onchain_floor, tip, recheck)
             .await;
     }
 
@@ -641,7 +701,7 @@ impl ShredArbEngine {
     async fn execute(
         &self,
         pair: &ArbPair,
-        pool: solana_sdk::pubkey::Pubkey,
+        key: PairKey,
         buy_kind: DexKind,
         sell_kind: DexKind,
         amount_in: u64,
@@ -653,7 +713,7 @@ impl ShredArbEngine {
         // one is still unconfirmed. Kept SMALL and configurable (send_dedup_ms,
         // 0 = off) so multiple distinct opportunities in one block can each send.
         if self.params.send_dedup_ms > 0 {
-            if let Some(prev) = self.last_sent.get(&pool) {
+            if let Some(prev) = self.last_sent.get(&key) {
                 if prev.elapsed() < Duration::from_millis(self.params.send_dedup_ms) {
                     self.nosend_dedup.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -674,7 +734,7 @@ impl ShredArbEngine {
             Ok(q) => q,
             Err(e) => {
                 self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
-                self.handle_load_failure(pair, pool, "buy", buy_label, &e.to_string()).await;
+                self.handle_load_failure(pair, key, "buy", buy_label, &e.to_string()).await;
                 return;
             }
         };
@@ -699,13 +759,13 @@ impl ShredArbEngine {
             Ok(q) => q,
             Err(e) => {
                 self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
-                self.handle_load_failure(pair, pool, "sell", sell_label, &e.to_string()).await;
+                self.handle_load_failure(pair, key, "sell", sell_label, &e.to_string()).await;
                 return;
             }
         };
         // Both legs routed — clear any load-failure strikes.
-        self.load_fail.remove(&pool);
-        self.note_route_success(pool);
+        self.load_fail.remove(&key);
+        self.note_route_success(key);
 
         // Set the on-chain floor to exactly the input (break-even) regardless of
         // what Metis quoted (our data is ahead of Metis).
@@ -763,7 +823,7 @@ impl ShredArbEngine {
             self.alt_registry.select(&route_set, MAX_ALTS_PER_TX);
         if extra_alts.is_empty() {
             if let Some(f) = &self.alt_fetcher {
-                extra_alts = f.tables_for(&pool);
+                extra_alts = f.tables_for(&key.0);
             }
             for a in [pair.pump.alt, pair.meteora.alt].into_iter().flatten() {
                 if !extra_alts.contains(&a) {
@@ -873,7 +933,7 @@ impl ShredArbEngine {
             match send_res {
                 Ok(Ok(sig)) => {
                     self.sent.fetch_add(1, Ordering::Relaxed);
-                    self.last_sent.insert(pool, Instant::now());
+                    self.last_sent.insert(key, Instant::now());
                     info!(signature = %sig, input = amount_in, "shred-arb tx sent (direct)");
                     // Resolve the on-chain fate so EVERY sent tx is accounted for
                     // (landed_ok / reverted / dropped / unknown always sums to
@@ -991,7 +1051,7 @@ impl ShredArbEngine {
         match result {
             Ok(id) => {
                 self.sent.fetch_add(1, Ordering::Relaxed);
-                self.last_sent.insert(pool, Instant::now());
+                self.last_sent.insert(key, Instant::now());
                 info!(bundle = %id, input = amount_in, tip, via = if use_grpc { "grpc" } else { "rest" }, "shred-arb bundle sent");
                 // Track on-chain fate so we KNOW: landed_ok / reverted / dropped
                 // (auction-lost or never landed). A dropped bundle costs nothing.
@@ -1019,22 +1079,57 @@ impl ShredArbEngine {
     /// Meteora reading we do NOT block (return true) — better to try than to
     /// stall on a cache gap.
     fn still_profitable(&self, r: &Recheck) -> bool {
+        // 1) In-flight Meteora tx seen on shreds since detection? Those come
+        // from the SAME low-liquidity pool our sell/buy leg depends on — a
+        // direct swap or a multi-hop arb routed through it closes our gap ~90%
+        // of the time, and its effect is NOT yet in the cached state (it is
+        // pre-consensus). Recompute below cannot see it, so drop outright.
+        if let Some(t) = self.meteora_activity.get(&r.met_pool) {
+            if *t.value() >= r.started {
+                return false;
+            }
+        }
+
         let met = match self.pool_state.meteora_pool(&r.met_pool, r.fallback_fee) {
             Some(m) => m,
             None => return true,
         };
+
+        // 2) Pump side: other Pump.fun txs during our window are usually
+        // harmless (the pool is deep). Only if the cached vaults moved past the
+        // detection-time snapshot do we re-price from the LIVE reserves — and
+        // even then we still send as long as the output clears the on-chain
+        // floor (positive slippage never blocks a send; the floor is exactly
+        // what the tx enforces anyway).
+        let pump = match self
+            .pool_state
+            .pump_pool(&r.pump_token_vault, &r.pump_wsol_vault)
+        {
+            Some(live)
+                if live.base_reserve != r.pump_before.base_reserve
+                    || live.quote_reserve != r.pump_before.quote_reserve =>
+            {
+                // Other Pump txs (possibly including the one we predicted)
+                // landed — the live reserves are now the best estimate.
+                live
+            }
+            _ => r.pump_after, // unchanged → keep the post-trade prediction
+        };
+
         let out = if r.buy_on_pump {
-            let base = r.pump_after.quote_buy(r.amount_in);
+            let base = pump.quote_buy(r.amount_in);
             if base == 0 {
                 return false;
             }
             met.sell_token_for_wsol(base, r.token_is_a)
         } else {
             match met.buy_token_with_wsol(r.amount_in, r.token_is_a) {
-                Some(base) if base > 0 => Some(PumpPool::quote_sell(&r.pump_after, base)),
+                Some(base) if base > 0 => Some(PumpPool::quote_sell(&pump, base)),
                 _ => None,
             }
         };
+        // Only NEGATIVE slippage (output below the revert floor) blocks the
+        // send; anything at or above the floor goes out as originally built.
         matches!(out, Some(o) if o >= r.min_out)
     }
 
@@ -1053,13 +1148,13 @@ impl ShredArbEngine {
     async fn handle_load_failure(
         &self,
         pair: &ArbPair,
-        pool: solana_sdk::pubkey::Pubkey,
+        key: PairKey,
         leg: &str,
         venue: &str,
         err: &str,
     ) {
         let n = {
-            let mut e = self.load_fail.entry(pool).or_insert(0);
+            let mut e = self.load_fail.entry(key).or_insert(0);
             *e += 1;
             *e
         };
@@ -1067,15 +1162,15 @@ impl ShredArbEngine {
         self.readd_market(pair, DexKind::PumpFunAmm).await;
         self.readd_market(pair, DexKind::MeteoraDammV2).await;
         if n >= LOAD_RETRY_LIMIT {
-            self.disabled.insert(pool);
-            self.load_fail.remove(&pool);
-            warn!(%pool, token = %pair.token_mint, attempts = n, "disabling pool — Metis never loaded both legs");
+            self.disabled.insert(key);
+            self.load_fail.remove(&key);
+            warn!(pool = %key.0, meteora = %key.1, token = %pair.token_mint, attempts = n, "disabling pair — Metis never loaded both legs");
             crate::errlog::log(
                 "error",
                 &format!(
-                    "token={} pool={} reason=disabled-after-{}-load-failures leg={leg} venue={venue} \
+                    "token={} reason=disabled-after-{}-load-failures leg={leg} venue={venue} \
                      pump_pool={} meteora_pool={} last_err={err}",
-                    pair.token_mint, pool, n, pair.pump.pool, pair.meteora.pool
+                    pair.token_mint, n, pair.pump.pool, pair.meteora.pool
                 ),
             );
         } else {
@@ -1108,10 +1203,10 @@ impl ShredArbEngine {
         }
     }
 
-    /// Reset the route-failure strike count for `pool` after a successful route.
-    fn note_route_success(&self, pool: solana_sdk::pubkey::Pubkey) {
-        if self.route_fail.contains_key(&pool) {
-            self.route_fail.remove(&pool);
+    /// Reset the route-failure strike count for a pair after a successful route.
+    fn note_route_success(&self, key: PairKey) {
+        if self.route_fail.contains_key(&key) {
+            self.route_fail.remove(&key);
         }
     }
 

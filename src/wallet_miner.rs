@@ -130,7 +130,7 @@ impl WalletMiner {
         let mut pumps: HashMap<Pubkey, PoolInfo> = HashMap::new();
         let mut meteoras: HashMap<Pubkey, PoolInfo> = HashMap::new();
         for (pool, cand) in candidates {
-            if self.seen_pools.contains(&pool) || self.manager.contains(&pool) {
+            if self.seen_pools.contains(&pool) || self.manager.contains_pool(&pool) {
                 continue;
             }
             self.seen_pools.insert(pool);

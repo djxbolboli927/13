@@ -476,6 +476,7 @@ fn spawn_shred_arb(
             target_pools,
             alt_map,
             rpc_client.clone(),
+            trading_keypair.pubkey(),
         ));
         let shred_metrics = consumer.metrics.clone();
         consumer.clone().spawn(tx);
@@ -508,17 +509,22 @@ fn spawn_shred_arb(
             ))
         };
 
-        // Shared, mutable pool registry (seeded from mix.json; discovery adds more).
-        let registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, pool_registry::ArbPair>> =
+        // Shared, mutable pool registry (seeded from mix.json; discovery adds
+        // more). Each Pump pool maps to EVERY (pump, meteora) pair it belongs
+        // to — a token can have several Meteora counter-pools.
+        let registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, Vec<pool_registry::ArbPair>>> =
             Arc::new(dashmap::DashMap::new());
         for p in pairs {
-            registry.insert(p.pump.pool, p);
+            // Watch the Meteora counter-pool for in-flight competing txs.
+            consumer.add_meteora_target(p.meteora.pool);
+            registry.entry(p.pump.pool).or_default().push(p);
         }
         // Pre-fetch ALTs for the startup (mix.json) pools so their first txs fit.
         if let Some(f) = &alt_fetcher {
             for e in registry.iter() {
-                let p = e.value();
-                tokio::spawn(f.clone().fetch_for_pool(p.pump.pool, p.meteora.pool, p.token_mint));
+                for p in e.value() {
+                    tokio::spawn(f.clone().fetch_for_pool(p.pump.pool, p.meteora.pool, p.token_mint));
+                }
             }
         }
 
@@ -609,7 +615,12 @@ fn spawn_shred_arb(
                     ticker.tick().await;
                     let pools: Vec<(String, solana_sdk::pubkey::Pubkey)> = registry
                         .iter()
-                        .map(|e| (e.value().token_mint.to_string(), e.value().meteora.pool))
+                        .flat_map(|e| {
+                            e.value()
+                                .iter()
+                                .map(|p| (p.token_mint.to_string(), p.meteora.pool))
+                                .collect::<Vec<_>>()
+                        })
                         .collect();
                     let rpc = rpc.clone();
                     let path = path.clone();
@@ -676,6 +687,9 @@ fn spawn_shred_arb(
                     interval: std::time::Duration::from_secs(
                         sa.discovery_interval_secs.max(1),
                     ),
+                    recheck_interval: std::time::Duration::from_secs(
+                        sa.discovery_recheck_interval_secs.max(10),
+                    ),
                     new_pools_url: sa.discovery_new_pools_url.clone(),
                     token_pairs_url: sa.discovery_token_pairs_url.clone(),
                     seed_urls: sa.discovery_seed_urls.clone(),
@@ -722,6 +736,7 @@ fn spawn_shred_arb(
             alt_builder,
             alt_fetcher,
             alt_registry,
+            consumer.meteora_activity(),
         ));
         engine.clone().spawn_reporter();
         // Second opportunity source: re-assess all pairs from current state
