@@ -127,6 +127,9 @@ pub struct ArbParams {
     pub send_dedup_ms: u64,
     /// Seconds to wait before polling a sent tx's on-chain fate.
     pub status_check_delay_secs: u64,
+    /// "Instructions++": serve repeat routes from the in-RAM instruction cache
+    /// instead of calling Metis. Off = always fetch from Metis.
+    pub instructions_pp: bool,
     /// Never tear a pool down (route failures no longer drop/close it). Kept for
     /// config symmetry; teardown is gated in main.rs, so it's not read here.
     #[allow(dead_code)]
@@ -731,7 +734,10 @@ impl ShredArbEngine {
         // — no Metis round-trip at all.
         let cache_key = (key, buy_kind == DexKind::PumpFunAmm);
         let mut from_cache = false;
-        let cached_ixs = self.route_cache.get(&cache_key).and_then(|c| {
+        let cached_ixs = if !self.params.instructions_pp {
+            None
+        } else {
+            self.route_cache.get(&cache_key).and_then(|c| {
             crate::template_cache::patch_amounts_b64(
                 &c.swap_ixs.swap_instruction.data,
                 c.in_off,
@@ -744,7 +750,8 @@ impl ShredArbEngine {
                 ixs.swap_instruction.data = data;
                 ixs
             })
-        });
+            })
+        };
 
         let swap_ixs = if let Some(ixs) = cached_ixs {
             from_cache = true;
@@ -828,6 +835,7 @@ impl ShredArbEngine {
             // live inside the instruction's Borsh data (this request used
             // in=amount_in, quoted_out=floor, so we can search for them). If the
             // layout doesn't validate we just keep going through Metis.
+            if self.params.instructions_pp {
             if let Ok(raw) = base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
                 &swap_ixs.swap_instruction.data,
@@ -841,6 +849,7 @@ impl ShredArbEngine {
                     );
                     debug!(token = %token, "route instructions cached in RAM");
                 }
+            }
             }
             swap_ixs
         };

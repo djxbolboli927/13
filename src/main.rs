@@ -376,6 +376,7 @@ fn spawn_shred_arb(
         use_shared_accounts: sa.metis_use_shared_accounts,
         send_dedup_ms: sa.send_dedup_ms,
         status_check_delay_secs: sa.status_check_delay_secs,
+        instructions_pp: sa.instructions_pp,
         never_close: sa.never_close_pools,
     };
 

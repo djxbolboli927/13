@@ -233,6 +233,10 @@ pub struct ShredArbConfig {
     /// every profitable eval sends — bounded only by the RPC rate). Default 150.
     #[serde(default = "default_send_dedup_ms")]
     pub send_dedup_ms: u64,
+    /// "Instructions++": serve whole-route swap instructions from the in-RAM
+    /// route cache (skip Metis on repeat opportunities). true = on.
+    #[serde(default = "default_true", rename = "Instructions++")]
+    pub instructions_pp: bool,
     /// Seconds to wait after a direct send before polling the tx's on-chain fate.
     #[serde(default = "default_status_check_delay_secs")]
     pub status_check_delay_secs: u64,
@@ -382,6 +386,7 @@ impl Default for ShredArbConfig {
             pool_idle_close_secs: default_pool_idle_close_secs(),
             min_trigger_reserve_frac: 0.0,
             send_dedup_ms: default_send_dedup_ms(),
+            instructions_pp: true,
             status_check_delay_secs: default_status_check_delay_secs(),
             error_log_dir: default_error_log_dir(),
             target_wallets: Vec::new(),

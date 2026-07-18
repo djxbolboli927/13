@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use base64::Engine;
-use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use solana_sdk::transaction::VersionedTransaction;
@@ -72,22 +71,33 @@ impl JitoClient {
 
     /// Send a single-transaction bundle to ALL Jito endpoints concurrently.
     /// Returns the first successful bundle ID.
+    ///
+    /// Every region's POST runs on its OWN detached task, so returning early on
+    /// the first acceptance does NOT cancel the remaining in-flight requests —
+    /// the bundle genuinely reaches all 8 regions (previously the early return
+    /// dropped the pending futures and only the fastest region ever received it).
     pub async fn send_bundle(&self, tx: &VersionedTransaction) -> Result<String> {
         let tx_bytes = bincode::serialize(tx).context("failed to serialize transaction")?;
         let tx_base64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
 
-        // Send to all endpoints concurrently, but release the worker as soon as
-        // any region accepts. Dropping the remaining futures cancels slow tails.
-        let mut futures = self
-            .bundle_urls
-            .iter()
-            .map(|url| self.send_to_endpoint(url, &tx_base64))
-            .collect::<FuturesUnordered<_>>();
-        let mut last_err = None;
+        let (res_tx, mut res_rx) =
+            tokio::sync::mpsc::channel::<Result<String>>(self.bundle_urls.len().max(1));
+        for url in &self.bundle_urls {
+            let http = self.http.clone();
+            let url = url.clone();
+            let b64 = tx_base64.clone();
+            let res_tx = res_tx.clone();
+            tokio::spawn(async move {
+                let r = Self::send_to_endpoint(http, &url, &b64).await;
+                let _ = res_tx.send(r).await;
+            });
+        }
+        drop(res_tx);
 
-        while let Some(result) = futures.next().await {
+        let mut last_err = None;
+        while let Some(result) = res_rx.recv().await {
             match result {
-                Ok(bundle_id) => return Ok(bundle_id),
+                Ok(bundle_id) => return Ok(bundle_id), // other regions keep sending
                 Err(e) => {
                     last_err = Some(e);
                 }
@@ -98,7 +108,7 @@ impl JitoClient {
     }
 
     /// Send bundle to a single endpoint.
-    async fn send_to_endpoint(&self, url: &str, tx_base64: &str) -> Result<String> {
+    async fn send_to_endpoint(http: Client, url: &str, tx_base64: &str) -> Result<String> {
         let request = SendBundleRpcRequest {
             jsonrpc: "2.0",
             id: 1,
@@ -109,8 +119,7 @@ impl JitoClient {
             ),
         };
 
-        let resp = self
-            .http
+        let resp = http
             .post(url)
             .json(&request)
             .send()

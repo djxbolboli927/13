@@ -23,7 +23,6 @@
 //! (REST first, gRPC fallback when REST limiter is empty).
 
 use anyhow::{anyhow, Context, Result};
-use futures::stream::{FuturesUnordered, StreamExt};
 use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
@@ -204,20 +203,30 @@ impl JitoGrpcClient {
     /// Serialize `tx` once, broadcast to ALL regions concurrently.
     /// Returns the first regional success, or the last error if every
     /// region failed.
+    ///
+    /// Each region's SendBundle runs on a DETACHED task so the early return on
+    /// first success no longer cancels the other regions' in-flight RPCs — the
+    /// bundle really reaches every region.
     pub async fn send_bundle(&self, tx: &VersionedTransaction) -> Result<String> {
         let tx_bytes = bincode::serialize(tx).context("failed to serialize transaction")?;
 
-        let mut futures = FuturesUnordered::new();
+        let (res_tx, mut res_rx) =
+            tokio::sync::mpsc::channel::<Result<String>>(self.regions.len().max(1));
         for region in &self.regions {
             let region = region.clone();
             let tx_bytes = tx_bytes.clone();
-            futures.push(async move { send_to_region(&region, tx_bytes).await });
+            let res_tx = res_tx.clone();
+            tokio::spawn(async move {
+                let r = send_to_region(&region, tx_bytes).await;
+                let _ = res_tx.send(r).await;
+            });
         }
+        drop(res_tx);
 
         let mut last_err = None;
-        while let Some(result) = futures.next().await {
+        while let Some(result) = res_rx.recv().await {
             match result {
-                Ok(uuid) => return Ok(uuid),
+                Ok(uuid) => return Ok(uuid), // other regions keep sending
                 Err(e) => last_err = Some(e),
             }
         }
