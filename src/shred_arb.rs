@@ -396,7 +396,15 @@ impl ShredArbEngine {
                         None => continue,
                     };
                     // No prediction — price against the current Pump state.
-                    self.assess(&pair, pool, pump_now).await;
+                    // Spawned per pool: NOTHING queues behind a slow send. One
+                    // pool's quote/build/send (hundreds of ms) must never delay
+                    // another pool's opportunity — an arb sent seconds late is
+                    // a guaranteed 0x1771. If the Jito rate limiter is full the
+                    // tx is dropped instantly inside execute(), never queued.
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        me.assess(&pair, pool, pump_now).await;
+                    });
                 }
             }
         });
