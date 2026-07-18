@@ -71,6 +71,7 @@ const MET_OFF_NUM_PERIOD: usize = 22;
 const MET_OFF_PERIOD_FREQ: usize = 24;
 const MET_OFF_REDUCTION: usize = 32;
 const MET_OFF_DYN_INIT: usize = 56;
+const MET_OFF_DYN_MAX_VOL_ACC: usize = 64;
 const MET_OFF_DYN_VFC: usize = 68;
 const MET_OFF_DYN_BIN_STEP: usize = 72;
 const MET_OFF_DYN_VOL_ACC: usize = 120;
@@ -201,11 +202,23 @@ fn meteora_total_fee_numerator(data: &[u8], current_slot: u64) -> Option<u64> {
     }
 
     // ── Dynamic (volatility) fee ──
+    // CRITICAL: on-chain, a swap first RECOMPUTES `volatility_accumulator`
+    // (update_references + update_volatility_accumulator) at the block clock
+    // before charging the fee — a big arb trade during a volatility burst (the
+    // exact moment a shred fires) pushes it toward `max_volatility_accumulator`.
+    // The passively-cached stored value therefore UNDERSTATES the fee we will
+    // actually pay, which fabricated profit and got every bundle reverted. To
+    // stay honest we price the WORST CASE: the volatility accumulator capped at
+    // its on-chain ceiling `max_volatility_accumulator`. A trade only clears the
+    // gate if it survives the maximum dynamic fee — no more phantom profit.
     let mut dynamic: u64 = 0;
     if data.get(MET_OFF_DYN_INIT).copied().unwrap_or(0) != 0 {
         let vfc = read_u32_le(data, MET_OFF_DYN_VFC).unwrap_or(0) as u128;
         let bin_step = read_u16_le(data, MET_OFF_DYN_BIN_STEP).unwrap_or(0) as u128;
-        let vol_acc = read_u128_le(data, MET_OFF_DYN_VOL_ACC).unwrap_or(0);
+        let stored_vol = read_u128_le(data, MET_OFF_DYN_VOL_ACC).unwrap_or(0);
+        let max_vol = read_u32_le(data, MET_OFF_DYN_MAX_VOL_ACC).unwrap_or(0) as u128;
+        // Worst-case volatility the pool can reach on our swap.
+        let vol_acc = stored_vol.max(max_vol);
         if vfc > 0 && bin_step > 0 && vol_acc > 0 {
             let vfa = vol_acc.saturating_mul(bin_step);
             let square = vfa.saturating_mul(vfa);

@@ -573,6 +573,23 @@ pub struct JitoConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RpcConfig {
     pub url: String,
+    /// Optional secondary RPC for HIGH-VOLUME, non-trade-critical reads
+    /// (competitor-wallet mining, pool discovery). Keeps that traffic off the
+    /// trading RPC so blockhash fetches and sends never hit its rate limit.
+    /// Falls back to `url` when empty.
+    #[serde(default)]
+    pub secondary_url: String,
+}
+
+impl RpcConfig {
+    /// The RPC to use for background/high-volume reads (wallet miner, discovery).
+    pub fn secondary(&self) -> &str {
+        if self.secondary_url.trim().is_empty() {
+            &self.url
+        } else {
+            &self.secondary_url
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

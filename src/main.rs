@@ -103,6 +103,9 @@ async fn async_main(config: config::Config) -> Result<()> {
     let trading_keypair = Arc::new(wallet::read_keypair(&config.jito.trading_keypair)?);
 
     let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
+    // Secondary RPC for background/high-volume reads (wallet mining, discovery)
+    // so that traffic never rate-limits the trading RPC.
+    let rpc_secondary = Arc::new(RpcClient::new(config.rpc.secondary().to_string()));
 
     let wsol_mint = solana_sdk::pubkey::Pubkey::from_str_const(tokens::WSOL_MINT);
     let wsol_ata = spl_associated_token_account::get_associated_token_address(
@@ -269,6 +272,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             blockhash_cache.clone(),
             trading_keypair.clone(),
             rpc_client.clone(),
+            rpc_secondary.clone(),
             alt_cache.clone(),
             jito_client.clone(),
             jito_grpc_client.clone(),
@@ -311,6 +315,7 @@ fn spawn_shred_arb(
     blockhash_cache: Arc<BlockhashCache>,
     trading_keypair: Arc<solana_sdk::signature::Keypair>,
     rpc_client: Arc<RpcClient>,
+    rpc_secondary: Arc<RpcClient>,
     alt_cache: AltCache,
     jito_client: Arc<jito::JitoClient>,
     jito_grpc_client: Option<Arc<jito_grpc::JitoGrpcClient>>,
@@ -663,7 +668,8 @@ fn spawn_shred_arb(
         if !sa.target_wallets.is_empty() {
             let miner = wallet_miner::WalletMiner::new(
                 wallet_miner::WalletMinerConfig {
-                    rpc_url: rpc_client.url(),
+                    // High-volume competitor-tx scanning goes on the secondary RPC.
+                    rpc_url: rpc_secondary.url(),
                     wallets: sa.target_wallets.clone(),
                     interval: std::time::Duration::from_secs(
                         sa.wallet_mine_interval_secs.max(60),
@@ -673,7 +679,7 @@ fn spawn_shred_arb(
                     min_meteora_wsol_lamports: sa.discovery_min_meteora_wsol_lamports,
                 },
                 pool_manager.clone(),
-                rpc_client.clone(),
+                rpc_secondary.clone(),
             );
             miner.spawn();
         }
@@ -698,7 +704,7 @@ fn spawn_shred_arb(
                     min_meteora_wsol_lamports: sa.discovery_min_meteora_wsol_lamports,
                 },
                 pool_manager.clone(),
-                rpc_client.clone(),
+                rpc_secondary.clone(),
             );
             disc.spawn();
         }

@@ -212,6 +212,10 @@ pub struct ShredArbEngine {
     nosend_dedup: AtomicU64,
     /// A forced leg quote failed on Metis (no route / timeout).
     nosend_quote_fail: AtomicU64,
+    /// Model flagged profit but Metis's REAL-fee quote for the route says the
+    /// output won't clear the floor — i.e. the hand-math over-predicted. NOT a
+    /// Metis error; the route quoted fine, it just isn't actually profitable.
+    nosend_metis_unprofitable: AtomicU64,
     /// /swap-instructions failed.
     nosend_swapix_fail: AtomicU64,
     /// Tx couldn't be built / signed.
@@ -338,6 +342,7 @@ impl ShredArbEngine {
             sent: AtomicU64::new(0),
             nosend_dedup: AtomicU64::new(0),
             nosend_quote_fail: AtomicU64::new(0),
+            nosend_metis_unprofitable: AtomicU64::new(0),
             nosend_swapix_fail: AtomicU64::new(0),
             nosend_build_fail: AtomicU64::new(0),
             nosend_too_large: AtomicU64::new(0),
@@ -654,20 +659,28 @@ impl ShredArbEngine {
                 return;
             }
         };
+        // ── Profit decision (exactly as specified) ──────────────────────────
+        // gross  = predicted_out - input
+        // net    = gross - (network_fee + minimum Jito tip)   [= gross - 6000]
+        // profitable  ⇔  net > 0.  The 20% profit-share tip is NOT part of this
+        // gate — if net > 0 it stays positive after the share; if net ≤ 0 it
+        // never reaches the share anyway. The instruction output floor below is
+        // built exactly as before (input + network fee + full dynamic tip).
         let cost_floor = best_x + required_extra;
         if best_out <= cost_floor {
             self.not_profitable.fetch_add(1, Ordering::Relaxed);
-            return; // does not even cover network fee + minimum tip
+            return; // gross does not cover network fee + minimum tip
         }
-        // Surplus above all fixed costs; the profit share of the tip comes out
-        // of it, and what remains must clear the minimum-profit gate.
-        let surplus = best_out - cost_floor;
-        let tip_extra = (surplus as f64 * self.params.jito_tip_profit_fraction) as u64;
-        let net = surplus - tip_extra; // profit we KEEP after fee + full tip
+        let net = best_out - cost_floor; // = gross - 6000, strictly > 0 here
+        // Optional extra margin (config): require at least this many lamports of
+        // net on top of the 6000. Set 0 to accept any positive net.
         if net < self.params.min_net_profit_lamports {
             self.not_profitable.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        // Profit share of the tip is carved from `net` (bounded, so the floor
+        // stays strictly below the predicted output → never revert-by-design).
+        let tip_extra = (net as f64 * self.params.jito_tip_profit_fraction) as u64;
 
         // Plausibility guard: a real cross-pool gap is small. A predicted net
         // above `max_profit_fraction` of the input is always a dead-pool
@@ -826,7 +839,7 @@ impl ShredArbEngine {
             // overestimating — drop instead of shipping a doomed bundle.
             if let Ok(metis_out) = q2.out_amount.parse::<u64>() {
                 if metis_out < floor {
-                    self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
+                    self.nosend_metis_unprofitable.fetch_add(1, Ordering::Relaxed);
                     crate::errlog::log(
                         "not-sent",
                         &format!(
@@ -1308,7 +1321,7 @@ impl ShredArbEngine {
                     "\n[shred-arb 30s] watching_pools={}\n\
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} bad_price={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
-                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
+                     NOT-SENT: dedup={} quote_fail={} metis_unprofitable={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
@@ -1326,6 +1339,7 @@ impl ShredArbEngine {
                     unknown,
                     self.nosend_dedup.load(Ordering::Relaxed),
                     self.nosend_quote_fail.load(Ordering::Relaxed),
+                    self.nosend_metis_unprofitable.load(Ordering::Relaxed),
                     self.nosend_swapix_fail.load(Ordering::Relaxed),
                     self.nosend_build_fail.load(Ordering::Relaxed),
                     self.nosend_too_large.load(Ordering::Relaxed),
