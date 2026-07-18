@@ -277,6 +277,7 @@ pub struct ShredArbConfig {
     /// Route-account coverage at which a competitor ALT is accepted as a pool's
     /// table and registered with Metis (of the 6 pool+vault accounts). Default 4.
     #[serde(default = "default_alt_min_coverage")]
+    #[allow(dead_code)]
     pub alt_min_coverage: usize,
     /// Minimum Jito tip (lamports) added on top of the profit share. Default 1000.
     #[serde(default = "default_jito_tip_min")]
