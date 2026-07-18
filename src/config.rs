@@ -97,27 +97,6 @@ pub struct ShredArbConfig {
     /// Effective Meteora fee in bps (dynamic fee not yet modelled — verify).
     #[serde(default = "default_meteora_fee_bps")]
     pub meteora_fee_bps: u64,
-    /// Effective fee (bps) used in the fast pre-check for constant-product
-    /// counter venues (Meteora Dynamic AMM / Raydium V4 / Raydium CPMM). The
-    /// exact quote still comes from Metis; this only sizes the pre-check.
-    #[serde(default = "default_cp_fee_bps")]
-    pub cp_fee_bps: u64,
-    // ── Counter-venue on/off toggles ─────────────────────────────────────────
-    // Pump.fun is always the trigger venue. Each flag enables pairing the Pump
-    // pool with that counter venue. Defaults preserve today's behaviour: only
-    // Meteora DAMM v2 on.
-    /// Pump pools (or their tokens) to NEVER trade — pasted pubkeys. Checked at
-    /// startup; matching pools are disabled so no tx is ever built for them.
-    #[serde(default)]
-    pub blacklist_pools: Vec<String>,
-    #[serde(default = "default_true")]
-    pub dex_meteora_damm_v2: bool,
-    #[serde(default)]
-    pub dex_meteora_dynamic_amm: bool,
-    #[serde(default)]
-    pub dex_raydium_v4: bool,
-    #[serde(default)]
-    pub dex_raydium_cpmm: bool,
     /// Ignore observed Pump trades whose SOL-side arg is below this (SOL).
     #[serde(default = "default_min_trigger_sol")]
     pub min_trigger_sol: f64,
@@ -249,11 +228,6 @@ pub struct ShredArbConfig {
     /// every profitable eval sends — bounded only by the RPC rate). Default 150.
     #[serde(default = "default_send_dedup_ms")]
     pub send_dedup_ms: u64,
-    /// Simulate every tx against live chain state right before sending and drop
-    /// it on any error (mainly 0x1771 slippage) — the pre-send negative-slippage
-    /// gate. Costs one RPC round-trip of latency per send. Default true.
-    #[serde(default = "default_true")]
-    pub simulate_before_send: bool,
     /// Seconds to wait after a direct send before polling the tx's on-chain fate.
     #[serde(default = "default_status_check_delay_secs")]
     pub status_check_delay_secs: u64,
@@ -300,11 +274,9 @@ pub struct ShredArbConfig {
     /// route, so 1 is enough; raise only if a tx still comes back too large).
     #[serde(default = "default_alt_max_per_pool")]
     pub alt_max_per_pool: usize,
-    /// (Retained for config compatibility; the ALT selector now uses a per-tx
-    /// greedy set-cover over the global public-ALT library instead of a per-pool
-    /// coverage threshold.)
+    /// Route-account coverage at which a competitor ALT is accepted as a pool's
+    /// table and registered with Metis (of the 6 pool+vault accounts). Default 4.
     #[serde(default = "default_alt_min_coverage")]
-    #[allow(dead_code)]
     pub alt_min_coverage: usize,
     /// Minimum Jito tip (lamports) added on top of the profit share. Default 1000.
     #[serde(default = "default_jito_tip_min")]
@@ -378,12 +350,6 @@ impl Default for ShredArbConfig {
             tip_lamports: default_tip(),
             network_fee_lamports: default_net_fee(),
             meteora_fee_bps: default_meteora_fee_bps(),
-            cp_fee_bps: default_cp_fee_bps(),
-            blacklist_pools: Vec::new(),
-            dex_meteora_damm_v2: true,
-            dex_meteora_dynamic_amm: false,
-            dex_raydium_v4: false,
-            dex_raydium_cpmm: false,
             min_trigger_sol: default_min_trigger_sol(),
             min_amount_sol: default_min_amount_sol(),
             max_amount_sol: default_max_amount_sol(),
@@ -409,7 +375,6 @@ impl Default for ShredArbConfig {
             pool_idle_close_secs: default_pool_idle_close_secs(),
             min_trigger_reserve_frac: 0.0,
             send_dedup_ms: default_send_dedup_ms(),
-            simulate_before_send: default_true(),
             status_check_delay_secs: default_status_check_delay_secs(),
             error_log_dir: default_error_log_dir(),
             target_wallets: Vec::new(),
@@ -529,9 +494,6 @@ fn default_shred_keypair() -> String {
 }
 fn default_tip() -> u64 {
     1600
-}
-fn default_cp_fee_bps() -> u64 {
-    25
 }
 fn default_shred_cu_limit() -> u32 {
     300_000

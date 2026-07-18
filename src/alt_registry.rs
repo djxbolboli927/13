@@ -1,94 +1,226 @@
-//! Per-transaction ALT selector, backed by the global library of PUBLIC lookup
-//! tables harvested from the network (shred_stream's `alt_map`).
+//! Per-pool "best ALT" registry, harvested from competitor transactions.
 //!
-//! On-chain evidence: competitors do NOT mint their own tables for fresh pools.
-//! They keep a library of pre-existing public ALTs (built months ago by other
-//! wallets) and, for each transaction, reference the 1-3 tables that best cover
-//! that route's accounts — different combinations per tx. We do exactly the
-//! same: for every tx we build, we look at the REAL account list Metis emitted
-//! and greedily pick the fewest public tables that compress the most accounts.
+//! There is no free way to MINT a route-optimized ALT (aggregators only publish
+//! them for older pools). The reliable source is the competitors themselves: the
+//! Pump.fun swaps we already see in the ShredStream carry `addressTableLookups`,
+//! and for a fresh pool those tables contain exactly the pool/vault accounts our
+//! own tx needs. So we collect the ALT keys each competitor tx used on one of our
+//! pools, look INSIDE each candidate table (fetch + decode), and keep the SINGLE
+//! table that covers the most of that pool's route accounts.
 //!
-//! Why greedy set-cover with a marginal-gain floor: every extra ALT referenced
-//! in a v0 message costs ~34 fixed bytes (its 32-byte pubkey + 2 length bytes),
-//! while each account it moves out of the static list saves 31 bytes (32 → 1).
-//! So a table is only worth adding if it uniquely covers ≥ 2 still-uncovered
-//! accounts (34 − 2·31 < 0). Greedy also dedupes automatically: a table
-//! identical to (or subsumed by) one already chosen has 0 marginal gain and is
-//! skipped.
+//! Why a single table: two tables with the same accounts don't help — every
+//! extra ALT referenced in a v0 message costs ~34 fixed bytes (its 32-byte pubkey
+//! + 2 index-length bytes), and a table contributing no unique account is pure
+//! overhead. One table with maximum coverage is optimal.
+//!
+//! Once a pool's chosen table covers enough accounts we FINALIZE it: register it
+//! with Metis (both legs) and stop hunting for that pool. Until then, every new
+//! competitor tx is a chance to find a better (higher-coverage) table.
 
+use dashmap::DashMap;
+use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tracing::info;
 
-/// A table is only worth attaching if it uniquely covers at least this many of
-/// the still-uncovered route accounts (fixed ~34-byte cost vs 31-byte/account
-/// saving ⇒ break-even is 2).
-const MIN_MARGINAL_COVERAGE: usize = 2;
+use crate::dex_ids::{METEORA_DAMM_V2_PROGRAM, PUMPFUN_AMM_PROGRAM};
+use crate::metis::MetisClient;
+use crate::pool_registry::ArbPair;
+use crate::transaction::deserialize_alt_addresses;
+
+#[derive(Clone, Copy)]
+struct Chosen {
+    alt: Pubkey,
+    coverage: usize,
+    finalized: bool,
+}
 
 pub struct AltRegistry {
-    /// The live global library shared with the shred consumer: ALT key → members.
-    library: Arc<RwLock<HashMap<Pubkey, Vec<Pubkey>>>>,
+    registry: Arc<DashMap<Pubkey, ArbPair>>,
+    metis: Arc<MetisClient>,
+    rpc: Arc<RpcClient>,
+    /// pump_pool → best table chosen so far.
+    chosen: DashMap<Pubkey, Chosen>,
+    /// ALT key → its member set (fetched once, cached).
+    members: DashMap<Pubkey, Arc<HashSet<Pubkey>>>,
+    /// pump_pool → the REAL set of accounts Metis puts in this pool's route
+    /// (both legs). Captured the first time the engine builds a tx for the pool.
+    /// This is what a good ALT must cover — NOT just the pool/vault pubkeys,
+    /// because most of the compressible weight is the shared program/config/mint
+    /// accounts the route touches.
+    route_accounts: DashMap<Pubkey, Arc<HashSet<Pubkey>>>,
+    /// Coverage (route accounts found in the table) at which we finalize.
+    min_coverage: usize,
 }
 
 impl AltRegistry {
-    pub fn new(library: Arc<RwLock<HashMap<Pubkey, Vec<Pubkey>>>>) -> Arc<Self> {
-        Arc::new(Self { library })
+    /// Spawn the background hunter and return (handle, candidate sender). Feed the
+    /// sender `(pump_pool, alt_keys)` for every competitor tx that touched a
+    /// watched pool and referenced ALTs.
+    pub fn spawn(
+        registry: Arc<DashMap<Pubkey, ArbPair>>,
+        metis: Arc<MetisClient>,
+        rpc: Arc<RpcClient>,
+        min_coverage: usize,
+    ) -> (Arc<Self>, mpsc::Sender<(Pubkey, Vec<Pubkey>)>) {
+        let (tx, rx) = mpsc::channel(4096);
+        let me = Arc::new(Self {
+            registry,
+            metis,
+            rpc,
+            chosen: DashMap::new(),
+            members: DashMap::new(),
+            route_accounts: DashMap::new(),
+            min_coverage: min_coverage.max(1),
+        });
+        me.clone().run(rx);
+        (me, tx)
     }
 
-    /// Pick up to `max` public ALTs from the library that together compress the
-    /// most of `needed` (the real accounts in this tx's Metis instruction).
-    /// Greedy by marginal coverage; stops when the best remaining table would
-    /// cover fewer than `MIN_MARGINAL_COVERAGE` new accounts (not worth the
-    /// per-ALT byte overhead). Returned keys are distinct and never redundant.
-    pub fn select(&self, needed: &HashSet<Pubkey>, max: usize) -> Vec<Pubkey> {
-        if needed.is_empty() || max == 0 {
-            return Vec::new();
-        }
-        let lib = self.library.read().unwrap();
+    /// The single chosen ALT for a pool (if any found yet). Read by the engine.
+    pub fn best_for(&self, pump_pool: &Pubkey) -> Option<Pubkey> {
+        self.chosen.get(pump_pool).map(|c| c.alt)
+    }
 
-        // Snapshot each library table's coverage of `needed` (only tables that
-        // cover ≥ the floor are even candidates).
-        let mut candidates: Vec<(Pubkey, Vec<Pubkey>)> = lib
-            .iter()
-            .filter_map(|(key, members)| {
-                let covered: Vec<Pubkey> = members
-                    .iter()
-                    .filter(|a| needed.contains(*a))
-                    .copied()
-                    .collect();
-                if covered.len() >= MIN_MARGINAL_COVERAGE {
-                    Some((*key, covered))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        drop(lib);
-
-        let mut remaining: HashSet<Pubkey> = needed.clone();
-        let mut chosen: Vec<Pubkey> = Vec::with_capacity(max);
-        while chosen.len() < max && !candidates.is_empty() {
-            // Best candidate by CURRENT marginal gain against `remaining`.
-            let mut best_idx: Option<usize> = None;
-            let mut best_gain = 0usize;
-            for (i, (_, covered)) in candidates.iter().enumerate() {
-                let gain = covered.iter().filter(|a| remaining.contains(*a)).count();
-                if gain > best_gain {
-                    best_gain = gain;
-                    best_idx = Some(i);
-                }
-            }
-            // Nothing left worth the ~34-byte cost of another ALT → stop.
-            if best_gain < MIN_MARGINAL_COVERAGE {
-                break;
-            }
-            let (key, covered) = candidates.swap_remove(best_idx.unwrap());
-            for a in &covered {
-                remaining.remove(a);
-            }
-            chosen.push(key);
+    /// Record the REAL account set Metis uses for this pool's route, so candidate
+    /// ALTs are scored against exactly what our tx needs to compress. Called by
+    /// the engine on the first (and every) build for the pool; cheap and
+    /// idempotent — we only replace when we don't yet have a set.
+    pub fn record_route_accounts(&self, pump_pool: Pubkey, accounts: Vec<Pubkey>) {
+        if accounts.is_empty() || self.route_accounts.contains_key(&pump_pool) {
+            return;
         }
-        chosen
+        let set: HashSet<Pubkey> = accounts.into_iter().collect();
+        self.route_accounts.insert(pump_pool, Arc::new(set));
+    }
+
+    fn run(self: Arc<Self>, mut rx: mpsc::Receiver<(Pubkey, Vec<Pubkey>)>) {
+        tokio::spawn(async move {
+            while let Some((pool, candidates)) = rx.recv().await {
+                self.consider(pool, candidates).await;
+            }
+        });
+    }
+
+    /// The accounts a good table should cover. Prefer the REAL route-account set
+    /// Metis emitted for this pool (captured on the first build) — that's the
+    /// exact set our tx must compress, dominated by shared program/config/mint
+    /// accounts, not just the pool/vault pubkeys. Until that's recorded, fall
+    /// back to the pool + vaults we know from the pair.
+    fn needed_accounts(&self, pump_pool: &Pubkey) -> Option<HashSet<Pubkey>> {
+        if let Some(r) = self.route_accounts.get(pump_pool) {
+            if !r.is_empty() {
+                return Some((**r).clone());
+            }
+        }
+        let pair = self.registry.get(pump_pool)?;
+        let mut set = HashSet::new();
+        for a in [
+            pair.pump.pool,
+            pair.pump.vault_a,
+            pair.pump.vault_b,
+            pair.meteora.pool,
+            pair.meteora.vault_a,
+            pair.meteora.vault_b,
+        ] {
+            if a != Pubkey::default() {
+                set.insert(a);
+            }
+        }
+        Some(set)
+    }
+
+    async fn members_of(&self, alt: Pubkey) -> Arc<HashSet<Pubkey>> {
+        if let Some(m) = self.members.get(&alt) {
+            return m.clone();
+        }
+        let rpc = self.rpc.clone();
+        let set: HashSet<Pubkey> = tokio::task::spawn_blocking(move || {
+            rpc.get_account(&alt)
+                .ok()
+                .and_then(|a| deserialize_alt_addresses(&a.data).ok())
+                .map(|v| v.into_iter().collect())
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        let arc = Arc::new(set);
+        self.members.insert(alt, arc.clone());
+        arc
+    }
+
+    async fn consider(&self, pool: Pubkey, candidates: Vec<Pubkey>) {
+        // Already finalized → stop hunting for this pool.
+        if self.chosen.get(&pool).map(|c| c.finalized).unwrap_or(false) {
+            return;
+        }
+        let needed = match self.needed_accounts(&pool) {
+            Some(n) if !n.is_empty() => n,
+            _ => return,
+        };
+
+        let mut best = self.chosen.get(&pool).map(|c| *c);
+        let mut seen: HashSet<Pubkey> = HashSet::new();
+        for alt in candidates {
+            if !seen.insert(alt) {
+                continue; // dedupe within this tx
+            }
+            let members = self.members_of(alt).await;
+            let coverage = needed.iter().filter(|a| members.contains(a)).count();
+            if coverage == 0 {
+                continue;
+            }
+            let better = best.map(|b| coverage > b.coverage).unwrap_or(true);
+            if better {
+                best = Some(Chosen {
+                    alt,
+                    coverage,
+                    finalized: false,
+                });
+                self.chosen.insert(
+                    pool,
+                    Chosen {
+                        alt,
+                        coverage,
+                        finalized: false,
+                    },
+                );
+                info!(%pool, %alt, coverage, needed = needed.len(), "alt-registry: better ALT chosen");
+            }
+        }
+
+        // Finalize once coverage is good enough: register with Metis (both legs)
+        // and stop hunting.
+        let done = best
+            .map(|b| b.coverage >= self.min_coverage.min(needed.len()))
+            .unwrap_or(false);
+        if let (true, Some(b)) = (done, best) {
+            if let Some(pair) = self.registry.get(&pool).map(|e| e.clone()) {
+                let alt = b.alt.to_string();
+                let _ = self
+                    .metis
+                    .add_market(&pair.pump.pool.to_string(), PUMPFUN_AMM_PROGRAM, Some(&alt))
+                    .await;
+                let _ = self
+                    .metis
+                    .add_market(
+                        &pair.meteora.pool.to_string(),
+                        METEORA_DAMM_V2_PROGRAM,
+                        Some(&alt),
+                    )
+                    .await;
+            }
+            self.chosen.insert(
+                pool,
+                Chosen {
+                    alt: b.alt,
+                    coverage: b.coverage,
+                    finalized: true,
+                },
+            );
+            info!(%pool, alt = %b.alt, coverage = b.coverage, "alt-registry: finalized (registered with Metis, hunt stopped)");
+        }
     }
 }

@@ -357,7 +357,6 @@ fn spawn_shred_arb(
         jito_tip_min_lamports: sa.jito_tip_min_lamports,
         jito_tip_profit_fraction: sa.jito_tip_profit_fraction,
         meteora_fee_bps: sa.meteora_fee_bps,
-        cp_fee_bps: sa.cp_fee_bps,
         min_trigger_lamports: lamports(sa.min_trigger_sol),
         min_amount_lamports: lamports(sa.min_amount_sol).max(1),
         max_amount_lamports: lamports(sa.max_amount_sol).max(1),
@@ -377,7 +376,6 @@ fn spawn_shred_arb(
         use_shared_accounts: sa.metis_use_shared_accounts,
         send_dedup_ms: sa.send_dedup_ms,
         status_check_delay_secs: sa.status_check_delay_secs,
-        simulate_before_send: sa.simulate_before_send,
         never_close: sa.never_close_pools,
     };
 
@@ -410,27 +408,11 @@ fn spawn_shred_arb(
     tokio::spawn(async move {
         use std::collections::{HashMap, HashSet};
 
-        // Which counter venues are enabled (Pump is always the trigger venue).
-        let mut enabled_counters: HashSet<dex_ids::DexKind> = HashSet::new();
-        if sa.dex_meteora_damm_v2 {
-            enabled_counters.insert(dex_ids::DexKind::MeteoraDammV2);
-        }
-        if sa.dex_meteora_dynamic_amm {
-            enabled_counters.insert(dex_ids::DexKind::MeteoraDynamicAmm);
-        }
-        if sa.dex_raydium_v4 {
-            enabled_counters.insert(dex_ids::DexKind::RaydiumV4);
-        }
-        if sa.dex_raydium_cpmm {
-            enabled_counters.insert(dex_ids::DexKind::RaydiumCpmm);
-        }
-        eprintln!("[shred-arb] enabled counter venues: {enabled_counters:?}");
-
         let pairs = loop {
-            match pool_registry::load_pairs(&sa.mix_cache_path, &enabled_counters) {
+            match pool_registry::load_pairs(&sa.mix_cache_path) {
                 Ok(p) if !p.is_empty() => break p,
                 Ok(_) => eprintln!(
-                    "[shred-arb] mix.json has 0 usable Pump↔counter pairs — retrying in 5s"
+                    "[shred-arb] mix.json has 0 usable Pump↔Meteora pairs — retrying in 5s"
                 ),
                 Err(e) => eprintln!(
                     "[shred-arb] cannot read {} ({e}) — retrying in 5s (is Metis running?)",
@@ -443,14 +425,14 @@ fn spawn_shred_arb(
         for p in &pairs {
             eprintln!(
                 "[shred-arb] pair token={} | pump_pool={} vaults=({},{}) | meteora_pool={}",
-                p.token_mint, p.pump.pool, p.pump.token_vault(), p.pump.wsol_vault(), p.counter.pool,
+                p.token_mint, p.pump.pool, p.pump.token_vault(), p.pump.wsol_vault(), p.meteora.pool,
             );
         }
 
         // Accounts to watch live: each Meteora pool + each Pump vault pair.
         let mut accounts: Vec<solana_sdk::pubkey::Pubkey> = Vec::new();
         for p in &pairs {
-            accounts.push(p.counter.pool);
+            accounts.push(p.meteora.pool);
             accounts.push(p.pump.token_vault());
             accounts.push(p.pump.wsol_vault());
         }
@@ -536,17 +518,20 @@ fn spawn_shred_arb(
         if let Some(f) = &alt_fetcher {
             for e in registry.iter() {
                 let p = e.value();
-                tokio::spawn(f.clone().fetch_for_pool(p.pump.pool, p.counter.pool, p.token_mint));
+                tokio::spawn(f.clone().fetch_for_pool(p.pump.pool, p.meteora.pool, p.token_mint));
             }
         }
 
-        // ALT selector backed by the GLOBAL library of public tables harvested
-        // from the network (shred_stream.alt_map). For each tx we build, it picks
-        // the best 1-3 public tables covering that route's real accounts — the
-        // same thing competitors do (reuse public ALTs, never mint their own).
-        // Compression happens in OUR v0 build step, not in Metis, so this needs
-        // no Metis registration and updates live as the library grows.
-        let alt_registry = alt_registry::AltRegistry::new(consumer.alt_library());
+        // Per-pool best-ALT registry, fed by competitor shreds: picks the single
+        // highest-coverage ALT for each pool and registers it with Metis. This is
+        // the primary tx-size fix (aggregators only have ALTs for old pools).
+        let (alt_registry, alt_cand_tx) = alt_registry::AltRegistry::spawn(
+            registry.clone(),
+            metis.clone(),
+            rpc_client.clone(),
+            sa.alt_min_coverage,
+        );
+        consumer.set_alt_candidate_sender(alt_cand_tx);
 
         // Automatic pool manager: add-market to Metis, extend the gRPC/shred
         // subscriptions, and manage ATAs — all at runtime, no restart. It holds
@@ -628,7 +613,7 @@ fn spawn_shred_arb(
                     ticker.tick().await;
                     let pools: Vec<(String, solana_sdk::pubkey::Pubkey)> = registry
                         .iter()
-                        .map(|e| (e.value().token_mint.to_string(), e.value().counter.pool))
+                        .map(|e| (e.value().token_mint.to_string(), e.value().meteora.pool))
                         .collect();
                     let rpc = rpc.clone();
                     let path = path.clone();
@@ -742,13 +727,6 @@ fn spawn_shred_arb(
             alt_fetcher,
             alt_registry,
         ));
-        // Blacklist: never trade these pools (parsed from config).
-        for s in &sa.blacklist_pools {
-            if let Ok(pk) = s.trim().parse::<solana_sdk::pubkey::Pubkey>() {
-                engine.blacklist_pool(pk);
-                eprintln!("[shred-arb] blacklisted pool {pk}");
-            }
-        }
         engine.clone().spawn_reporter();
         // Second opportunity source: re-assess all pairs from current state
         // every 200ms, not only when a Pump shred fires.

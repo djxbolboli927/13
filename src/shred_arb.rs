@@ -26,7 +26,7 @@ use crate::dex_ids::DexKind;
 use crate::jito::JitoClient;
 use crate::jito_grpc::JitoGrpcClient;
 use crate::metis::MetisClient;
-use crate::pool_registry::{ArbPair, PoolInfo};
+use crate::pool_registry::ArbPair;
 use crate::pool_state::PoolStateCache;
 use crate::pumpfun_math::PumpPool;
 use crate::rate_limiter::RateLimiter;
@@ -38,16 +38,6 @@ use crate::transaction;
 /// re-adding BOTH legs — a pool is disabled (only one leg ever loaded into
 /// Metis). Stops the endless No-routes spam; the reason is written to /root/g.
 const LOAD_RETRY_LIMIT: u32 = 10;
-
-/// Max public ALTs to attach per transaction. Competitors use ~2 on a 2-hop and
-/// 5-6 on a 4-hop; 3 is plenty of headroom for our Pump↔Meteora route while
-/// keeping the per-ALT (~34-byte) overhead in check.
-const MAX_ALTS_PER_TX: usize = 3;
-
-/// Diagnostic: simulate 1 in this many sent bundles against live chain state and
-/// log the REAL failure reason (slippage vs other) to the error log. Jito drops
-/// failing bundles silently, so this is how we learn WHY. 0 disables it.
-const SIM_SAMPLE_EVERY: u64 = 10;
 
 /// A raw price gap larger than this is never a real arb — it's a decode
 /// artifact or a one-sided dead pool. Real cross-pool gaps are a few percent.
@@ -69,8 +59,6 @@ pub struct ArbParams {
     /// Fraction of detected net profit paid to Jito as tip (0.20 = 20%).
     pub jito_tip_profit_fraction: f64,
     pub meteora_fee_bps: u64,
-    /// Fee (bps) used in the fast pre-check for constant-product counter venues.
-    pub cp_fee_bps: u64,
     /// Ignore observed trades whose SOL-side arg is below this (small trades
     /// barely move price).
     pub min_trigger_lamports: u64,
@@ -115,11 +103,6 @@ pub struct ArbParams {
     pub send_dedup_ms: u64,
     /// Seconds to wait before polling a sent tx's on-chain fate.
     pub status_check_delay_secs: u64,
-    /// If true, simulate every tx against LIVE chain state right before sending
-    /// and DROP it on any error (mainly 0x1771 slippage) — i.e. a competitor
-    /// moved the pool and our tx would revert (negative slippage). Positive
-    /// slippage passes. Costs one RPC round-trip of latency per send.
-    pub simulate_before_send: bool,
     /// Never tear a pool down (route failures no longer drop/close it). Kept for
     /// config symmetry; teardown is gated in main.rs, so it's not read here.
     #[allow(dead_code)]
@@ -162,17 +145,12 @@ pub struct ShredArbEngine {
     last_sent: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
     /// On-chain fate of sent txs.
     sent_stats: Arc<SentStats>,
-    /// Rolling counter used to sample pre-send simulations (diagnostic).
-    sim_sample: AtomicU64,
     /// Consecutive forced-quote route failures per pool. A pool that can't be
     /// routed on both venues repeatedly is dropped (see `ROUTE_FAIL_LIMIT`).
     route_fail: dashmap::DashMap<solana_sdk::pubkey::Pubkey, u32>,
     /// Consecutive "No routes found" load failures per pool while we retry
     /// add-market on BOTH legs. After `LOAD_RETRY_LIMIT` the pool is disabled.
     load_fail: dashmap::DashMap<solana_sdk::pubkey::Pubkey, u32>,
-    /// Last time a load-failure strike was counted per pool (strikes are
-    /// rate-limited to 1/s so a fresh pool gets real time to load into Metis).
-    load_fail_last: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
     /// Pools disabled after repeated failed Metis loads (only one leg ever
     /// loaded). Skipped in `assess` so they stop producing No-routes spam. Never
     /// closed (per never_close policy) — just not traded.
@@ -215,13 +193,6 @@ pub struct ShredArbEngine {
     /// Skipped at the last moment because the pool moved during our compute
     /// window (a competitor's trade landed) so the tx would now revert.
     nosend_preempted: AtomicU64,
-    /// Dropped by the pre-send simulation gate (would revert on live state,
-    /// mainly 0x1771 slippage).
-    nosend_sim_fail: AtomicU64,
-    /// Metis routed a leg through a DIFFERENT pool than the one we modelled
-    /// (token has several pools on that DEX) — our predicted profit was against
-    /// the wrong reserves, so we skip.
-    nosend_wrong_pool: AtomicU64,
     /// Best (max) net lamports the optimizer found in the current window,
     /// including negatives — shows how close we get when nothing is profitable.
     best_net_seen: AtomicI64,
@@ -231,7 +202,7 @@ pub struct ShredArbEngine {
 #[derive(Clone, Copy, PartialEq)]
 enum BuyOn {
     Pump,
-    Counter,
+    Meteora,
 }
 
 /// Everything needed to re-check, at the very last moment before sending,
@@ -244,9 +215,8 @@ struct Recheck {
     buy_on_pump: bool,
     token_is_a: bool,
     pump_after: PumpPool,
-    counter_info: PoolInfo,
+    met_pool: solana_sdk::pubkey::Pubkey,
     fallback_fee: u64,
-    cp_fee_bps: u64,
     amount_in: u64,
     /// Minimum WSOL out we need (input + network fee + tip).
     min_out: u64,
@@ -311,10 +281,8 @@ impl ShredArbEngine {
             last_fired: dashmap::DashMap::new(),
             last_sent: dashmap::DashMap::new(),
             sent_stats: Arc::new(SentStats::default()),
-            sim_sample: AtomicU64::new(0),
             route_fail: dashmap::DashMap::new(),
             load_fail: dashmap::DashMap::new(),
-            load_fail_last: dashmap::DashMap::new(),
             disabled: dashmap::DashSet::new(),
             signals_received: AtomicU64::new(0),
             skip_min_trigger: AtomicU64::new(0),
@@ -338,8 +306,6 @@ impl ShredArbEngine {
             nosend_too_locks: AtomicU64::new(0),
             nosend_send_err: AtomicU64::new(0),
             nosend_preempted: AtomicU64::new(0),
-            nosend_sim_fail: AtomicU64::new(0),
-            nosend_wrong_pool: AtomicU64::new(0),
             best_net_seen: AtomicI64::new(i64::MIN),
         }
     }
@@ -378,7 +344,7 @@ impl ShredArbEngine {
                 for (pool, pair) in pairs {
                     // Freshness: did any relevant account update recently?
                     let recent = [
-                        pair.counter.pool,
+                        pair.meteora.pool,
                         pair.pump.token_vault(),
                         pair.pump.wsol_vault(),
                     ]
@@ -396,15 +362,7 @@ impl ShredArbEngine {
                         None => continue,
                     };
                     // No prediction — price against the current Pump state.
-                    // Spawned per pool: NOTHING queues behind a slow send. One
-                    // pool's quote/build/send (hundreds of ms) must never delay
-                    // another pool's opportunity — an arb sent seconds late is
-                    // a guaranteed 0x1771. If the Jito rate limiter is full the
-                    // tx is dropped instantly inside execute(), never queued.
-                    let me = self.clone();
-                    tokio::spawn(async move {
-                        me.assess(&pair, pool, pump_now).await;
-                    });
+                    self.assess(&pair, pool, pump_now).await;
                 }
             }
         });
@@ -476,18 +434,17 @@ impl ShredArbEngine {
         }
         self.evaluated.fetch_add(1, Ordering::Relaxed);
 
-        // 2) Counter-venue state (Meteora DAMM v2 / Dynamic AMM / Raydium V4/CPMM).
+        // 2) Meteora state.
         // config fallback fee is in bps; convert to the 1e9-denominated numerator.
         let fallback_fee_numerator = self.params.meteora_fee_bps.saturating_mul(100_000);
-        let counter = match self.pool_state.counter_pool(
-            &pair.counter,
-            fallback_fee_numerator,
-            self.params.cp_fee_bps,
-        ) {
+        let meteora = match self
+            .pool_state
+            .meteora_pool(&pair.meteora.pool, fallback_fee_numerator)
+        {
             Some(m) => m,
             None => {
                 self.skip_no_meteora_state.fetch_add(1, Ordering::Relaxed);
-                debug!(pool = %pair.counter.pool, "counter state not cached yet");
+                debug!(pool = %pair.meteora.pool, "meteora state not cached yet");
                 return;
             }
         };
@@ -499,7 +456,7 @@ impl ShredArbEngine {
         } else {
             pump_after.quote_reserve as f64 / pump_after.base_reserve as f64
         };
-        let met_price = counter.token_price_in_sol(pair.counter.token_is_a);
+        let met_price = meteora.token_price_in_sol(pair.meteora.token_is_a, 0, 0);
         if met_price <= 0.0 {
             self.skip_bad_price.fetch_add(1, Ordering::Relaxed);
             return;
@@ -507,11 +464,11 @@ impl ShredArbEngine {
         let buy_on = if pump_price < met_price {
             BuyOn::Pump // token cheaper on pump
         } else {
-            BuyOn::Counter
+            BuyOn::Meteora
         };
 
         // 4) Optimal size.
-        let token_is_a = pair.counter.token_is_a;
+        let token_is_a = pair.meteora.token_is_a;
         let eval = |x: u64| -> Option<u64> {
             match buy_on {
                 BuyOn::Pump => {
@@ -519,10 +476,10 @@ impl ShredArbEngine {
                     if base_out == 0 {
                         return None;
                     }
-                    counter.sell_token_for_wsol(base_out, token_is_a)
+                    meteora.sell_token_for_wsol(base_out, token_is_a)
                 }
-                BuyOn::Counter => {
-                    let base_out = counter.buy_token_with_wsol(x, token_is_a)?;
+                BuyOn::Meteora => {
+                    let base_out = meteora.buy_token_with_wsol(x, token_is_a)?;
                     if base_out == 0 {
                         return None;
                     }
@@ -534,15 +491,10 @@ impl ShredArbEngine {
         // Profit GATE: the optimizer maximizes `out - x - required_extra`, where
         // `required_extra` is the minimum profit we insist on (default 5000 =
         // one network base fee). Direct sends pay only that fee, no Jito tip.
-        // The optimizer maximises `out - x - required_extra`. `required_extra`
-        // MUST be the FULL unavoidable cost of a landed tx — network fee AND the
-        // minimum Jito tip — otherwise we'd optimise (and detect) against a floor
-        // that's lower than the on-chain min-out and every marginal trade would
-        // revert. (This was the bug: detection used only the network fee, but the
-        // on-chain floor added the tip on top → guaranteed self-inflicted revert
-        // for any opportunity whose profit was below the tip.)
-        let required_extra =
-            self.params.network_fee_lamports + self.params.jito_tip_min_lamports;
+        // NOTE: this is only the gate — the on-chain minimum output is set to
+        // exactly the input (break-even) at send time, so a trade that clears
+        // the gate at predict time still lands as long as it doesn't lose money.
+        let required_extra = self.params.min_net_profit_lamports;
 
         // Ceiling on trade size: never add more WSOL than a fraction of the
         // BUY pool's current WSOL reserve (keeps the swap in a valid range and
@@ -552,7 +504,7 @@ impl ShredArbEngine {
         // the real "optimal volume".
         let buy_wsol_reserve = match buy_on {
             BuyOn::Pump => pump_after.quote_reserve,
-            BuyOn::Counter => counter.wsol_reserve(token_is_a),
+            BuyOn::Meteora => meteora.wsol_reserve(token_is_a),
         };
         // Dead-pool guards — skip empty/broken pools early (they were flooding
         // the logs and wasting cycles): the BUY side must hold real WSOL depth,
@@ -594,7 +546,7 @@ impl ShredArbEngine {
                 gap_pct,
                 pump_after_price = pump_price,
                 met_price,
-                met_wsol_depth = counter.wsol_reserve(token_is_a),
+                met_wsol_depth = meteora.wsol_reserve(token_is_a),
                 buy_wsol_reserve,
                 hi,
                 opt_x,
@@ -627,29 +579,12 @@ impl ShredArbEngine {
                 return;
             }
         };
-        // ── Two-stage profit gate (exactly the flow you described) ──
-        // Base cost of a landed tx = input + network fee + the MINIMUM Jito tip.
-        // Example: buy 1 SOL → base cost = 1 SOL + 5000 + 1000 = 1 SOL + 6000.
-        let network_fee = self.params.network_fee_lamports;
-        let base_cost = network_fee + self.params.jito_tip_min_lamports;
-        // Stage 1 — initial filter (this is min_net_profit's ONLY role, NOT the
-        // send floor): the profit OVER the base cost must clear the worth-it
-        // minimum. If output = 1 SOL + 7000, profit_over_base = 1000.
-        let profit_over_base = best_out.saturating_sub(best_x + base_cost);
-        if profit_over_base < self.params.min_net_profit_lamports.max(1) {
+        let profit_floor = best_x + required_extra;
+        if best_out <= profit_floor {
             self.not_profitable.fetch_add(1, Ordering::Relaxed);
-            return;
+            return; // predicted profit below the minimum gate
         }
-        // Stage 2 — hand a share of the REMAINING profit to Jito as EXTRA tip and
-        // keep the rest. tip = min_tip + frac·profit_over_base (frac=0 ⇒ fixed
-        // tip = min_tip). Example: extra = 20%·1000 = 200 → tip = 1200, kept =
-        // 800. The on-chain floor becomes input + fee + tip = best_out - kept, so
-        // the quote ALWAYS clears its own floor; only a competitor moving the
-        // pool first can revert a sent tx — never our own arithmetic.
-        let frac = self.params.jito_tip_profit_fraction.max(0.0);
-        let extra_tip = (profit_over_base as f64 * frac) as u64;
-        let tip = self.params.jito_tip_min_lamports + extra_tip;
-        let net = profit_over_base - extra_tip; // profit we actually keep
+        let net = best_out - profit_floor;
 
         // Plausibility guard: a real cross-pool gap is small. A predicted net
         // above `max_profit_fraction` of the input is always a dead-pool
@@ -664,20 +599,9 @@ impl ShredArbEngine {
         self.profitable.fetch_add(1, Ordering::Relaxed);
 
         let (buy_kind, sell_kind) = match buy_on {
-            BuyOn::Pump => (pair.pump.kind, pair.counter.kind),
-            BuyOn::Counter => (pair.counter.kind, pair.pump.kind),
+            BuyOn::Pump => (DexKind::PumpFunAmm, DexKind::MeteoraDammV2),
+            BuyOn::Meteora => (DexKind::MeteoraDammV2, DexKind::PumpFunAmm),
         };
-        // Diagnostic fields so we can PROVE (with data, not guesses) why a trade
-        // is detected as profitable: the raw prices + gap we computed, the depth
-        // of the counter (shallow) pool we'd trade against, and how stale that
-        // counter state is. If gap_pct is smaller than the fees yet net>0, or the
-        // counter state is old, the numbers show exactly where the model is off.
-        let counter_wsol = counter.wsol_reserve(token_is_a);
-        let counter_age_ms = self
-            .pool_state
-            .last_update_age(&pair.counter.pool)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(u64::MAX);
         info!(
             pool = %pool,
             token = %pair.token_mint,
@@ -685,26 +609,23 @@ impl ShredArbEngine {
             input = best_x,
             predicted_out = best_out,
             net_lamports = net,
-            gap_pct = format!("{:.4}", gap_pct),
-            pump_price = format!("{:.9}", pump_price),
-            counter_price = format!("{:.9}", met_price),
-            counter_wsol_reserve = counter_wsol,
-            counter_age_ms,
             "shred-arb opportunity"
         );
 
         self.last_fired.insert(pool, Instant::now());
-        // `tip` was derived above from the surplus; the on-chain output floor is
-        // input + network fee + tip, which by construction equals best_out - net
-        // (≤ best_out) — so a detected opportunity always clears its own floor.
-        let onchain_floor = best_x + network_fee + tip;
+        // Jito tip = min tip + a share of the detected profit (e.g. 1000 + 20%).
+        // On-chain output floor = input + network fee + tip, so the tx reverts
+        // unless it at least covers the fee and the tip (we keep the rest). Only
+        // opportunities whose realized profit exceeds fee+tip actually land.
+        let tip = self.params.jito_tip_min_lamports
+            + (net as f64 * self.params.jito_tip_profit_fraction) as u64;
+        let onchain_floor = best_x + self.params.network_fee_lamports + tip;
         let recheck = Recheck {
             buy_on_pump: buy_on == BuyOn::Pump,
             token_is_a,
             pump_after,
-            counter_info: pair.counter.clone(),
+            met_pool: pair.meteora.pool,
             fallback_fee: fallback_fee_numerator,
-            cp_fee_bps: self.params.cp_fee_bps,
             amount_in: best_x,
             min_out: onchain_floor,
         };
@@ -782,40 +703,8 @@ impl ShredArbEngine {
         self.load_fail.remove(&pool);
         self.note_route_success(pool);
 
-        // Verify Metis routed each leg through the EXACT pool we modelled. The
-        // `dexes=` filter only pins the DEX, not the pool — a token with several
-        // pools on one venue (common on Meteora) can route through a DIFFERENT
-        // pool than the one we detected the gap on, so our predicted profit is
-        // against the wrong reserves and the tx reverts. If either leg didn't
-        // route through our pool, skip (the opportunity is not real for us).
-        let (pump_q, counter_q) = if buy_kind == pair.pump.kind {
-            (&q1, &q2)
-        } else {
-            (&q2, &q1)
-        };
-        let pump_ok = route_first_amm_key(pump_q)
-            .map(|k| k == pair.pump.pool.to_string())
-            .unwrap_or(false);
-        let counter_ok = route_first_amm_key(counter_q)
-            .map(|k| k == pair.counter.pool.to_string())
-            .unwrap_or(false);
-        if !pump_ok || !counter_ok {
-            self.nosend_wrong_pool.fetch_add(1, Ordering::Relaxed);
-            crate::errlog::log(
-                "not-sent",
-                &format!(
-                    "token={token} reason=routed-wrong-pool pump_ok={pump_ok} counter_ok={counter_ok} \
-                     want_pump={} want_counter={}",
-                    pair.pump.pool, pair.counter.pool
-                ),
-            );
-            return;
-        }
-
-        // Set the on-chain floor to exactly the input + fee + tip (break-even+)
-        // regardless of what Metis quoted — our shred-driven data is AHEAD of
-        // Metis (it hasn't ingested the observed trade yet), so we only take the
-        // instruction skeleton from Metis and override the amounts ourselves.
+        // Set the on-chain floor to exactly the input (break-even) regardless of
+        // what Metis quoted (our data is ahead of Metis).
         let merged = match MetisClient::merge_quotes(&q1, &q2, floor) {
             Ok(m) => m,
             Err(e) => {
@@ -843,9 +732,16 @@ impl ShredArbEngine {
             }
         };
 
+        // Record the REAL route-account set for this pool so the ALT registry
+        // scores harvested competitor tables against exactly what THIS tx must
+        // compress (shared program/config/mint accounts included), not just the
+        // pool/vault pubkeys. This is what makes a harvested ALT actually reduce
+        // our tx size instead of contributing zero used entries.
+        self.alt_registry
+            .record_route_accounts(pool, harvest_accounts(&swap_ixs));
+
         // Teach our self-learning ALT every account in this route so subsequent
         // txs for this pool compress fully. Cheap: only unseen pubkeys enqueue.
-        // (Off by default — the library selector below is the primary path.)
         if let Some(ab) = &self.alt_builder {
             ab.note(harvest_accounts(&swap_ixs));
         }
@@ -860,21 +756,19 @@ impl ShredArbEngine {
         let alt = self.alt_cache.clone();
         let rpc = self.rpc_client.clone();
         let cu = self.params.cu_limit;
-        // Pick the best public ALTs to compress THIS tx. We look at the REAL
-        // account list Metis just returned and select (from the global library
-        // harvested off the network) the fewest tables covering the most of it —
-        // exactly how competitors reuse public ALTs. Compression happens here in
-        // our v0 build, independent of Metis. Fallback (empty library / cold
-        // start): a free provider ALT and any ALT recorded on the pool itself.
-        let route_set: std::collections::HashSet<solana_sdk::pubkey::Pubkey> =
-            harvest_accounts(&swap_ixs).into_iter().collect();
-        let mut extra_alts: Vec<solana_sdk::pubkey::Pubkey> =
-            self.alt_registry.select(&route_set, MAX_ALTS_PER_TX);
+        // ALTs folded into the tx so route accounts compress from 32 static bytes
+        // to a 1-byte index. Priority: the single max-coverage ALT the registry
+        // harvested for this pool from competitor shreds; then (as fallback) a
+        // free provider ALT and any ALT recorded on the pool itself.
+        let mut extra_alts: Vec<solana_sdk::pubkey::Pubkey> = Vec::new();
+        if let Some(a) = self.alt_registry.best_for(&pool) {
+            extra_alts.push(a);
+        }
         if extra_alts.is_empty() {
             if let Some(f) = &self.alt_fetcher {
                 extra_alts = f.tables_for(&pool);
             }
-            for a in [pair.pump.alt, pair.counter.alt].into_iter().flatten() {
+            for a in [pair.pump.alt, pair.meteora.alt].into_iter().flatten() {
                 if !extra_alts.contains(&a) {
                     extra_alts.push(a);
                 }
@@ -948,7 +842,7 @@ impl ShredArbEngine {
                     &format!(
                         "token={token} reason=tx-too-large bytes={raw} locks={locks} \
                          alts_used={alts_used} pump_alt={:?} met_alt={:?}",
-                        pair.pump.alt, pair.counter.alt
+                        pair.pump.alt, pair.meteora.alt
                     ),
                 );
                 return;
@@ -1084,76 +978,6 @@ impl ShredArbEngine {
             return;
         }
 
-        // Pre-send negative-slippage gate: simulate against LIVE chain state
-        // right before sending. If a competitor moved the pool so our min-out no
-        // longer clears, the sim reverts with 0x1771 (slippage) — DROP instead of
-        // sending a doomed bundle that just burns our rate limit. Positive
-        // slippage (better price) passes the sim, so only negative slippage is
-        // filtered. Costs one RPC round-trip; toggle with `simulate_before_send`.
-        if self.params.simulate_before_send {
-            let rpc_sim = self.rpc_client.clone();
-            let tx_sim = tx.clone();
-            let sim = tokio::task::spawn_blocking(move || {
-                use solana_client::rpc_config::RpcSimulateTransactionConfig;
-                rpc_sim.simulate_transaction_with_config(
-                    &tx_sim,
-                    RpcSimulateTransactionConfig {
-                        sig_verify: false,
-                        replace_recent_blockhash: true,
-                        ..Default::default()
-                    },
-                )
-            })
-            .await;
-            // Only a definite program error blocks the send; an RPC hiccup
-            // (Err) falls through so a transient failure doesn't stall trading.
-            if let Ok(Ok(resp)) = sim {
-                if let Some(err) = resp.value.err {
-                    self.nosend_sim_fail.fetch_add(1, Ordering::Relaxed);
-                    let tail: Vec<String> = resp
-                        .value
-                        .logs
-                        .as_ref()
-                        .map(|l| l.iter().rev().take(2).cloned().collect())
-                        .unwrap_or_default();
-                    crate::errlog::log(
-                        "not-sent",
-                        &format!("token={token} reason=sim-would-revert err={err:?} logs={tail:?}"),
-                    );
-                    return;
-                }
-            }
-        } else if SIM_SAMPLE_EVERY > 0
-            && self.sim_sample.fetch_add(1, Ordering::Relaxed) % SIM_SAMPLE_EVERY == 0
-        {
-            // Gate off → keep a sampled diagnostic so we still see WHY bundles
-            // drop (auction loss vs revert). Spawned; never delays the send.
-            let rpc_sim = self.rpc_client.clone();
-            let tx_sim = tx.clone();
-            let tok = token.clone();
-            tokio::spawn(async move {
-                let res = tokio::task::spawn_blocking(move || {
-                    use solana_client::rpc_config::RpcSimulateTransactionConfig;
-                    rpc_sim.simulate_transaction_with_config(
-                        &tx_sim,
-                        RpcSimulateTransactionConfig {
-                            sig_verify: false,
-                            replace_recent_blockhash: true,
-                            ..Default::default()
-                        },
-                    )
-                })
-                .await;
-                if let Ok(Ok(resp)) = res {
-                    let v = resp.value;
-                    crate::errlog::log(
-                        "sim",
-                        &format!("token={tok} sim_err={:?} units={:?}", v.err, v.units_consumed),
-                    );
-                }
-            });
-        }
-
         // Signature of the swap tx — used to check whether the bundle actually
         // landed (Jito accepting a bundle ≠ it landing; it may lose the auction
         // or its tx may revert). Without this the Jito path is blind.
@@ -1192,23 +1016,13 @@ impl ShredArbEngine {
         }
     }
 
-    /// Permanently skip a pool (blacklist). Reuses the `disabled` set that
-    /// `assess` already short-circuits on, so no tx is ever built for it.
-    pub fn blacklist_pool(&self, pool: solana_sdk::pubkey::Pubkey) {
-        self.disabled.insert(pool);
-    }
-
     /// Final gate: using the LATEST cached Meteora state, would the trade still
     /// clear `min_out`? Returns false if a competitor moved the pool against us
     /// during the compute window (the tx would revert). If we have no fresh
     /// Meteora reading we do NOT block (return true) — better to try than to
     /// stall on a cache gap.
     fn still_profitable(&self, r: &Recheck) -> bool {
-        let met = match self.pool_state.counter_pool(
-            &r.counter_info,
-            r.fallback_fee,
-            r.cp_fee_bps,
-        ) {
+        let met = match self.pool_state.meteora_pool(&r.met_pool, r.fallback_fee) {
             Some(m) => m,
             None => return true,
         };
@@ -1227,14 +1041,11 @@ impl ShredArbEngine {
         matches!(out, Some(o) if o >= r.min_out)
     }
 
-    /// The configurable Metis `dexes=` label for a venue. Pump and the classic
-    /// Meteora DAMM v2 come from config (so they can be tuned); the newer venues
-    /// use their built-in `dex_ids` label.
+    /// The configurable Metis `dexes=` label for a venue.
     fn label_for(&self, kind: DexKind) -> &str {
         match kind {
             DexKind::PumpFunAmm => &self.params.pump_label,
             DexKind::MeteoraDammV2 => &self.params.meteora_label,
-            other => other.metis_label(),
         }
     }
 
@@ -1250,19 +1061,6 @@ impl ShredArbEngine {
         venue: &str,
         err: &str,
     ) {
-        // Rate-limit strikes to one per second. The 200ms state evaluator would
-        // otherwise burn all LOAD_RETRY_LIMIT strikes in ~2s — disabling a hot,
-        // freshly-discovered pool before Metis has even finished indexing its
-        // markets (the "sees opportunities but never sends" symptom). One strike
-        // per second means a pool gets ≥ LOAD_RETRY_LIMIT seconds to load.
-        let now = Instant::now();
-        {
-            let mut last = self.load_fail_last.entry(pool).or_insert(now);
-            if *last != now && last.elapsed() < Duration::from_secs(1) {
-                return;
-            }
-            *last = now;
-        }
         let n = {
             let mut e = self.load_fail.entry(pool).or_insert(0);
             *e += 1;
@@ -1270,7 +1068,7 @@ impl ShredArbEngine {
         };
         // Re-add BOTH markets so a half-loaded pair gets its missing leg.
         self.readd_market(pair, DexKind::PumpFunAmm).await;
-        self.readd_market(pair, pair.counter.kind).await;
+        self.readd_market(pair, DexKind::MeteoraDammV2).await;
         if n >= LOAD_RETRY_LIMIT {
             self.disabled.insert(pool);
             self.load_fail.remove(&pool);
@@ -1279,8 +1077,8 @@ impl ShredArbEngine {
                 "error",
                 &format!(
                     "token={} pool={} reason=disabled-after-{}-load-failures leg={leg} venue={venue} \
-                     pump_pool={} counter_pool={} last_err={err}",
-                    pair.token_mint, pool, n, pair.pump.pool, pair.counter.pool
+                     pump_pool={} meteora_pool={} last_err={err}",
+                    pair.token_mint, pool, n, pair.pump.pool, pair.meteora.pool
                 ),
             );
         } else {
@@ -1299,13 +1097,10 @@ impl ShredArbEngine {
     /// restarted. Cheap and idempotent; the route-failure counter still drops
     /// the pool if it keeps failing.
     async fn readd_market(&self, pair: &ArbPair, kind: DexKind) {
-        // `kind` is either the pump leg or the counter leg of this pair.
-        let info = if kind == pair.pump.kind {
-            &pair.pump
-        } else {
-            &pair.counter
+        let (info, owner) = match kind {
+            DexKind::PumpFunAmm => (&pair.pump, crate::dex_ids::PUMPFUN_AMM_PROGRAM),
+            DexKind::MeteoraDammV2 => (&pair.meteora, crate::dex_ids::METEORA_DAMM_V2_PROGRAM),
         };
-        let owner = info.kind.program_str();
         let alt = info.alt.map(|a| a.to_string());
         if let Err(e) = self
             .metis
@@ -1342,7 +1137,7 @@ impl ShredArbEngine {
                     "\n[shred-arb 30s] watching_pools={}\n\
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} bad_price={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
-                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={} sim_fail={} wrong_pool={}",
+                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
                     self.profitable.load(Ordering::Relaxed),
@@ -1365,8 +1160,6 @@ impl ShredArbEngine {
                     self.nosend_too_locks.load(Ordering::Relaxed),
                     self.nosend_send_err.load(Ordering::Relaxed),
                     self.nosend_preempted.load(Ordering::Relaxed),
-                    self.nosend_sim_fail.load(Ordering::Relaxed),
-                    self.nosend_wrong_pool.load(Ordering::Relaxed),
                 );
             }
         });
@@ -1462,23 +1255,10 @@ fn harvest_accounts(
     out
 }
 
-/// The `ammKey` (pool) of the FIRST hop in a Metis quote's route plan. For our
-/// single-hop forced quotes this is the pool Metis actually routed through.
-fn route_first_amm_key(q: &crate::metis::QuoteResponse) -> Option<String> {
-    q.route_plan
-        .as_array()?
-        .first()?
-        .get("swapInfo")?
-        .get("ammKey")?
-        .as_str()
-        .map(|s| s.to_string())
-}
-
 fn buy_kind_label(k: DexKind) -> &'static str {
     match k {
         DexKind::PumpFunAmm => "PumpFun",
         DexKind::MeteoraDammV2 => "Meteora",
-        other => other.short(),
     }
 }
 
