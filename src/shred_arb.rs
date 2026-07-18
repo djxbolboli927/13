@@ -130,6 +130,10 @@ pub struct ArbParams {
     /// "Instructions++": serve repeat routes from the in-RAM instruction cache
     /// instead of calling Metis. Off = always fetch from Metis.
     pub instructions_pp: bool,
+    /// Worst-case Meteora fee: price the volatility (dynamic) fee at the pool's
+    /// `max_volatility_accumulator` ceiling instead of the stored value, so the
+    /// fee is never understated (kills phantom profit). Toggle in config.
+    pub meteora_fee_worst_case: bool,
     /// Never tear a pool down (route failures no longer drop/close it). Kept for
     /// config symmetry; teardown is gated in main.rs, so it's not read here.
     #[allow(dead_code)]
@@ -400,7 +404,7 @@ impl ShredArbEngine {
                     }
                     let pump_now = match self
                         .pool_state
-                        .pump_pool(&pair.pump.token_vault(), &pair.pump.wsol_vault())
+                        .pump_pool(&pair.pump.token_vault(), &pair.pump.wsol_vault(), &pair.token_mint)
                     {
                         Some(p) => p,
                         None => continue,
@@ -439,7 +443,7 @@ impl ShredArbEngine {
         // vaults are identical across every pair of this pool).
         let pump_now = match self
             .pool_state
-            .pump_pool(&first.pump.token_vault(), &first.pump.wsol_vault())
+            .pump_pool(&first.pump.token_vault(), &first.pump.wsol_vault(), &first.token_mint)
         {
             Some(p) => p,
             None => {
@@ -504,7 +508,7 @@ impl ShredArbEngine {
         let fallback_fee_numerator = self.params.meteora_fee_bps.saturating_mul(100_000);
         let meteora = match self
             .pool_state
-            .meteora_pool(&pair.meteora.pool, fallback_fee_numerator)
+            .meteora_pool(&pair.meteora.pool, fallback_fee_numerator, self.params.meteora_fee_worst_case)
         {
             Some(m) => m,
             None => {
@@ -1177,7 +1181,7 @@ impl ShredArbEngine {
     /// Meteora reading we do NOT block (return true) — better to try than to
     /// stall on a cache gap.
     fn still_profitable(&self, r: &Recheck) -> bool {
-        let met = match self.pool_state.meteora_pool(&r.met_pool, r.fallback_fee) {
+        let met = match self.pool_state.meteora_pool(&r.met_pool, r.fallback_fee, self.params.meteora_fee_worst_case) {
             Some(m) => m,
             None => return true,
         };
@@ -1271,6 +1275,66 @@ impl ShredArbEngine {
         if self.route_fail.contains_key(&key) {
             self.route_fail.remove(&key);
         }
+    }
+
+    /// Periodic fee-audit log: for a sample of tracked pairs, print the decoded
+    /// Meteora fee breakdown (base scheduler + dynamic, stored vs worst-case)
+    /// and the Pump.fun tiered fee, so the operator can hand-verify the fees
+    /// against a real on-chain swap on those pools. Off when `secs == 0`.
+    pub fn spawn_fee_audit(self: Arc<Self>, secs: u64) {
+        if secs == 0 {
+            return;
+        }
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(secs.max(10)));
+            ticker.tick().await; // skip immediate first tick
+            loop {
+                ticker.tick().await;
+                let pairs: Vec<ArbPair> = self
+                    .registry
+                    .iter()
+                    .flat_map(|e| e.value().clone())
+                    .take(200)
+                    .collect();
+                let mut printed = 0usize;
+                for pair in pairs {
+                    // Only pairs whose Meteora fee we can currently decode.
+                    let Some(fb) = self.pool_state.meteora_fee_breakdown(&pair.meteora.pool)
+                    else {
+                        continue;
+                    };
+                    let pump = self.pool_state.pump_pool(
+                        &pair.pump.token_vault(),
+                        &pair.pump.wsol_vault(),
+                        &pair.token_mint,
+                    );
+                    let pump_fee_bps = pump.map(|p| p.total_fee_bps).unwrap_or(0);
+                    let supply = self.pool_state.spl_mint_supply(&pair.token_mint).unwrap_or(0);
+                    eprintln!(
+                        "[fee-audit] token={} | PUMP pool={} fee={}bps supply={} | METEORA pool={} \
+                         cliff={:.1}bps base={:.1}bps dyn_now={:.1}bps dyn_worst={:.1}bps \
+                         TOTAL now={:.1}bps worst={:.1}bps dyn_enabled={} | meteora_using={}",
+                        pair.token_mint,
+                        pair.pump.pool,
+                        pump_fee_bps,
+                        supply,
+                        pair.meteora.pool,
+                        fb.cliff_bps,
+                        fb.base_bps,
+                        fb.dyn_stored_bps,
+                        fb.dyn_worst_bps,
+                        fb.total_stored_bps,
+                        fb.total_worst_bps,
+                        fb.dynamic_enabled,
+                        if self.params.meteora_fee_worst_case { "WORST" } else { "now" },
+                    );
+                    printed += 1;
+                    if printed >= 12 {
+                        break; // cap the log volume per tick
+                    }
+                }
+            }
+        });
     }
 
     pub fn spawn_reporter(self: Arc<Self>) {

@@ -237,6 +237,15 @@ pub struct ShredArbConfig {
     /// route cache (skip Metis on repeat opportunities). true = on.
     #[serde(default = "default_true", rename = "Instructions++")]
     pub instructions_pp: bool,
+    /// Worst-case Meteora fee: price the volatility (dynamic) fee at the pool's
+    /// `max_volatility_accumulator` ceiling so the fee is never understated
+    /// (kills phantom profit on volatile new pools). Default false.
+    #[serde(default)]
+    pub meteora_fee_worst_case: bool,
+    /// Seconds between fee-audit log lines (decoded fee per tracked pair, for
+    /// hand-verification against real on-chain swaps). 0 = off. Default 120.
+    #[serde(default = "default_fee_audit_log_secs")]
+    pub fee_audit_log_secs: u64,
     /// Seconds to wait after a direct send before polling the tx's on-chain fate.
     #[serde(default = "default_status_check_delay_secs")]
     pub status_check_delay_secs: u64,
@@ -325,6 +334,10 @@ fn default_idle_tokens_path() -> String {
 fn default_send_dedup_ms() -> u64 {
     150
 }
+
+fn default_fee_audit_log_secs() -> u64 {
+    120
+}
 fn default_status_check_delay_secs() -> u64 {
     12
 }
@@ -387,6 +400,8 @@ impl Default for ShredArbConfig {
             min_trigger_reserve_frac: 0.0,
             send_dedup_ms: default_send_dedup_ms(),
             instructions_pp: true,
+            meteora_fee_worst_case: false,
+            fee_audit_log_secs: default_fee_audit_log_secs(),
             status_check_delay_secs: default_status_check_delay_secs(),
             error_log_dir: default_error_log_dir(),
             target_wallets: Vec::new(),

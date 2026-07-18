@@ -71,6 +71,7 @@ const MET_OFF_NUM_PERIOD: usize = 22;
 const MET_OFF_PERIOD_FREQ: usize = 24;
 const MET_OFF_REDUCTION: usize = 32;
 const MET_OFF_DYN_INIT: usize = 56;
+const MET_OFF_DYN_MAX_VOL_ACC: usize = 64;
 const MET_OFF_DYN_VFC: usize = 68;
 const MET_OFF_DYN_BIN_STEP: usize = 72;
 const MET_OFF_DYN_VOL_ACC: usize = 120;
@@ -144,7 +145,20 @@ fn read_u16_le(data: &[u8], off: usize) -> Option<u16> {
 /// compounding curve, unknown scheduler/fee version, or garbage read) — the
 /// caller must SKIP the pool, never fall back to a cheaper config fee (that
 /// exact fallback is what produced streams of fake-profit sends).
-fn meteora_total_fee_numerator(data: &[u8], current_slot: u64) -> Option<u64> {
+/// Breakdown of a Meteora pool's decoded fee, for the audit log so the operator
+/// can hand-verify against a real on-chain swap.
+#[derive(Clone, Copy, Debug)]
+pub struct MetFeeBreakdown {
+    pub cliff_bps: f64,
+    pub base_bps: f64,
+    pub dyn_stored_bps: f64,
+    pub dyn_worst_bps: f64,
+    pub total_stored_bps: f64,
+    pub total_worst_bps: f64,
+    pub dynamic_enabled: bool,
+}
+
+fn meteora_total_fee_numerator(data: &[u8], current_slot: u64, worst_case: bool) -> Option<u64> {
     // Pool must be enabled (pool_status 0) — a disabled pool reverts all swaps.
     if data.get(MET_OFF_POOL_STATUS).copied().unwrap_or(1) != 0 {
         return None;
@@ -201,29 +215,86 @@ fn meteora_total_fee_numerator(data: &[u8], current_slot: u64) -> Option<u64> {
     }
 
     // ── Dynamic (volatility) fee ──
-    // Priced from the pool's currently-stored `volatility_accumulator` (the
-    // live on-chain value we observe). NOTE: the program recomputes this at
-    // swap execution time, so a large trade during a burst can pay a somewhat
-    // higher dynamic fee than this snapshot implies — kept as-is per the manual
-    // model; tighten later if needed.
-    let mut dynamic: u64 = 0;
-    if data.get(MET_OFF_DYN_INIT).copied().unwrap_or(0) != 0 {
-        let vfc = read_u32_le(data, MET_OFF_DYN_VFC).unwrap_or(0) as u128;
-        let bin_step = read_u16_le(data, MET_OFF_DYN_BIN_STEP).unwrap_or(0) as u128;
-        let vol_acc = read_u128_le(data, MET_OFF_DYN_VOL_ACC).unwrap_or(0);
-        if vfc > 0 && bin_step > 0 && vol_acc > 0 {
-            let vfa = vol_acc.saturating_mul(bin_step);
-            let square = vfa.saturating_mul(vfa);
-            let v_fee = square.saturating_mul(vfc);
-            dynamic = v_fee
-                .saturating_add(99_999_999_999)
-                .checked_div(100_000_000_000)
-                .unwrap_or(0)
-                .min(max_fee as u128) as u64;
-        }
-    }
-
+    // The on-chain program RECOMPUTES `volatility_accumulator` at swap time
+    // (volatility_reference + price-move-in-bins, capped at
+    // `max_volatility_accumulator`), so a big trade pays MORE than the stored
+    // snapshot implies. Two modes:
+    //   worst_case = true  → price at `max_volatility_accumulator` (hard ceiling
+    //                        → the fee can never be understated → no fake profit)
+    //   worst_case = false → price at the currently-stored `volatility_accumulator`
+    let dynamic = meteora_dynamic_fee(data, worst_case, max_fee);
     Some(base.saturating_add(dynamic).min(max_fee))
+}
+
+/// Dynamic (volatility) fee numerator for a Meteora pool, from either the stored
+/// or the worst-case (max) volatility accumulator.
+fn meteora_dynamic_fee(data: &[u8], worst_case: bool, max_fee: u64) -> u64 {
+    if data.get(MET_OFF_DYN_INIT).copied().unwrap_or(0) == 0 {
+        return 0;
+    }
+    let vfc = read_u32_le(data, MET_OFF_DYN_VFC).unwrap_or(0) as u128;
+    let bin_step = read_u16_le(data, MET_OFF_DYN_BIN_STEP).unwrap_or(0) as u128;
+    let vol_acc = if worst_case {
+        read_u32_le(data, MET_OFF_DYN_MAX_VOL_ACC).unwrap_or(0) as u128
+    } else {
+        read_u128_le(data, MET_OFF_DYN_VOL_ACC).unwrap_or(0)
+    };
+    if vfc == 0 || bin_step == 0 || vol_acc == 0 {
+        return 0;
+    }
+    let vfa = vol_acc.saturating_mul(bin_step);
+    let square = vfa.saturating_mul(vfa);
+    let v_fee = square.saturating_mul(vfc);
+    v_fee
+        .saturating_add(99_999_999_999)
+        .checked_div(100_000_000_000)
+        .unwrap_or(0)
+        .min(max_fee as u128) as u64
+}
+
+/// Compute the base (scheduler) fee numerator alone, for the audit breakdown.
+fn meteora_base_fee_numerator(data: &[u8], current_slot: u64) -> Option<u64> {
+    let max_fee = match data.get(MET_OFF_FEE_VERSION).copied().unwrap_or(0) {
+        0 => MAX_FEE_NUMERATOR_V0,
+        1 => MAX_FEE_NUMERATOR_V1,
+        _ => return None,
+    };
+    let cliff = read_u64_le(data, MET_OFF_CLIFF_FEE)?;
+    if cliff == 0 || cliff > max_fee {
+        return None;
+    }
+    let mode = data.get(MET_OFF_SCHED_MODE).copied().unwrap_or(0);
+    if mode > 1 {
+        return None;
+    }
+    let mut base = cliff;
+    let period_freq = read_u64_le(data, MET_OFF_PERIOD_FREQ).unwrap_or(0);
+    if period_freq > 0 {
+        let num_period = read_u16_le(data, MET_OFF_NUM_PERIOD).unwrap_or(0) as u64;
+        let reduction = read_u64_le(data, MET_OFF_REDUCTION).unwrap_or(0);
+        let activation_point = read_u64_le(data, MET_OFF_ACTIVATION_POINT).unwrap_or(0);
+        let activation_type = data.get(MET_OFF_ACTIVATION_TYPE).copied().unwrap_or(0);
+        let current_point = if activation_type == 1 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        } else {
+            current_slot
+        };
+        let period = if current_point == 0 {
+            0
+        } else {
+            (current_point.saturating_sub(activation_point) / period_freq).min(num_period)
+        };
+        base = if mode == 1 {
+            let r = (reduction.min(BASIS_POINT_MAX) as f64) / BASIS_POINT_MAX as f64;
+            ((cliff as f64) * (1.0 - r).powi(period.min(u16::MAX as u64) as i32)).ceil() as u64
+        } else {
+            cliff.saturating_sub(reduction.saturating_mul(period))
+        };
+    }
+    Some(base)
 }
 
 impl PoolStateCache {
@@ -316,7 +387,12 @@ impl PoolStateCache {
     /// Returns `None` if the decoded state is not tradeable — a drained pool
     /// (`liquidity == 0`), a sqrt-price outside the on-chain valid range, or a
     /// mangled/partial read — so the engine never sizes a trade off garbage.
-    pub fn meteora_pool(&self, pool: &Pubkey, _fallback_fee_numerator: u64) -> Option<MeteoraPool> {
+    pub fn meteora_pool(
+        &self,
+        pool: &Pubkey,
+        _fallback_fee_numerator: u64,
+        worst_case_fee: bool,
+    ) -> Option<MeteoraPool> {
         let entry = self.inner.get(pool)?;
         let data = entry.value();
         // Current TOTAL fee: scheduler-adjusted base fee + volatility-based
@@ -325,7 +401,7 @@ impl PoolStateCache {
         // unknown scheduler/fee version), the pool is untradeable — never fall
         // back to a cheaper config fee (that fallback fabricated profit).
         let fee_numerator =
-            meteora_total_fee_numerator(data, self.slot.load(Ordering::Relaxed))?;
+            meteora_total_fee_numerator(data, self.slot.load(Ordering::Relaxed), worst_case_fee)?;
         // Compounding pools (collect_fee_mode 2) use plain x*y=k on tracked
         // reserves, NOT the sqrt-price curve below — reject them.
         let collect_fee_mode = data.get(MET_OFF_COLLECT_FEE_MODE).copied().unwrap_or(0);
@@ -355,6 +431,34 @@ impl PoolStateCache {
         Some(p)
     }
 
+    /// Fee breakdown for a Meteora pool (bps), for the operator audit log.
+    /// Returns None if the pool isn't cached / not decodable.
+    pub fn meteora_fee_breakdown(&self, pool: &Pubkey) -> Option<MetFeeBreakdown> {
+        let entry = self.inner.get(pool)?;
+        let data = entry.value();
+        let slot = self.slot.load(Ordering::Relaxed);
+        let max_fee = match data.get(MET_OFF_FEE_VERSION).copied().unwrap_or(0) {
+            0 => MAX_FEE_NUMERATOR_V0,
+            1 => MAX_FEE_NUMERATOR_V1,
+            _ => return None,
+        };
+        // numerator (1e9 denom) → bps (1e4 denom): / 1e5.
+        let to_bps = |n: u64| n as f64 / 100_000.0;
+        let cliff = read_u64_le(data, MET_OFF_CLIFF_FEE).unwrap_or(0);
+        let base = meteora_base_fee_numerator(data, slot).unwrap_or(cliff);
+        let dyn_stored = meteora_dynamic_fee(data, false, max_fee);
+        let dyn_worst = meteora_dynamic_fee(data, true, max_fee);
+        Some(MetFeeBreakdown {
+            cliff_bps: to_bps(cliff),
+            base_bps: to_bps(base),
+            dyn_stored_bps: to_bps(dyn_stored),
+            dyn_worst_bps: to_bps(dyn_worst),
+            total_stored_bps: to_bps((base + dyn_stored).min(max_fee)),
+            total_worst_bps: to_bps((base + dyn_worst).min(max_fee)),
+            dynamic_enabled: data.get(MET_OFF_DYN_INIT).copied().unwrap_or(0) != 0,
+        })
+    }
+
     /// Raw `liquidity` field of a Meteora pool (no validity gating). `Some(0)`
     /// means the pool has been fully drained (rug) — used by the rug monitor,
     /// which must distinguish "drained" from "not yet cached".
@@ -370,10 +474,26 @@ impl PoolStateCache {
     }
 
     /// Build a Pump.fun pool from its two vaults (base = token, quote = WSOL).
-    pub fn pump_pool(&self, token_vault: &Pubkey, wsol_vault: &Pubkey) -> Option<PumpPool> {
+    /// `token_mint` is used to read the token's REAL supply for the market-cap
+    /// fee tier; if the mint account isn't cached yet, supply is passed as 0 and
+    /// `PumpPool::new` fails closed to the highest fee tier.
+    pub fn pump_pool(
+        &self,
+        token_vault: &Pubkey,
+        wsol_vault: &Pubkey,
+        token_mint: &Pubkey,
+    ) -> Option<PumpPool> {
         let base = self.spl_amount(token_vault)?;
         let quote = self.spl_amount(wsol_vault)?;
-        Some(PumpPool::new(base, quote))
+        let supply = self.spl_mint_supply(token_mint).unwrap_or(0) as u128;
+        Some(PumpPool::new(base, quote, supply))
+    }
+
+    /// SPL mint total supply (u64 @ offset 36 of a Mint account). `None` if the
+    /// mint account isn't cached.
+    pub fn spl_mint_supply(&self, mint: &Pubkey) -> Option<u64> {
+        let entry = self.inner.get(mint)?;
+        read_u64_le(entry.value(), 36)
     }
 
     /// Spawn the subscription task with reconnect/backoff. `accounts` seeds the

@@ -233,11 +233,13 @@ impl PoolManager {
         self.register_metis(&pair.pump, PUMPFUN_AMM_PROGRAM).await;
         self.register_metis(&pair.meteora, METEORA_DAMM_V2_PROGRAM).await;
 
-        // 2. Live pool-state subscription: Meteora pool + Pump vault pair.
+        // 2. Live pool-state subscription: Meteora pool + Pump vault pair, plus
+        // the token mint (its `supply` drives the Pump market-cap fee tier).
         let accounts = [
             pair.meteora.pool,
             pair.pump.token_vault(),
             pair.pump.wsol_vault(),
+            pair.token_mint,
         ];
         self.pool_state.add_accounts(&self.rpc, &accounts);
 

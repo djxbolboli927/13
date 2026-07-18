@@ -9,17 +9,15 @@
 //! "Dynamic Fees" update: the total fee is tiered by MARKET CAP, from 1.25%
 //! on tiny pools down to 0.30% above ~98,240 SOL market cap. The tier table
 //! below is the official schedule (pump-public-docs/docs/fees.png); market cap
-//! in lamports for a canonical PumpSwap pool is
-//! `quote_reserve * base_mint_supply / base_reserve` with the canonical pump
-//! supply of 1e9 tokens × 10^6 decimals = 1e15 base units.
+//! in lamports for a PumpSwap pool is
+//! `quote_reserve * base_mint_supply / base_reserve`, where base_mint_supply is
+//! the token's REAL on-chain mint supply (read from the mint account, NOT
+//! assumed) — a wrong supply picks the wrong fee tier and fabricates profit.
 //! On a `buy` the fees are added ON TOP of the pool-bound input; on a `sell`
 //! they are subtracted FROM the gross output. All fee roundings are ceiling,
 //! matching the on-chain program (pool-favorable). Integer math throughout.
 
 const BPS_DENOM: u64 = 10_000;
-
-/// Canonical pump.fun token supply in base units: 1e9 tokens × 10^6 decimals.
-const CANONICAL_SUPPLY_BASE_UNITS: u128 = 1_000_000_000_000_000;
 
 const LAMPORTS_PER_SOL: u128 = 1_000_000_000;
 
@@ -56,15 +54,30 @@ const FEE_TIERS: &[(u64, u64, u64)] = &[
     (0, 125, 2),
 ];
 
-/// `(total_fee_bps, lp_fee_bps)` for a canonical PumpSwap pool given its
-/// reserves, per the official market-cap tier schedule.
-pub fn fee_for_reserves(base_reserve: u64, quote_reserve: u64) -> (u64, u64) {
-    if base_reserve == 0 {
-        // Unknown market cap → assume the highest fee (never overstate profit).
-        return (FEE_TIERS[FEE_TIERS.len() - 1].1, FEE_TIERS[FEE_TIERS.len() - 1].2);
+/// `(total_fee_bps, lp_fee_bps)` for a PumpSwap pool given its reserves and the
+/// base token's ACTUAL mint supply (base units), per the official market-cap
+/// tier schedule: `market_cap = quote_reserve * base_mint_supply / base_reserve`
+/// (pump-public-docs `poolMarketCap`).
+///
+/// `supply_base_units == 0` means we don't yet know the real supply — FAIL
+/// CLOSED to the HIGHEST fee tier (lowest market cap), so the fee is never
+/// understated. This replaces the old hardcoded 1e15-supply assumption, which
+/// on tokens with a different supply/decimals produced the wrong tier → an
+/// understated fee → phantom profit → reverts.
+pub fn fee_for_reserves(
+    base_reserve: u64,
+    quote_reserve: u64,
+    supply_base_units: u128,
+) -> (u64, u64) {
+    let highest = (
+        FEE_TIERS[FEE_TIERS.len() - 1].1,
+        FEE_TIERS[FEE_TIERS.len() - 1].2,
+    );
+    if base_reserve == 0 || supply_base_units == 0 {
+        return highest; // unknown market cap → highest fee
     }
     let mcap_lamports =
-        (quote_reserve as u128).saturating_mul(CANONICAL_SUPPLY_BASE_UNITS) / base_reserve as u128;
+        (quote_reserve as u128).saturating_mul(supply_base_units) / base_reserve as u128;
     let mcap_sol = (mcap_lamports / LAMPORTS_PER_SOL).min(u64::MAX as u128) as u64;
     for &(thresh, total, lp) in FEE_TIERS {
         if mcap_sol >= thresh {
@@ -95,8 +108,11 @@ pub struct PumpPool {
 }
 
 impl PumpPool {
-    pub fn new(base_reserve: u64, quote_reserve: u64) -> Self {
-        let (total_fee_bps, lp_fee_bps) = fee_for_reserves(base_reserve, quote_reserve);
+    /// `supply_base_units` is the base token's real mint supply (0 = unknown →
+    /// highest fee tier, fail-closed).
+    pub fn new(base_reserve: u64, quote_reserve: u64, supply_base_units: u128) -> Self {
+        let (total_fee_bps, lp_fee_bps) =
+            fee_for_reserves(base_reserve, quote_reserve, supply_base_units);
         Self {
             base_reserve,
             quote_reserve,
@@ -198,7 +214,7 @@ mod tests {
 
     #[test]
     fn buy_then_sell_loses_to_fees() {
-        let p = PumpPool::new(1_000_000_000, 200_000_000_000);
+        let p = PumpPool::new(1_000_000_000, 200_000_000_000, 1_000_000_000_000_000);
         let base_out = p.quote_buy(1_000_000_000);
         assert!(base_out > 0);
         let back = p.quote_sell(base_out);
@@ -208,7 +224,7 @@ mod tests {
 
     #[test]
     fn observed_buy_raises_price() {
-        let p = PumpPool::new(1_000_000_000, 200_000_000_000);
+        let p = PumpPool::new(1_000_000_000, 200_000_000_000, 1_000_000_000_000_000);
         let before = p.spot_price(6, 9);
         let after = p.after_observed_buy(10_000_000).spot_price(6, 9);
         assert!(after > before);

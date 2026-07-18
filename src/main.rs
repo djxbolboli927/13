@@ -382,6 +382,7 @@ fn spawn_shred_arb(
         send_dedup_ms: sa.send_dedup_ms,
         status_check_delay_secs: sa.status_check_delay_secs,
         instructions_pp: sa.instructions_pp,
+        meteora_fee_worst_case: sa.meteora_fee_worst_case,
         never_close: sa.never_close_pools,
     };
 
@@ -442,6 +443,8 @@ fn spawn_shred_arb(
             accounts.push(p.meteora.pool);
             accounts.push(p.pump.token_vault());
             accounts.push(p.pump.wsol_vault());
+            // Token mint too — its `supply` field drives the Pump market-cap fee tier.
+            accounts.push(p.token_mint);
         }
         accounts.sort_unstable();
         accounts.dedup();
@@ -743,6 +746,7 @@ fn spawn_shred_arb(
             alt_registry,
         ));
         engine.clone().spawn_reporter();
+        engine.clone().spawn_fee_audit(sa.fee_audit_log_secs);
         // Second opportunity source: re-assess all pairs from current state
         // every 200ms, not only when a Pump shred fires.
         engine.clone().spawn_state_evaluator(200);
