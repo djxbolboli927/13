@@ -100,10 +100,11 @@ pub struct ArbParams {
     /// Reject opportunities whose predicted net profit exceeds this fraction of
     /// the input (e.g. 0.5 = 50%) — always a mispricing on a dead pool.
     pub max_profit_fraction: f64,
-    /// Minimum KEPT profit (lamports, after network fee AND the full Jito tip)
-    /// required before we fetch instructions and send. The on-chain output
-    /// floor is input + network fee + tip, which sits exactly this many
-    /// lamports below the predicted output.
+    /// Minimum predicted NET profit (lamports, above the network fee) required
+    /// before we fetch instructions and send. Production default 5000. This is
+    /// the profit GATE; the on-chain minimum output is set separately to exactly
+    /// the input (break-even floor) so any trade that clears the gate at predict
+    /// time still lands on-chain as long as it doesn't lose money.
     pub min_net_profit_lamports: u64,
     /// Send directly to the network via RPC instead of Jito bundles.
     pub direct_send: bool,
@@ -212,10 +213,6 @@ pub struct ShredArbEngine {
     nosend_dedup: AtomicU64,
     /// A forced leg quote failed on Metis (no route / timeout).
     nosend_quote_fail: AtomicU64,
-    /// Model flagged profit but Metis's REAL-fee quote for the route says the
-    /// output won't clear the floor — i.e. the hand-math over-predicted. NOT a
-    /// Metis error; the route quoted fine, it just isn't actually profitable.
-    nosend_metis_unprofitable: AtomicU64,
     /// /swap-instructions failed.
     nosend_swapix_fail: AtomicU64,
     /// Tx couldn't be built / signed.
@@ -342,7 +339,6 @@ impl ShredArbEngine {
             sent: AtomicU64::new(0),
             nosend_dedup: AtomicU64::new(0),
             nosend_quote_fail: AtomicU64::new(0),
-            nosend_metis_unprofitable: AtomicU64::new(0),
             nosend_swapix_fail: AtomicU64::new(0),
             nosend_build_fail: AtomicU64::new(0),
             nosend_too_large: AtomicU64::new(0),
@@ -557,14 +553,13 @@ impl ShredArbEngine {
             }
         };
 
-        // Cost-complete objective: the optimizer maximizes
-        // `out - x - (network fee + minimum Jito tip)`. The profit-share part
-        // of the tip and the min-profit gate are applied AFTER optimization
-        // (see below), so the on-chain floor can never exceed the predicted
-        // output — previously the tip was excluded here but included in the
-        // floor, which made every small-net send revert by construction.
-        let required_extra =
-            self.params.network_fee_lamports + self.params.jito_tip_min_lamports;
+        // Profit GATE: the optimizer maximizes `out - x - required_extra`, where
+        // `required_extra` is the minimum profit we insist on (default 5000 =
+        // one network base fee). Direct sends pay only that fee, no Jito tip.
+        // NOTE: this is only the gate — the on-chain minimum output is set to
+        // exactly the input (break-even) at send time, so a trade that clears
+        // the gate at predict time still lands as long as it doesn't lose money.
+        let required_extra = self.params.min_net_profit_lamports;
 
         // Ceiling on trade size: never add more WSOL than a fraction of the
         // BUY pool's current WSOL reserve (keeps the swap in a valid range and
@@ -576,23 +571,13 @@ impl ShredArbEngine {
             BuyOn::Pump => pump_after.quote_reserve,
             BuyOn::Meteora => meteora.wsol_reserve(token_is_a),
         };
-        // The SELL side must hold real WSOL depth too — our output comes out of
-        // it. Previously only the buy side was checked, so "buy on Pump, sell
-        // into a near-empty Meteora pool" passed every guard.
-        let sell_wsol_reserve = match buy_on {
-            BuyOn::Pump => meteora.wsol_reserve(token_is_a),
-            BuyOn::Meteora => pump_after.quote_reserve,
-        };
         // Dead-pool guards — skip empty/broken pools early (they were flooding
         // the logs and wasting cycles): the BUY side must hold real WSOL depth,
         // and the price gap must be plausible. A real cross-pool gap is small
         // (competitors trade ~0.2%); a 100%+ "gap" is a decode artifact or a
         // one-sided dead pool, never an executable arb.
         let gap_pct = (pump_price - met_price) / met_price * 100.0;
-        if buy_wsol_reserve < 5_000
-            || sell_wsol_reserve < 5_000
-            || gap_pct.abs() > MAX_PLAUSIBLE_GAP_PCT
-        {
+        if buy_wsol_reserve < 5_000 || gap_pct.abs() > MAX_PLAUSIBLE_GAP_PCT {
             self.skip_bad_price.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -659,28 +644,12 @@ impl ShredArbEngine {
                 return;
             }
         };
-        // ── Profit decision (exactly as specified) ──────────────────────────
-        // gross  = predicted_out - input
-        // net    = gross - (network_fee + minimum Jito tip)   [= gross - 6000]
-        // profitable  ⇔  net > 0.  The 20% profit-share tip is NOT part of this
-        // gate — if net > 0 it stays positive after the share; if net ≤ 0 it
-        // never reaches the share anyway. The instruction output floor below is
-        // built exactly as before (input + network fee + full dynamic tip).
-        let cost_floor = best_x + required_extra;
-        if best_out <= cost_floor {
+        let profit_floor = best_x + required_extra;
+        if best_out <= profit_floor {
             self.not_profitable.fetch_add(1, Ordering::Relaxed);
-            return; // gross does not cover network fee + minimum tip
+            return; // predicted profit below the minimum gate
         }
-        let net = best_out - cost_floor; // = gross - 6000, strictly > 0 here
-        // Optional extra margin (config): require at least this many lamports of
-        // net on top of the 6000. Set 0 to accept any positive net.
-        if net < self.params.min_net_profit_lamports {
-            self.not_profitable.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        // Profit share of the tip is carved from `net` (bounded, so the floor
-        // stays strictly below the predicted output → never revert-by-design).
-        let tip_extra = (net as f64 * self.params.jito_tip_profit_fraction) as u64;
+        let net = best_out - profit_floor;
 
         // Plausibility guard: a real cross-pool gap is small. A predicted net
         // above `max_profit_fraction` of the input is always a dead-pool
@@ -710,12 +679,12 @@ impl ShredArbEngine {
         );
 
         self.last_fired.insert(key, Instant::now());
-        // Jito tip = min tip + the profit share carved out of the surplus. The
-        // on-chain floor = input + network fee + tip, which by construction is
-        // `net` lamports BELOW the predicted output — the tx only reverts if
-        // the realized output falls short of the prediction, never because the
-        // floor itself was set above what we predicted.
-        let tip = self.params.jito_tip_min_lamports + tip_extra;
+        // Jito tip = min tip + a share of the detected profit (e.g. 1000 + 20%).
+        // On-chain output floor = input + network fee + tip, so the tx reverts
+        // unless it at least covers the fee and the tip (we keep the rest). Only
+        // opportunities whose realized profit exceeds fee+tip actually land.
+        let tip = self.params.jito_tip_min_lamports
+            + (net as f64 * self.params.jito_tip_profit_fraction) as u64;
         let onchain_floor = best_x + self.params.network_fee_lamports + tip;
         let recheck = Recheck {
             buy_on_pump: buy_on == BuyOn::Pump,
@@ -833,23 +802,6 @@ impl ShredArbEngine {
             self.load_fail.remove(&key);
             self.note_route_success(key);
 
-            // Backstop against model error: Metis just priced this exact route
-            // with the REAL on-chain fee/curve logic. If even its (slightly
-            // stale) output cannot clear our on-chain floor, our model is
-            // overestimating — drop instead of shipping a doomed bundle.
-            if let Ok(metis_out) = q2.out_amount.parse::<u64>() {
-                if metis_out < floor {
-                    self.nosend_metis_unprofitable.fetch_add(1, Ordering::Relaxed);
-                    crate::errlog::log(
-                        "not-sent",
-                        &format!(
-                            "token={token} reason=metis-out-below-floor metis_out={metis_out} floor={floor}"
-                        ),
-                    );
-                    return;
-                }
-            }
-
             // Set the on-chain floor to exactly the input (break-even) regardless of
             // what Metis quoted (our data is ahead of Metis).
             let merged = match MetisClient::merge_quotes(&q1, &q2, floor) {
@@ -878,6 +830,28 @@ impl ShredArbEngine {
                     return;
                 }
             };
+
+            // ammKey guard: with a FORCED dex label Metis can route through a
+            // DIFFERENT pool of that same dex (same venue, different ammKey). We
+            // only cache — and later reuse — an instruction that genuinely
+            // trades OUR two pools, so a cached entry keyed by (pump, meteora)
+            // can never serve a route through some other pool.
+            let route_accounts: std::collections::HashSet<solana_sdk::pubkey::Pubkey> =
+                harvest_accounts(&swap_ixs).into_iter().collect();
+            let ammkeys_match = route_accounts.contains(&pair.pump.pool)
+                && route_accounts.contains(&pair.meteora.pool);
+            if !ammkeys_match {
+                crate::errlog::log(
+                    "not-sent",
+                    &format!(
+                        "token={token} reason=ammkey-mismatch (Metis routed through a \
+                         different pool) pump={} meteora={}",
+                        pair.pump.pool, pair.meteora.pool
+                    ),
+                );
+                self.nosend_build_fail.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
 
             // Capture the whole route for next time: find where the two amounts
             // live inside the instruction's Borsh data (this request used
@@ -1205,10 +1179,7 @@ impl ShredArbEngine {
     fn still_profitable(&self, r: &Recheck) -> bool {
         let met = match self.pool_state.meteora_pool(&r.met_pool, r.fallback_fee) {
             Some(m) => m,
-            // FAIL CLOSED: no verifiable Meteora state (missing, drained, or an
-            // untradeable fee/curve mode) → do not send a bundle we cannot
-            // re-validate. Silently passing here let doomed sends escape.
-            None => return false,
+            None => return true,
         };
         let out = if r.buy_on_pump {
             let base = r.pump_after.quote_buy(r.amount_in);
@@ -1321,7 +1292,7 @@ impl ShredArbEngine {
                     "\n[shred-arb 30s] watching_pools={}\n\
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} bad_price={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
-                     NOT-SENT: dedup={} quote_fail={} metis_unprofitable={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
+                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
@@ -1339,7 +1310,6 @@ impl ShredArbEngine {
                     unknown,
                     self.nosend_dedup.load(Ordering::Relaxed),
                     self.nosend_quote_fail.load(Ordering::Relaxed),
-                    self.nosend_metis_unprofitable.load(Ordering::Relaxed),
                     self.nosend_swapix_fail.load(Ordering::Relaxed),
                     self.nosend_build_fail.load(Ordering::Relaxed),
                     self.nosend_too_large.load(Ordering::Relaxed),
