@@ -60,7 +60,7 @@ core_affinity = "0.8"
 # Local SVM simulation (pre-flight filter before Jito send).
 # Git dep so Cargo resolves litesvm's own workspace dependencies correctly.
 # The vendored source at vendor/litesvm is a reference copy at the same commit.
-litesvm = { git = "https://github.com/LiteSVM/litesvm", branch = "master" }
+litesvm = { git = "https://github.com/LiteSVM/litesvm", rev = "ef0e717210aa49a16348ea8362248cfcc5691bf1" }
 # solana-account must match litesvm's workspace pin (3.2.0) so the Account
 # type that crosses the Yellowstone cache → LiteSVM boundary is the same type.
 solana-account = "3.2.0"
