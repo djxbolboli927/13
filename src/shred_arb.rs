@@ -100,11 +100,10 @@ pub struct ArbParams {
     /// Reject opportunities whose predicted net profit exceeds this fraction of
     /// the input (e.g. 0.5 = 50%) — always a mispricing on a dead pool.
     pub max_profit_fraction: f64,
-    /// Minimum predicted NET profit (lamports, above the network fee) required
-    /// before we fetch instructions and send. Production default 5000. This is
-    /// the profit GATE; the on-chain minimum output is set separately to exactly
-    /// the input (break-even floor) so any trade that clears the gate at predict
-    /// time still lands on-chain as long as it doesn't lose money.
+    /// Minimum KEPT profit (lamports, after network fee AND the full Jito tip)
+    /// required before we fetch instructions and send. The on-chain output
+    /// floor is input + network fee + tip, which sits exactly this many
+    /// lamports below the predicted output.
     pub min_net_profit_lamports: u64,
     /// Send directly to the network via RPC instead of Jito bundles.
     pub direct_send: bool,
@@ -553,13 +552,14 @@ impl ShredArbEngine {
             }
         };
 
-        // Profit GATE: the optimizer maximizes `out - x - required_extra`, where
-        // `required_extra` is the minimum profit we insist on (default 5000 =
-        // one network base fee). Direct sends pay only that fee, no Jito tip.
-        // NOTE: this is only the gate — the on-chain minimum output is set to
-        // exactly the input (break-even) at send time, so a trade that clears
-        // the gate at predict time still lands as long as it doesn't lose money.
-        let required_extra = self.params.min_net_profit_lamports;
+        // Cost-complete objective: the optimizer maximizes
+        // `out - x - (network fee + minimum Jito tip)`. The profit-share part
+        // of the tip and the min-profit gate are applied AFTER optimization
+        // (see below), so the on-chain floor can never exceed the predicted
+        // output — previously the tip was excluded here but included in the
+        // floor, which made every small-net send revert by construction.
+        let required_extra =
+            self.params.network_fee_lamports + self.params.jito_tip_min_lamports;
 
         // Ceiling on trade size: never add more WSOL than a fraction of the
         // BUY pool's current WSOL reserve (keeps the swap in a valid range and
@@ -571,13 +571,23 @@ impl ShredArbEngine {
             BuyOn::Pump => pump_after.quote_reserve,
             BuyOn::Meteora => meteora.wsol_reserve(token_is_a),
         };
+        // The SELL side must hold real WSOL depth too — our output comes out of
+        // it. Previously only the buy side was checked, so "buy on Pump, sell
+        // into a near-empty Meteora pool" passed every guard.
+        let sell_wsol_reserve = match buy_on {
+            BuyOn::Pump => meteora.wsol_reserve(token_is_a),
+            BuyOn::Meteora => pump_after.quote_reserve,
+        };
         // Dead-pool guards — skip empty/broken pools early (they were flooding
         // the logs and wasting cycles): the BUY side must hold real WSOL depth,
         // and the price gap must be plausible. A real cross-pool gap is small
         // (competitors trade ~0.2%); a 100%+ "gap" is a decode artifact or a
         // one-sided dead pool, never an executable arb.
         let gap_pct = (pump_price - met_price) / met_price * 100.0;
-        if buy_wsol_reserve < 5_000 || gap_pct.abs() > MAX_PLAUSIBLE_GAP_PCT {
+        if buy_wsol_reserve < 5_000
+            || sell_wsol_reserve < 5_000
+            || gap_pct.abs() > MAX_PLAUSIBLE_GAP_PCT
+        {
             self.skip_bad_price.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -644,12 +654,20 @@ impl ShredArbEngine {
                 return;
             }
         };
-        let profit_floor = best_x + required_extra;
-        if best_out <= profit_floor {
+        let cost_floor = best_x + required_extra;
+        if best_out <= cost_floor {
             self.not_profitable.fetch_add(1, Ordering::Relaxed);
-            return; // predicted profit below the minimum gate
+            return; // does not even cover network fee + minimum tip
         }
-        let net = best_out - profit_floor;
+        // Surplus above all fixed costs; the profit share of the tip comes out
+        // of it, and what remains must clear the minimum-profit gate.
+        let surplus = best_out - cost_floor;
+        let tip_extra = (surplus as f64 * self.params.jito_tip_profit_fraction) as u64;
+        let net = surplus - tip_extra; // profit we KEEP after fee + full tip
+        if net < self.params.min_net_profit_lamports {
+            self.not_profitable.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
 
         // Plausibility guard: a real cross-pool gap is small. A predicted net
         // above `max_profit_fraction` of the input is always a dead-pool
@@ -679,12 +697,12 @@ impl ShredArbEngine {
         );
 
         self.last_fired.insert(key, Instant::now());
-        // Jito tip = min tip + a share of the detected profit (e.g. 1000 + 20%).
-        // On-chain output floor = input + network fee + tip, so the tx reverts
-        // unless it at least covers the fee and the tip (we keep the rest). Only
-        // opportunities whose realized profit exceeds fee+tip actually land.
-        let tip = self.params.jito_tip_min_lamports
-            + (net as f64 * self.params.jito_tip_profit_fraction) as u64;
+        // Jito tip = min tip + the profit share carved out of the surplus. The
+        // on-chain floor = input + network fee + tip, which by construction is
+        // `net` lamports BELOW the predicted output — the tx only reverts if
+        // the realized output falls short of the prediction, never because the
+        // floor itself was set above what we predicted.
+        let tip = self.params.jito_tip_min_lamports + tip_extra;
         let onchain_floor = best_x + self.params.network_fee_lamports + tip;
         let recheck = Recheck {
             buy_on_pump: buy_on == BuyOn::Pump,
@@ -801,6 +819,23 @@ impl ShredArbEngine {
             // Both legs routed — clear any load-failure strikes.
             self.load_fail.remove(&key);
             self.note_route_success(key);
+
+            // Backstop against model error: Metis just priced this exact route
+            // with the REAL on-chain fee/curve logic. If even its (slightly
+            // stale) output cannot clear our on-chain floor, our model is
+            // overestimating — drop instead of shipping a doomed bundle.
+            if let Ok(metis_out) = q2.out_amount.parse::<u64>() {
+                if metis_out < floor {
+                    self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
+                    crate::errlog::log(
+                        "not-sent",
+                        &format!(
+                            "token={token} reason=metis-out-below-floor metis_out={metis_out} floor={floor}"
+                        ),
+                    );
+                    return;
+                }
+            }
 
             // Set the on-chain floor to exactly the input (break-even) regardless of
             // what Metis quoted (our data is ahead of Metis).
@@ -1157,7 +1192,10 @@ impl ShredArbEngine {
     fn still_profitable(&self, r: &Recheck) -> bool {
         let met = match self.pool_state.meteora_pool(&r.met_pool, r.fallback_fee) {
             Some(m) => m,
-            None => return true,
+            // FAIL CLOSED: no verifiable Meteora state (missing, drained, or an
+            // untradeable fee/curve mode) → do not send a bundle we cannot
+            // re-validate. Silently passing here let doomed sends escape.
+            None => return false,
         };
         let out = if r.buy_on_pump {
             let base = r.pump_after.quote_buy(r.amount_in);

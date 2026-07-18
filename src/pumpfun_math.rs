@@ -5,22 +5,74 @@
 //! pool account; they are the SPL-token `amount` of the two vaults
 //! (`pool_base_token_account`, `pool_quote_token_account`).
 //!
-//! Fees (all levied on the QUOTE / SOL leg, current mainnet values):
-//!   * LP fee        — 20 bps, stays inside the pool (grows the quote reserve)
-//!   * protocol fee  —  5 bps, transferred out
-//!   * coin-creator  —  5 bps, transferred out (canonical pools only)
+//! Fees (all levied on the QUOTE / SOL leg) are DYNAMIC since pump.fun's
+//! "Dynamic Fees" update: the total fee is tiered by MARKET CAP, from 1.25%
+//! on tiny pools down to 0.30% above ~98,240 SOL market cap. The tier table
+//! below is the official schedule (pump-public-docs/docs/fees.png); market cap
+//! in lamports for a canonical PumpSwap pool is
+//! `quote_reserve * base_mint_supply / base_reserve` with the canonical pump
+//! supply of 1e9 tokens × 10^6 decimals = 1e15 base units.
 //! On a `buy` the fees are added ON TOP of the pool-bound input; on a `sell`
 //! they are subtracted FROM the gross output. All fee roundings are ceiling,
 //! matching the on-chain program (pool-favorable). Integer math throughout.
 
-/// LP fee that is retained inside the pool on every swap.
-pub const LP_FEE_BPS: u64 = 20;
-/// Protocol + coin-creator fees that leave the pool (canonical pool: 5 + 5).
-pub const OUT_FEE_BPS: u64 = 10;
-/// Total fee charged to the trader.
-pub const TOTAL_FEE_BPS: u64 = LP_FEE_BPS + OUT_FEE_BPS;
-
 const BPS_DENOM: u64 = 10_000;
+
+/// Canonical pump.fun token supply in base units: 1e9 tokens × 10^6 decimals.
+const CANONICAL_SUPPLY_BASE_UNITS: u128 = 1_000_000_000_000_000;
+
+const LAMPORTS_PER_SOL: u128 = 1_000_000_000;
+
+/// Official PumpSwap dynamic-fee schedule, DESCENDING by market-cap threshold:
+/// `(mcap_threshold_sol, total_fee_bps, lp_fee_bps)`. The row whose threshold
+/// the market cap meets first applies. Fractional-bps totals (e.g. 0.525%) are
+/// rounded UP so the fee is never understated. LP fee is 20 bps in every tier
+/// except the lowest (2 bps).
+const FEE_TIERS: &[(u64, u64, u64)] = &[
+    (98_240, 30, 20),
+    (93_330, 33, 20),
+    (88_400, 35, 20),
+    (83_500, 38, 20),
+    (78_590, 40, 20),
+    (73_681, 43, 20),
+    (68_770, 45, 20),
+    (63_860, 48, 20),
+    (58_940, 50, 20),
+    (54_030, 53, 20),
+    (49_120, 55, 20),
+    (44_210, 60, 20),
+    (39_300, 65, 20),
+    (34_380, 70, 20),
+    (29_470, 75, 20),
+    (24_560, 80, 20),
+    (19_650, 85, 20),
+    (14_740, 90, 20),
+    (9_820, 95, 20),
+    (4_420, 100, 20),
+    (3_440, 105, 20),
+    (2_460, 110, 20),
+    (1_470, 115, 20),
+    (420, 120, 20),
+    (0, 125, 2),
+];
+
+/// `(total_fee_bps, lp_fee_bps)` for a canonical PumpSwap pool given its
+/// reserves, per the official market-cap tier schedule.
+pub fn fee_for_reserves(base_reserve: u64, quote_reserve: u64) -> (u64, u64) {
+    if base_reserve == 0 {
+        // Unknown market cap → assume the highest fee (never overstate profit).
+        return (FEE_TIERS[FEE_TIERS.len() - 1].1, FEE_TIERS[FEE_TIERS.len() - 1].2);
+    }
+    let mcap_lamports =
+        (quote_reserve as u128).saturating_mul(CANONICAL_SUPPLY_BASE_UNITS) / base_reserve as u128;
+    let mcap_sol = (mcap_lamports / LAMPORTS_PER_SOL).min(u64::MAX as u128) as u64;
+    for &(thresh, total, lp) in FEE_TIERS {
+        if mcap_sol >= thresh {
+            return (total, lp);
+        }
+    }
+    (125, 2)
+}
 
 #[inline]
 fn ceil_div(a: u128, b: u128) -> u128 {
@@ -36,19 +88,20 @@ fn ceil_div(a: u128, b: u128) -> u128 {
 pub struct PumpPool {
     pub base_reserve: u64,
     pub quote_reserve: u64,
-    /// Total fee in bps (30 canonical, 25 without a coin creator).
+    /// Total fee in bps — dynamic, selected from the market-cap tier schedule.
     pub total_fee_bps: u64,
-    /// LP portion of the fee that stays in the pool (20 bps).
+    /// LP portion of the fee that stays in the pool.
     pub lp_fee_bps: u64,
 }
 
 impl PumpPool {
     pub fn new(base_reserve: u64, quote_reserve: u64) -> Self {
+        let (total_fee_bps, lp_fee_bps) = fee_for_reserves(base_reserve, quote_reserve);
         Self {
             base_reserve,
             quote_reserve,
-            total_fee_bps: TOTAL_FEE_BPS,
-            lp_fee_bps: LP_FEE_BPS,
+            total_fee_bps,
+            lp_fee_bps,
         }
     }
 

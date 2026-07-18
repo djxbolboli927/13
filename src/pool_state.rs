@@ -48,34 +48,41 @@ const MET_OFF_SQRT_PRICE: usize = 456;
 // against the offsets above that are already validated on live accounts
 // (pool_fees occupies bytes 8..168, token_a_mint at 168):
 //
-// BaseFeeStruct @8:  cliff_fee_numerator u64 @8, fee_scheduler_mode u8 @16,
-//                    padding[5], number_of_period u16 @22,
-//                    period_frequency u64 @24, reduction_factor u64 @32,
-//                    padding u64 @40 (ends @56)
-// protocol/partner/referral percents + padding @56..64
-// DynamicFeeStruct @64: initialized u8 @64, padding[7],
-//                    max_volatility_accumulator u32 @72,
-//                    variable_fee_control u32 @76, bin_step u16 @80,
-//                    filter_period u16 @82, decay_period u16 @84,
-//                    reduction_factor u16 @86, last_update_timestamp u64 @88,
-//                    bin_step_u128 u128 @96, sqrt_price_reference u128 @112,
-//                    volatility_accumulator u128 @128,
-//                    volatility_reference u128 @144 (ends @160)
+// BaseFeeStruct @8..48 (base_fee_info blob 8..40 + padding u64 @40):
+//   time-scheduler modes (0 linear / 1 exponential): cliff_fee_numerator u64
+//   @8, mode u8 @16, padding[5], number_of_period u16 @22, period_frequency
+//   u64 @24, reduction_factor u64 @32. Modes 2 (rate limiter) and 3/4
+//   (market-cap scheduler) lay the blob out DIFFERENTLY — those pools are
+//   rejected as untradeable rather than mis-decoded.
+// protocol_fee_percent u8 @48, padding u8 @49, referral_fee_percent u8 @50,
+// padding[3] @51, compounding_fee_bps u16 @54.
+// DynamicFeeStruct @56..152: initialized u8 @56, padding[7] @57,
+//   max_volatility_accumulator u32 @64, variable_fee_control u32 @68,
+//   bin_step u16 @72, filter_period u16 @74, decay_period u16 @76,
+//   reduction_factor u16 @78, last_update_timestamp u64 @80,
+//   bin_step_u128 u128 @88, sqrt_price_reference u128 @104,
+//   volatility_accumulator u128 @120, volatility_reference u128 @136.
+// init_sqrt_price u128 @152..168.
 // Pool tail: activation_point u64 @472, activation_type u8 @480 (0=slot,
-// 1=unix timestamp).
+// 1=unix timestamp), pool_status u8 @481, collect_fee_mode u8 @484,
+// fee_version u8 @486.
 const MET_OFF_SCHED_MODE: usize = 16;
 const MET_OFF_NUM_PERIOD: usize = 22;
 const MET_OFF_PERIOD_FREQ: usize = 24;
 const MET_OFF_REDUCTION: usize = 32;
-const MET_OFF_DYN_INIT: usize = 64;
-const MET_OFF_DYN_VFC: usize = 76;
-const MET_OFF_DYN_BIN_STEP: usize = 80;
-const MET_OFF_DYN_VOL_ACC: usize = 128;
+const MET_OFF_DYN_INIT: usize = 56;
+const MET_OFF_DYN_VFC: usize = 68;
+const MET_OFF_DYN_BIN_STEP: usize = 72;
+const MET_OFF_DYN_VOL_ACC: usize = 120;
 const MET_OFF_ACTIVATION_POINT: usize = 472;
 const MET_OFF_ACTIVATION_TYPE: usize = 480;
+const MET_OFF_POOL_STATUS: usize = 481;
+const MET_OFF_COLLECT_FEE_MODE: usize = 484;
+const MET_OFF_FEE_VERSION: usize = 486;
 
-/// On-chain cap: fees never exceed 50% (numerator over 1e9).
-const MAX_FEE_NUMERATOR: u64 = 500_000_000;
+/// On-chain fee caps (numerator over 1e9): 50% for fee_version 0, 99% for 1.
+const MAX_FEE_NUMERATOR_V0: u64 = 500_000_000;
+const MAX_FEE_NUMERATOR_V1: u64 = 990_000_000;
 const BASIS_POINT_MAX: u64 = 10_000;
 
 // SPL token account: amount is a u64 LE at offset 64.
@@ -133,19 +140,39 @@ fn read_u16_le(data: &[u8], off: usize) -> Option<u16> {
 /// The stored volatility_accumulator is likewise used without decay: right
 /// after the bursts of activity we trade on it is accurate, and between bursts
 /// it only overstates the fee (conservative direction).
+/// `None` means the pool is NOT SAFELY TRADEABLE with our model (disabled,
+/// compounding curve, unknown scheduler/fee version, or garbage read) — the
+/// caller must SKIP the pool, never fall back to a cheaper config fee (that
+/// exact fallback is what produced streams of fake-profit sends).
 fn meteora_total_fee_numerator(data: &[u8], current_slot: u64) -> Option<u64> {
+    // Pool must be enabled (pool_status 0) — a disabled pool reverts all swaps.
+    if data.get(MET_OFF_POOL_STATUS).copied().unwrap_or(1) != 0 {
+        return None;
+    }
+    // Fee cap depends on fee_version; unknown version → untradeable.
+    let max_fee = match data.get(MET_OFF_FEE_VERSION).copied().unwrap_or(0) {
+        0 => MAX_FEE_NUMERATOR_V0,
+        1 => MAX_FEE_NUMERATOR_V1,
+        _ => return None,
+    };
     let cliff = read_u64_le(data, MET_OFF_CLIFF_FEE)?;
-    if cliff == 0 || cliff > MAX_FEE_NUMERATOR {
-        return None; // implausible read — caller falls back to config
+    if cliff == 0 || cliff > max_fee {
+        return None; // garbage read or above the legal cap — do not trade
     }
 
     // ── Base fee via the time/slot scheduler ──
+    // Only modes 0 (linear) and 1 (exponential) share this field layout; the
+    // rate-limiter (2) and market-cap-scheduler (3/4) blobs are laid out
+    // differently and would decode as garbage — reject those pools.
+    let mode = data.get(MET_OFF_SCHED_MODE).copied().unwrap_or(0);
+    if mode > 1 {
+        return None;
+    }
     let mut base = cliff;
     let period_freq = read_u64_le(data, MET_OFF_PERIOD_FREQ).unwrap_or(0);
     if period_freq > 0 {
         let num_period = read_u16_le(data, MET_OFF_NUM_PERIOD).unwrap_or(0) as u64;
         let reduction = read_u64_le(data, MET_OFF_REDUCTION).unwrap_or(0);
-        let mode = data.get(MET_OFF_SCHED_MODE).copied().unwrap_or(0);
         let activation_point = read_u64_le(data, MET_OFF_ACTIVATION_POINT).unwrap_or(0);
         let activation_type = data.get(MET_OFF_ACTIVATION_TYPE).copied().unwrap_or(0);
         let current_point = if activation_type == 1 {
@@ -163,9 +190,10 @@ fn meteora_total_fee_numerator(data: &[u8], current_slot: u64) -> Option<u64> {
             (current_point.saturating_sub(activation_point) / period_freq).min(num_period)
         };
         base = if mode == 1 {
-            // Exponential: cliff * (1 - reduction/10000)^period.
+            // Exponential: cliff * (1 - reduction/10000)^period, rounded UP so
+            // f64 drift can never round below the on-chain fixed-point fee.
             let r = (reduction.min(BASIS_POINT_MAX) as f64) / BASIS_POINT_MAX as f64;
-            ((cliff as f64) * (1.0 - r).powi(period.min(u16::MAX as u64) as i32)) as u64
+            ((cliff as f64) * (1.0 - r).powi(period.min(u16::MAX as u64) as i32)).ceil() as u64
         } else {
             // Linear.
             cliff.saturating_sub(reduction.saturating_mul(period))
@@ -186,11 +214,11 @@ fn meteora_total_fee_numerator(data: &[u8], current_slot: u64) -> Option<u64> {
                 .saturating_add(99_999_999_999)
                 .checked_div(100_000_000_000)
                 .unwrap_or(0)
-                .min(MAX_FEE_NUMERATOR as u128) as u64;
+                .min(max_fee as u128) as u64;
         }
     }
 
-    Some(base.saturating_add(dynamic).min(MAX_FEE_NUMERATOR))
+    Some(base.saturating_add(dynamic).min(max_fee))
 }
 
 impl PoolStateCache {
@@ -283,21 +311,29 @@ impl PoolStateCache {
     /// Returns `None` if the decoded state is not tradeable — a drained pool
     /// (`liquidity == 0`), a sqrt-price outside the on-chain valid range, or a
     /// mangled/partial read — so the engine never sizes a trade off garbage.
-    pub fn meteora_pool(&self, pool: &Pubkey, fallback_fee_numerator: u64) -> Option<MeteoraPool> {
+    pub fn meteora_pool(&self, pool: &Pubkey, _fallback_fee_numerator: u64) -> Option<MeteoraPool> {
         let entry = self.inner.get(pool)?;
         let data = entry.value();
         // Current TOTAL fee: scheduler-adjusted base fee + volatility-based
-        // dynamic fee (can push a "0.25%" pool well past 2%). Falls back to the
-        // config value only when the on-chain read is implausible.
+        // dynamic fee (can push a "0.25%" pool well past 2%). FAIL CLOSED: if
+        // the fee cannot be decoded safely (disabled pool, compounding curve,
+        // unknown scheduler/fee version), the pool is untradeable — never fall
+        // back to a cheaper config fee (that fallback fabricated profit).
         let fee_numerator =
-            meteora_total_fee_numerator(data, self.slot.load(Ordering::Relaxed))
-                .unwrap_or(fallback_fee_numerator);
+            meteora_total_fee_numerator(data, self.slot.load(Ordering::Relaxed))?;
+        // Compounding pools (collect_fee_mode 2) use plain x*y=k on tracked
+        // reserves, NOT the sqrt-price curve below — reject them.
+        let collect_fee_mode = data.get(MET_OFF_COLLECT_FEE_MODE).copied().unwrap_or(0);
+        if collect_fee_mode > 1 {
+            return None;
+        }
         let p = MeteoraPool {
             liquidity: read_u128_le(data, MET_OFF_LIQUIDITY)?,
             sqrt_min_price: read_u128_le(data, MET_OFF_SQRT_MIN)?,
             sqrt_max_price: read_u128_le(data, MET_OFF_SQRT_MAX)?,
             sqrt_price: read_u128_le(data, MET_OFF_SQRT_PRICE)?,
             fee_numerator,
+            collect_fee_mode,
         };
         // Validity gate: reject drained / out-of-range / garbage state.
         if p.liquidity == 0

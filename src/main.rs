@@ -395,6 +395,7 @@ fn spawn_shred_arb(
             sqrt_min_price: meteora_math::MIN_SQRT_PRICE,
             sqrt_max_price: meteora_math::MAX_SQRT_PRICE,
             fee_numerator: 1_000_000,
+            collect_fee_mode: 1,
         };
         let r = t.wsol_reserve(true);
         let s = t.swap_exact_in(1000, false).map(|o| o.amount_out);

@@ -39,10 +39,15 @@ pub struct MeteoraPool {
     pub liquidity: u128,
     pub sqrt_min_price: u128,
     pub sqrt_max_price: u128,
-    /// Effective fee numerator (denominator `FEE_DENOM` = 1e9), read from the
-    /// pool's `cliff_fee_numerator`. Dynamic (volatility) fee is negligible for
-    /// the tiny trades on these low-liquidity pools, so the base fee suffices.
+    /// Effective TOTAL fee numerator (denominator `FEE_DENOM` = 1e9):
+    /// scheduler-adjusted base fee + dynamic volatility fee, decoded from the
+    /// live pool account by `pool_state`.
     pub fee_numerator: u64,
+    /// `collect_fee_mode` byte from the pool account: 0 = BothToken (fee taken
+    /// on the OUTPUT side in both directions), 1 = OnlyB (fee on output for
+    /// A→B, on input for B→A). Compounding pools (2) use a different curve and
+    /// are rejected upstream.
+    pub collect_fee_mode: u8,
 }
 
 /// Result of a single-range exact-in swap.
@@ -85,12 +90,22 @@ impl MeteoraPool {
         if amount_in == 0 || self.liquidity == 0 {
             return None;
         }
-        // Fee on input (pool-favorable ceiling).
-        let fee = ceil_div(amount_in as u128 * self.fee_numerator as u128, FEE_DENOM);
-        let net_in = (amount_in as u128).saturating_sub(fee);
-        if net_in == 0 {
-            return None;
-        }
+        // Fee side per the on-chain `FeeMode::get_fee_mode`:
+        //   BothToken (0): fee on OUTPUT for both directions.
+        //   OnlyB     (1): fee on output for A→B, on INPUT for B→A.
+        // Charging on the input for a fee-on-output pool OVERSTATES the output
+        // (the curve is concave), which fabricated profit on thin pools.
+        let fee_on_input = self.collect_fee_mode == 1 && !a_to_b;
+        let net_in = if fee_on_input {
+            let fee = ceil_div(amount_in as u128 * self.fee_numerator as u128, FEE_DENOM);
+            let n = (amount_in as u128).saturating_sub(fee);
+            if n == 0 {
+                return None;
+            }
+            n
+        } else {
+            amount_in as u128
+        };
 
         let sqrt = self.sqrt_price;
         let l = self.liquidity;
@@ -113,8 +128,9 @@ impl MeteoraPool {
             }
             // out_b = L·(√P − √P') / 2^128  → high 128 bits of the 256-bit product.
             let (hi, _lo) = mul_wide(l, sqrt - sqrt_next);
+            let out = self.apply_output_fee(hi, fee_on_input);
             Some(SwapOut {
-                amount_out: hi.min(u64::MAX as u128) as u64,
+                amount_out: out.min(u64::MAX as u128) as u64,
                 next_sqrt_price: sqrt_next,
             })
         } else {
@@ -129,11 +145,22 @@ impl MeteoraPool {
             let diff = sqrt_next - sqrt;
             let inner = mul_div_floor(l, diff, sqrt)?; // L·diff/√P
             let out = inner / sqrt_next; // /√P'
+            let out = self.apply_output_fee(out, fee_on_input);
             Some(SwapOut {
                 amount_out: out.min(u64::MAX as u128) as u64,
                 next_sqrt_price: sqrt_next,
             })
         }
+    }
+
+    /// Subtract the trading fee from a gross output (pool-favorable ceiling),
+    /// unless the fee was already taken on the input side.
+    fn apply_output_fee(&self, gross_out: u128, fee_taken_on_input: bool) -> u128 {
+        if fee_taken_on_input {
+            return gross_out;
+        }
+        let fee = ceil_div(gross_out * self.fee_numerator as u128, FEE_DENOM);
+        gross_out.saturating_sub(fee)
     }
 
     /// Current WSOL reserve held in the pool, used to bound trade size so we
@@ -184,6 +211,7 @@ mod tests {
             sqrt_min_price: MIN_SQRT_PRICE,
             sqrt_max_price: MAX_SQRT_PRICE,
             fee_numerator: 2_500_000, // 0.25%
+            collect_fee_mode: 1,
         }
     }
 
