@@ -241,11 +241,9 @@ impl PoolManager {
         ];
         self.pool_state.add_accounts(&self.rpc, &accounts);
 
-        // 3. ShredStream watch set (+ ALT contents for account resolution),
-        // and the Meteora pool for in-flight competing-tx detection.
+        // 3. ShredStream watch set (+ ALT contents for account resolution).
         let alt = pair.pump.alt.and_then(|a| self.load_alt(a));
         self.consumer.add_target(pair.pump.pool, alt);
-        self.consumer.add_meteora_target(pair.meteora.pool);
 
         // 4. Token ATA so we can hold the asset.
         match ata::ensure_ata(&self.rpc, &self.keypair, &pair.token_mint) {
@@ -351,9 +349,6 @@ impl PoolManager {
             "removing pool (rug/dead)"
         );
         self.consumer.remove_target(pump_pool);
-        for pair in &pairs {
-            self.consumer.remove_meteora_target(&pair.meteora.pool);
-        }
         if let Err(e) = ata::close_ata(&self.rpc, &self.keypair, &first.token_mint) {
             warn!(token = %first.token_mint, error = %e, "close_ata failed");
         }

@@ -281,7 +281,7 @@ pub struct RouteTemplate {
 /// collisions with account pubkeys or other args are effectively impossible.
 /// We require exactly ONE match; zero or multiple matches → None (safe
 /// fallback to Metis).  Returns (in_offset, quoted_out_offset).
-fn discover_offsets(data: &[u8], in_amount: u64, quoted_out: u64) -> Option<(usize, usize)> {
+pub fn discover_offsets(data: &[u8], in_amount: u64, quoted_out: u64) -> Option<(usize, usize)> {
     let in_le = in_amount.to_le_bytes();
     let out_le = quoted_out.to_le_bytes();
     if data.len() < 16 {
@@ -320,7 +320,7 @@ fn discover_offsets(data: &[u8], in_amount: u64, quoted_out: u64) -> Option<(usi
     Some((p, p + 8))
 }
 
-fn patch_amounts_b64(
+pub fn patch_amounts_b64(
     data_b64: &str,
     in_off: usize,
     out_off: usize,

@@ -476,7 +476,6 @@ fn spawn_shred_arb(
             target_pools,
             alt_map,
             rpc_client.clone(),
-            trading_keypair.pubkey(),
         ));
         let shred_metrics = consumer.metrics.clone();
         consumer.clone().spawn(tx);
@@ -515,8 +514,6 @@ fn spawn_shred_arb(
         let registry: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, Vec<pool_registry::ArbPair>>> =
             Arc::new(dashmap::DashMap::new());
         for p in pairs {
-            // Watch the Meteora counter-pool for in-flight competing txs.
-            consumer.add_meteora_target(p.meteora.pool);
             registry.entry(p.pump.pool).or_default().push(p);
         }
         // Pre-fetch ALTs for the startup (mix.json) pools so their first txs fit.
@@ -736,7 +733,6 @@ fn spawn_shred_arb(
             alt_builder,
             alt_fetcher,
             alt_registry,
-            consumer.meteora_activity(),
         ));
         engine.clone().spawn_reporter();
         // Second opportunity source: re-assess all pairs from current state

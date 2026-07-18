@@ -56,6 +56,20 @@ const EVAL_LOG_SAMPLE: u64 = 50;
 /// Pump pool.
 type PairKey = (solana_sdk::pubkey::Pubkey, solana_sdk::pubkey::Pubkey);
 
+/// One saved whole-route Metis response for a (pair, direction). On reuse only
+/// the two amounts inside the route instruction's Borsh data are rewritten
+/// (input and on-chain output floor — the floor already carries fee + tip), so
+/// no Metis call is needed. Lives in RAM only: the tokens are short-lived and a
+/// fresh process may never trade them again.
+#[derive(Clone)]
+struct CachedRoute {
+    swap_ixs: crate::metis::SwapInstructionsResponse,
+    /// Byte offsets of in_amount / quoted_out_amount in the decoded
+    /// swap_instruction data (discovered once at capture time).
+    in_off: usize,
+    out_off: usize,
+}
+
 /// Tunables sourced from `[shred_arb]` config.
 #[derive(Clone)]
 pub struct ArbParams {
@@ -151,9 +165,11 @@ pub struct ShredArbEngine {
     /// Best-ALT-per-pool registry harvested from competitor shreds (primary
     /// source for fresh pools). One max-coverage ALT per pool.
     pub alt_registry: Arc<crate::alt_registry::AltRegistry>,
-    /// Last in-flight (shred-observed) competing tx per watched Meteora pool —
-    /// fed by the ShredConsumer, read by the pre-send freshness gate.
-    meteora_activity: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>>,
+    /// In-RAM whole-route instruction cache: one Metis swap-instructions
+    /// response per (pair, direction), amount-patched on every reuse so hot
+    /// opportunities skip the Metis round-trip entirely. RAM-only by design —
+    /// the tokens are short-lived, so nothing is persisted across restarts.
+    route_cache: dashmap::DashMap<(PairKey, bool), CachedRoute>,
     last_fired: dashmap::DashMap<PairKey, Instant>,
     /// Last time we actually SENT a tx for a pair — de-dupes the spam of
     /// re-firing the same standing gap every 100ms.
@@ -208,6 +224,10 @@ pub struct ShredArbEngine {
     /// Skipped at the last moment because the pool moved during our compute
     /// window (a competitor's trade landed) so the tx would now revert.
     nosend_preempted: AtomicU64,
+    /// Route-instruction cache: sends served from RAM (no Metis round-trip)
+    /// vs. sends that had to fetch instructions from Metis first.
+    route_cache_hits: AtomicU64,
+    route_cache_misses: AtomicU64,
     /// Best (max) net lamports the optimizer found in the current window,
     /// including negatives — shows how close we get when nothing is profitable.
     best_net_seen: AtomicI64,
@@ -229,23 +249,12 @@ enum BuyOn {
 struct Recheck {
     buy_on_pump: bool,
     token_is_a: bool,
-    /// Predicted Pump reserves at detection time (post-observed-trade).
     pump_after: PumpPool,
-    /// LIVE Pump reserves at detection time — if the cached vaults have moved
-    /// past this snapshot by send time, other Pump txs landed and we re-price
-    /// against the live reserves instead of the frozen prediction.
-    pump_before: PumpPool,
-    pump_token_vault: solana_sdk::pubkey::Pubkey,
-    pump_wsol_vault: solana_sdk::pubkey::Pubkey,
     met_pool: solana_sdk::pubkey::Pubkey,
     fallback_fee: u64,
     amount_in: u64,
     /// Minimum WSOL out we need (input + network fee + tip).
     min_out: u64,
-    /// When this opportunity was detected — any in-flight Meteora tx observed
-    /// after this instant is treated as adverse (it almost always closes the
-    /// gap our bundle depends on).
-    started: Instant,
 }
 
 /// On-chain fate of the direct-sent transactions (checked a few seconds after
@@ -284,7 +293,6 @@ impl ShredArbEngine {
         alt_builder: Option<Arc<crate::alt_builder::AltBuilder>>,
         alt_fetcher: Option<Arc<crate::alt_fetch::AltFetcher>>,
         alt_registry: Arc<crate::alt_registry::AltRegistry>,
-        meteora_activity: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>>,
     ) -> Self {
         Self {
             metis,
@@ -305,7 +313,7 @@ impl ShredArbEngine {
             alt_builder,
             alt_fetcher,
             alt_registry,
-            meteora_activity,
+            route_cache: dashmap::DashMap::new(),
             last_fired: dashmap::DashMap::new(),
             last_sent: dashmap::DashMap::new(),
             sent_stats: Arc::new(SentStats::default()),
@@ -334,6 +342,8 @@ impl ShredArbEngine {
             nosend_too_locks: AtomicU64::new(0),
             nosend_send_err: AtomicU64::new(0),
             nosend_preempted: AtomicU64::new(0),
+            route_cache_hits: AtomicU64::new(0),
+            route_cache_misses: AtomicU64::new(0),
             best_net_seen: AtomicI64::new(i64::MIN),
         }
     }
@@ -673,25 +683,14 @@ impl ShredArbEngine {
         let tip = self.params.jito_tip_min_lamports
             + (net as f64 * self.params.jito_tip_profit_fraction) as u64;
         let onchain_floor = best_x + self.params.network_fee_lamports + tip;
-        // Live Pump snapshot at detection time — the pre-send gate compares the
-        // cached vaults against this to know whether OTHER Pump txs landed
-        // during our compute window (and re-prices from live state if so).
-        let pump_before = self
-            .pool_state
-            .pump_pool(&pair.pump.token_vault(), &pair.pump.wsol_vault())
-            .unwrap_or(pump_after);
         let recheck = Recheck {
             buy_on_pump: buy_on == BuyOn::Pump,
             token_is_a,
             pump_after,
-            pump_before,
-            pump_token_vault: pair.pump.token_vault(),
-            pump_wsol_vault: pair.pump.wsol_vault(),
             met_pool: pair.meteora.pool,
             fallback_fee: fallback_fee_numerator,
             amount_in: best_x,
             min_out: onchain_floor,
-            started: Instant::now(),
         };
         self.execute(pair, key, buy_kind, sell_kind, best_x, onchain_floor, tip, recheck)
             .await;
@@ -725,75 +724,125 @@ impl ShredArbEngine {
         let buy_label = self.label_for(buy_kind);
         let sell_label = self.label_for(sell_kind);
 
-        // Leg 1: forced buy on `buy_kind` (WSOL → token).
-        let q1 = match self
-            .metis
-            .get_quote_forced(WSOL_MINT, &token, amount_in, buy_label, self.params.metis_max_accounts)
-            .await
-        {
-            Ok(q) => q,
-            Err(e) => {
-                self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
-                self.handle_load_failure(pair, key, "buy", buy_label, &e.to_string()).await;
-                return;
-            }
-        };
-        let token_amt: u64 = match q1.out_amount.parse().ok().filter(|&v| v > 0) {
-            Some(v) => v,
-            None => {
-                self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
-                crate::errlog::log(
-                    "not-sent",
-                    &format!("token={token} reason=buy-quote-zero-out"),
-                );
-                return;
-            }
-        };
+        // ── RAM route cache: reuse the saved whole-route instruction ─────────
+        // If we already captured this (pair, direction) route from Metis, just
+        // rewrite the input amount and the on-chain output floor (which already
+        // includes network fee + Jito tip) inside the instruction data and send
+        // — no Metis round-trip at all.
+        let cache_key = (key, buy_kind == DexKind::PumpFunAmm);
+        let mut from_cache = false;
+        let cached_ixs = self.route_cache.get(&cache_key).and_then(|c| {
+            crate::template_cache::patch_amounts_b64(
+                &c.swap_ixs.swap_instruction.data,
+                c.in_off,
+                c.out_off,
+                amount_in,
+                floor,
+            )
+            .map(|data| {
+                let mut ixs = c.swap_ixs.clone();
+                ixs.swap_instruction.data = data;
+                ixs
+            })
+        });
 
-        // Leg 2: forced sell on `sell_kind` (token → WSOL).
-        let q2 = match self
-            .metis
-            .get_quote_forced(&token, WSOL_MINT, token_amt, sell_label, self.params.metis_max_accounts)
-            .await
-        {
-            Ok(q) => q,
-            Err(e) => {
-                self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
-                self.handle_load_failure(pair, key, "sell", sell_label, &e.to_string()).await;
-                return;
-            }
-        };
-        // Both legs routed — clear any load-failure strikes.
-        self.load_fail.remove(&key);
-        self.note_route_success(key);
+        let swap_ixs = if let Some(ixs) = cached_ixs {
+            from_cache = true;
+            self.route_cache_hits.fetch_add(1, Ordering::Relaxed);
+            ixs
+        } else {
+            self.route_cache_misses.fetch_add(1, Ordering::Relaxed);
 
-        // Set the on-chain floor to exactly the input (break-even) regardless of
-        // what Metis quoted (our data is ahead of Metis).
-        let merged = match MetisClient::merge_quotes(&q1, &q2, floor) {
-            Ok(m) => m,
-            Err(e) => {
-                self.nosend_build_fail.fetch_add(1, Ordering::Relaxed);
-                warn!(error = %e, "merge_quotes failed");
-                crate::errlog::log("not-sent", &format!("token={token} reason=merge-fail err={e}"));
-                return;
-            }
-        };
+            // Leg 1: forced buy on `buy_kind` (WSOL → token).
+            let q1 = match self
+                .metis
+                .get_quote_forced(WSOL_MINT, &token, amount_in, buy_label, self.params.metis_max_accounts)
+                .await
+            {
+                Ok(q) => q,
+                Err(e) => {
+                    self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
+                    self.handle_load_failure(pair, key, "buy", buy_label, &e.to_string()).await;
+                    return;
+                }
+            };
+            let token_amt: u64 = match q1.out_amount.parse().ok().filter(|&v| v > 0) {
+                Some(v) => v,
+                None => {
+                    self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
+                    crate::errlog::log(
+                        "not-sent",
+                        &format!("token={token} reason=buy-quote-zero-out"),
+                    );
+                    return;
+                }
+            };
 
-        let swap_ixs = match self
-            .metis
-            .get_swap_instructions(&self.user_pubkey, &merged, self.params.use_shared_accounts)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                self.nosend_swapix_fail.fetch_add(1, Ordering::Relaxed);
-                warn!(?e, "swap_instructions failed for forced arb");
-                crate::errlog::log(
-                    "not-sent",
-                    &format!("token={token} reason=swap-instructions-fail err={e:?}"),
-                );
-                return;
+            // Leg 2: forced sell on `sell_kind` (token → WSOL).
+            let q2 = match self
+                .metis
+                .get_quote_forced(&token, WSOL_MINT, token_amt, sell_label, self.params.metis_max_accounts)
+                .await
+            {
+                Ok(q) => q,
+                Err(e) => {
+                    self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
+                    self.handle_load_failure(pair, key, "sell", sell_label, &e.to_string()).await;
+                    return;
+                }
+            };
+            // Both legs routed — clear any load-failure strikes.
+            self.load_fail.remove(&key);
+            self.note_route_success(key);
+
+            // Set the on-chain floor to exactly the input (break-even) regardless of
+            // what Metis quoted (our data is ahead of Metis).
+            let merged = match MetisClient::merge_quotes(&q1, &q2, floor) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.nosend_build_fail.fetch_add(1, Ordering::Relaxed);
+                    warn!(error = %e, "merge_quotes failed");
+                    crate::errlog::log("not-sent", &format!("token={token} reason=merge-fail err={e}"));
+                    return;
+                }
+            };
+
+            let swap_ixs = match self
+                .metis
+                .get_swap_instructions(&self.user_pubkey, &merged, self.params.use_shared_accounts)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    self.nosend_swapix_fail.fetch_add(1, Ordering::Relaxed);
+                    warn!(?e, "swap_instructions failed for forced arb");
+                    crate::errlog::log(
+                        "not-sent",
+                        &format!("token={token} reason=swap-instructions-fail err={e:?}"),
+                    );
+                    return;
+                }
+            };
+
+            // Capture the whole route for next time: find where the two amounts
+            // live inside the instruction's Borsh data (this request used
+            // in=amount_in, quoted_out=floor, so we can search for them). If the
+            // layout doesn't validate we just keep going through Metis.
+            if let Ok(raw) = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &swap_ixs.swap_instruction.data,
+            ) {
+                if let Some((in_off, out_off)) =
+                    crate::template_cache::discover_offsets(&raw, amount_in, floor)
+                {
+                    self.route_cache.insert(
+                        cache_key,
+                        CachedRoute { swap_ixs: swap_ixs.clone(), in_off, out_off },
+                    );
+                    debug!(token = %token, "route instructions cached in RAM");
+                }
             }
+            swap_ixs
         };
 
         // Teach our self-learning ALT every account in this route so subsequent
@@ -865,6 +914,9 @@ impl ShredArbEngine {
             {
                 Ok(Ok(tx)) => tx,
                 _ => {
+                    if from_cache {
+                        self.route_cache.remove(&cache_key);
+                    }
                     self.nosend_build_fail.fetch_add(1, Ordering::Relaxed);
                     warn!("build_direct_transaction failed");
                     crate::errlog::log("not-sent", &format!("token={token} reason=build-fail"));
@@ -874,6 +926,9 @@ impl ShredArbEngine {
 
             let locks = transaction::account_lock_count(&tx);
             if locks > 64 {
+                if from_cache {
+                    self.route_cache.remove(&cache_key);
+                }
                 self.nosend_too_locks.fetch_add(1, Ordering::Relaxed);
                 warn!(locks, "direct arb tx exceeds 64 account locks, dropping");
                 crate::errlog::log(
@@ -885,6 +940,9 @@ impl ShredArbEngine {
             // Final size gate (Solana caps at 1232 raw bytes).
             let raw = transaction::serialized_len(&tx);
             if raw > 1232 {
+                if from_cache {
+                    self.route_cache.remove(&cache_key);
+                }
                 self.nosend_too_large.fetch_add(1, Ordering::Relaxed);
                 let alts_used = match &tx.message {
                     solana_sdk::message::VersionedMessage::V0(m) => m.address_table_lookups.len(),
@@ -997,6 +1055,9 @@ impl ShredArbEngine {
         {
             Ok(Ok(tx)) => tx,
             _ => {
+                if from_cache {
+                    self.route_cache.remove(&cache_key);
+                }
                 self.nosend_build_fail.fetch_add(1, Ordering::Relaxed);
                 warn!("build_arb_transaction failed");
                 crate::errlog::log("not-sent", &format!("token={token} reason=build-fail-jito"));
@@ -1005,12 +1066,18 @@ impl ShredArbEngine {
         };
 
         if transaction::account_lock_count(&tx) > 64 {
+            if from_cache {
+                self.route_cache.remove(&cache_key);
+            }
             self.nosend_too_locks.fetch_add(1, Ordering::Relaxed);
             warn!("forced arb tx exceeds 64 account locks, dropping");
             return;
         }
         let raw = transaction::serialized_len(&tx);
         if raw > 1232 {
+            if from_cache {
+                self.route_cache.remove(&cache_key);
+            }
             self.nosend_too_large.fetch_add(1, Ordering::Relaxed);
             let alts_used = match &tx.message {
                 solana_sdk::message::VersionedMessage::V0(m) => m.address_table_lookups.len(),
@@ -1079,57 +1146,22 @@ impl ShredArbEngine {
     /// Meteora reading we do NOT block (return true) — better to try than to
     /// stall on a cache gap.
     fn still_profitable(&self, r: &Recheck) -> bool {
-        // 1) In-flight Meteora tx seen on shreds since detection? Those come
-        // from the SAME low-liquidity pool our sell/buy leg depends on — a
-        // direct swap or a multi-hop arb routed through it closes our gap ~90%
-        // of the time, and its effect is NOT yet in the cached state (it is
-        // pre-consensus). Recompute below cannot see it, so drop outright.
-        if let Some(t) = self.meteora_activity.get(&r.met_pool) {
-            if *t.value() >= r.started {
-                return false;
-            }
-        }
-
         let met = match self.pool_state.meteora_pool(&r.met_pool, r.fallback_fee) {
             Some(m) => m,
             None => return true,
         };
-
-        // 2) Pump side: other Pump.fun txs during our window are usually
-        // harmless (the pool is deep). Only if the cached vaults moved past the
-        // detection-time snapshot do we re-price from the LIVE reserves — and
-        // even then we still send as long as the output clears the on-chain
-        // floor (positive slippage never blocks a send; the floor is exactly
-        // what the tx enforces anyway).
-        let pump = match self
-            .pool_state
-            .pump_pool(&r.pump_token_vault, &r.pump_wsol_vault)
-        {
-            Some(live)
-                if live.base_reserve != r.pump_before.base_reserve
-                    || live.quote_reserve != r.pump_before.quote_reserve =>
-            {
-                // Other Pump txs (possibly including the one we predicted)
-                // landed — the live reserves are now the best estimate.
-                live
-            }
-            _ => r.pump_after, // unchanged → keep the post-trade prediction
-        };
-
         let out = if r.buy_on_pump {
-            let base = pump.quote_buy(r.amount_in);
+            let base = r.pump_after.quote_buy(r.amount_in);
             if base == 0 {
                 return false;
             }
             met.sell_token_for_wsol(base, r.token_is_a)
         } else {
             match met.buy_token_with_wsol(r.amount_in, r.token_is_a) {
-                Some(base) if base > 0 => Some(PumpPool::quote_sell(&pump, base)),
+                Some(base) if base > 0 => Some(PumpPool::quote_sell(&r.pump_after, base)),
                 _ => None,
             }
         };
-        // Only NEGATIVE slippage (output below the revert floor) blocks the
-        // send; anything at or above the floor goes out as originally built.
         matches!(out, Some(o) if o >= r.min_out)
     }
 
@@ -1229,7 +1261,8 @@ impl ShredArbEngine {
                     "\n[shred-arb 30s] watching_pools={}\n\
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} bad_price={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
-                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}",
+                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
+                     ROUTE-RAM: hits={} misses={} cached_routes={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
                     self.profitable.load(Ordering::Relaxed),
@@ -1252,6 +1285,9 @@ impl ShredArbEngine {
                     self.nosend_too_locks.load(Ordering::Relaxed),
                     self.nosend_send_err.load(Ordering::Relaxed),
                     self.nosend_preempted.load(Ordering::Relaxed),
+                    self.route_cache_hits.load(Ordering::Relaxed),
+                    self.route_cache_misses.load(Ordering::Relaxed),
+                    self.route_cache.len(),
                 );
             }
         });
