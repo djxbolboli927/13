@@ -170,6 +170,9 @@ pub struct ShredArbEngine {
     /// Consecutive "No routes found" load failures per pool while we retry
     /// add-market on BOTH legs. After `LOAD_RETRY_LIMIT` the pool is disabled.
     load_fail: dashmap::DashMap<solana_sdk::pubkey::Pubkey, u32>,
+    /// Last time a load-failure strike was counted per pool (strikes are
+    /// rate-limited to 1/s so a fresh pool gets real time to load into Metis).
+    load_fail_last: dashmap::DashMap<solana_sdk::pubkey::Pubkey, Instant>,
     /// Pools disabled after repeated failed Metis loads (only one leg ever
     /// loaded). Skipped in `assess` so they stop producing No-routes spam. Never
     /// closed (per never_close policy) — just not traded.
@@ -311,6 +314,7 @@ impl ShredArbEngine {
             sim_sample: AtomicU64::new(0),
             route_fail: dashmap::DashMap::new(),
             load_fail: dashmap::DashMap::new(),
+            load_fail_last: dashmap::DashMap::new(),
             disabled: dashmap::DashSet::new(),
             signals_received: AtomicU64::new(0),
             skip_min_trigger: AtomicU64::new(0),
@@ -1238,6 +1242,19 @@ impl ShredArbEngine {
         venue: &str,
         err: &str,
     ) {
+        // Rate-limit strikes to one per second. The 200ms state evaluator would
+        // otherwise burn all LOAD_RETRY_LIMIT strikes in ~2s — disabling a hot,
+        // freshly-discovered pool before Metis has even finished indexing its
+        // markets (the "sees opportunities but never sends" symptom). One strike
+        // per second means a pool gets ≥ LOAD_RETRY_LIMIT seconds to load.
+        let now = Instant::now();
+        {
+            let mut last = self.load_fail_last.entry(pool).or_insert(now);
+            if *last != now && last.elapsed() < Duration::from_secs(1) {
+                return;
+            }
+            *last = now;
+        }
         let n = {
             let mut e = self.load_fail.entry(pool).or_insert(0);
             *e += 1;
@@ -1245,7 +1262,7 @@ impl ShredArbEngine {
         };
         // Re-add BOTH markets so a half-loaded pair gets its missing leg.
         self.readd_market(pair, DexKind::PumpFunAmm).await;
-        self.readd_market(pair, DexKind::MeteoraDammV2).await;
+        self.readd_market(pair, pair.counter.kind).await;
         if n >= LOAD_RETRY_LIMIT {
             self.disabled.insert(pool);
             self.load_fail.remove(&pool);
