@@ -172,6 +172,11 @@ pub struct ShredArbConfig {
     /// of the Jito tip; toggle this to A/B test whether it helps landing.
     #[serde(default)]
     pub compute_unit_price_microlamports: u64,
+    /// Max consecutive Metis "No routes found" failures on a pair before it is
+    /// disabled (stops wasting compute on a token Metis won't route). The
+    /// disable reason is written to the error log. 0 = built-in default (10).
+    #[serde(default = "default_metis_load_retry_limit")]
+    pub metis_load_retry_limit: u32,
     /// Token mints whose ATA is assumed to ALWAYS exist — never checked, never
     /// created at startup. Put SOL/WSOL/USDC/USDT (and any other permanent
     /// holdings) here. Edited in config.toml under `[shred_arb]`.
@@ -439,12 +444,16 @@ impl Default for ShredArbConfig {
             metis_max_accounts: default_metis_max_accounts(),
             direct_loaded_accounts_data_limit: 0,
             compute_unit_price_microlamports: 0,
+            metis_load_retry_limit: default_metis_load_retry_limit(),
         }
     }
 }
 
 fn default_metis_max_accounts() -> u64 {
     50
+}
+fn default_metis_load_retry_limit() -> u32 {
+    10
 }
 fn default_pump_label() -> String {
     "Pump.fun Amm".to_string()

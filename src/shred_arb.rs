@@ -34,10 +34,9 @@ use crate::shred_stream::PumpSwapSignal;
 use crate::tokens::WSOL_MINT;
 use crate::transaction;
 
-/// After this many consecutive Metis "No routes found" failures — while we keep
-/// re-adding BOTH legs — a pool is disabled (only one leg ever loaded into
-/// Metis). Stops the endless No-routes spam; the reason is written to /root/g.
-const LOAD_RETRY_LIMIT: u32 = 10;
+/// Fallback for the max consecutive Metis "No routes found" failures before a
+/// pair is disabled, used only if config leaves `metis_load_retry_limit` at 0.
+const LOAD_RETRY_LIMIT_DEFAULT: u32 = 10;
 
 /// Max public ALTs attached per transaction: one best-coverage table per leg
 /// (buy + sell), never duplicated.
@@ -117,6 +116,9 @@ pub struct ArbParams {
     /// SetComputeUnitPrice priority fee, micro-lamports/CU (0 = don't add). Used
     /// on the Jito path too; toggled from config for A/B testing landing rates.
     pub compute_unit_price_microlamports: u64,
+    /// Max consecutive Metis "No routes" failures before a pair is disabled and
+    /// stops wasting compute (0 = use the built-in default of 10).
+    pub metis_load_retry_limit: u32,
     /// Only react to observed trades ≥ this fraction of the Pump WSOL reserve
     /// (0 = disabled, use the absolute min_trigger only).
     pub min_trigger_reserve_frac: f64,
@@ -1304,10 +1306,15 @@ impl ShredArbEngine {
             *e += 1;
             *e
         };
+        let limit = if self.params.metis_load_retry_limit == 0 {
+            LOAD_RETRY_LIMIT_DEFAULT
+        } else {
+            self.params.metis_load_retry_limit
+        };
         // Re-add BOTH markets so a half-loaded pair gets its missing leg.
         self.readd_market(pair, DexKind::PumpFunAmm).await;
         self.readd_market(pair, DexKind::MeteoraDammV2).await;
-        if n >= LOAD_RETRY_LIMIT {
+        if n >= limit {
             self.disabled.insert(key);
             self.load_fail.remove(&key);
             warn!(pool = %key.0, meteora = %key.1, token = %pair.token_mint, attempts = n, "disabling pair — Metis never loaded both legs");
@@ -1323,7 +1330,7 @@ impl ShredArbEngine {
             crate::errlog::log(
                 "not-sent",
                 &format!(
-                    "token={} reason={leg}-quote-fail attempt={n}/{LOAD_RETRY_LIMIT} venue={venue} err={err}",
+                    "token={} reason={leg}-quote-fail attempt={n}/{limit} venue={venue} err={err}",
                     pair.token_mint
                 ),
             );
