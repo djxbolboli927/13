@@ -134,6 +134,11 @@ pub struct ArbParams {
     /// `max_volatility_accumulator` ceiling instead of the stored value, so the
     /// fee is never understated (kills phantom profit). Toggle in config.
     pub meteora_fee_worst_case: bool,
+    /// Minimum WSOL depth (lamports) a pool must hold on EACH side to be traded.
+    /// If either the Pump or Meteora WSOL reserve is below this, the opportunity
+    /// is skipped up-front (before the slippage calc). Default 800_000
+    /// (0.0008 WSOL).
+    pub min_pool_wsol_lamports: u64,
     /// Never tear a pool down (route failures no longer drop/close it). Kept for
     /// config symmetry; teardown is gated in main.rs, so it's not read here.
     #[allow(dead_code)]
@@ -530,6 +535,23 @@ impl ShredArbEngine {
             self.skip_bad_price.fetch_add(1, Ordering::Relaxed);
             return;
         }
+
+        // ── Liquidity guard (BOTH sides, BEFORE any slippage calc) ───────────
+        // If EITHER pool's WSOL depth is below the floor, skip immediately —
+        // don't waste the compute on a pool too thin to trade (its slippage
+        // eats any gap and just fabricates profit). Checked up-front on both the
+        // Pump WSOL reserve and the Meteora WSOL reserve. Default 800_000
+        // lamports = 0.0008 WSOL; a pool that recovers above it trades again.
+        let token_is_a = pair.meteora.token_is_a;
+        let pump_wsol_depth = pump_after.quote_reserve;
+        let met_wsol_depth = meteora.wsol_reserve(token_is_a);
+        if pump_wsol_depth < self.params.min_pool_wsol_lamports
+            || met_wsol_depth < self.params.min_pool_wsol_lamports
+        {
+            self.skip_bad_price.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
         let buy_on = if pump_price < met_price {
             BuyOn::Pump // token cheaper on pump
         } else {
@@ -537,7 +559,6 @@ impl ShredArbEngine {
         };
 
         // 4) Optimal size.
-        let token_is_a = pair.meteora.token_is_a;
         let eval = |x: u64| -> Option<u64> {
             match buy_on {
                 BuyOn::Pump => {

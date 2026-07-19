@@ -242,6 +242,11 @@ pub struct ShredArbConfig {
     /// (kills phantom profit on volatile new pools). Default false.
     #[serde(default)]
     pub meteora_fee_worst_case: bool,
+    /// Minimum WSOL depth (lamports) a pool must hold on EACH side to be traded.
+    /// Below this on either the Pump or Meteora side, the pool is skipped
+    /// up-front. Default 800_000 (0.0008 WSOL).
+    #[serde(default = "default_min_pool_wsol_lamports")]
+    pub min_pool_wsol_lamports: u64,
     /// Seconds between fee-audit log lines (decoded fee per tracked pair, for
     /// hand-verification against real on-chain swaps). 0 = off. Default 120.
     #[serde(default = "default_fee_audit_log_secs")]
@@ -338,6 +343,10 @@ fn default_send_dedup_ms() -> u64 {
 fn default_fee_audit_log_secs() -> u64 {
     120
 }
+
+fn default_min_pool_wsol_lamports() -> u64 {
+    800_000
+}
 fn default_status_check_delay_secs() -> u64 {
     12
 }
@@ -401,6 +410,7 @@ impl Default for ShredArbConfig {
             send_dedup_ms: default_send_dedup_ms(),
             instructions_pp: true,
             meteora_fee_worst_case: false,
+            min_pool_wsol_lamports: default_min_pool_wsol_lamports(),
             fee_audit_log_secs: default_fee_audit_log_secs(),
             status_check_delay_secs: default_status_check_delay_secs(),
             error_log_dir: default_error_log_dir(),
