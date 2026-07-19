@@ -177,6 +177,12 @@ pub struct ShredArbConfig {
     /// disable reason is written to the error log. 0 = built-in default (10).
     #[serde(default = "default_metis_load_retry_limit")]
     pub metis_load_retry_limit: u32,
+    /// Skip an opportunity if the Meteora pool's cached state is more than this
+    /// many slots behind the newest slot seen. Pricing off a stale Meteora
+    /// sqrt_price is the proven cause of the 0x1771 over-prediction reverts, so
+    /// this refuses to trade on stale state. 0 = gate off. Try 10-25.
+    #[serde(default)]
+    pub meteora_max_stale_slots: u64,
     /// Token mints whose ATA is assumed to ALWAYS exist — never checked, never
     /// created at startup. Put SOL/WSOL/USDC/USDT (and any other permanent
     /// holdings) here. Edited in config.toml under `[shred_arb]`.
@@ -445,6 +451,7 @@ impl Default for ShredArbConfig {
             direct_loaded_accounts_data_limit: 0,
             compute_unit_price_microlamports: 0,
             metis_load_retry_limit: default_metis_load_retry_limit(),
+            meteora_max_stale_slots: 0,
         }
     }
 }

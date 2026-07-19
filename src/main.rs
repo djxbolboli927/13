@@ -393,6 +393,7 @@ fn spawn_shred_arb(
         loaded_accounts_data_limit: sa.direct_loaded_accounts_data_limit,
         compute_unit_price_microlamports: sa.compute_unit_price_microlamports,
         metis_load_retry_limit: sa.metis_load_retry_limit,
+        meteora_max_stale_slots: sa.meteora_max_stale_slots,
         min_trigger_reserve_frac: sa.min_trigger_reserve_frac,
         pump_label: sa.metis_pump_label.clone(),
         meteora_label: sa.metis_meteora_label.clone(),

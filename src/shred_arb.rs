@@ -119,6 +119,9 @@ pub struct ArbParams {
     /// Max consecutive Metis "No routes" failures before a pair is disabled and
     /// stops wasting compute (0 = use the built-in default of 10).
     pub metis_load_retry_limit: u32,
+    /// Skip if the Meteora pool state is more than this many slots stale
+    /// (0 = off). The proven fix for the stale-sqrt_price over-prediction.
+    pub meteora_max_stale_slots: u64,
     /// Only react to observed trades ≥ this fraction of the Pump WSOL reserve
     /// (0 = disabled, use the absolute min_trigger only).
     pub min_trigger_reserve_frac: f64,
@@ -213,6 +216,10 @@ pub struct ShredArbEngine {
     skip_cooldown: AtomicU64,
     skip_no_pump_state: AtomicU64,
     skip_no_meteora_state: AtomicU64,
+    /// Skipped because the Meteora pool's cached state is older than
+    /// `meteora_max_stale_slots` — pricing off a stale sqrt_price is exactly what
+    /// caused the over-prediction reverts (proven: math + decode are exact).
+    skip_stale_meteora: AtomicU64,
     skip_bad_price: AtomicU64,
     /// Skipped because one side's WSOL depth was below min_pool_wsol_lamports
     /// (the both-sides liquidity guard). Split out of `bad_price` so the operator
@@ -353,6 +360,7 @@ impl ShredArbEngine {
             skip_cooldown: AtomicU64::new(0),
             skip_no_pump_state: AtomicU64::new(0),
             skip_no_meteora_state: AtomicU64::new(0),
+            skip_stale_meteora: AtomicU64::new(0),
             skip_bad_price: AtomicU64::new(0),
             skip_thin_pool: AtomicU64::new(0),
             skip_implausible: AtomicU64::new(0),
@@ -571,6 +579,26 @@ impl ShredArbEngine {
                 return;
             }
         };
+
+        // ── Meteora freshness gate ───────────────────────────────────────────
+        // Both a source audit and a real-swap reconstruction proved the Meteora
+        // math + decode are EXACT: given the correct sqrt_price/liquidity we
+        // reproduce the on-chain output to the lamport. So the ~3-6% over-
+        // prediction that reverts 0x1771 is a STALE sqrt_price — we priced off a
+        // snapshot older than the state the tx executes against (the pool-state
+        // gRPC feed lags for low-activity Meteora accounts). Refuse to trade a
+        // Meteora pool whose cached state is more than `meteora_max_stale_slots`
+        // behind the newest slot we've seen. 0 = gate off.
+        if self.params.meteora_max_stale_slots > 0 {
+            let behind = self
+                .pool_state
+                .slot()
+                .saturating_sub(self.pool_state.last_update_slot(&pair.meteora.pool).unwrap_or(0));
+            if behind > self.params.meteora_max_stale_slots {
+                self.skip_stale_meteora.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
 
         // 3) Direction: compare raw price (WSOL-raw per token-raw) on both.
         let pump_price = if pump_after.base_reserve == 0 {
@@ -1505,7 +1533,7 @@ impl ShredArbEngine {
                 let unknown = ss.unknown.load(Ordering::Relaxed);
                 eprintln!(
                     "\n[shred-arb 30s] watching_pools={}\n\
-                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} bad_price={} thin_pool={} implausible={}]\n\
+                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
@@ -1516,6 +1544,7 @@ impl ShredArbEngine {
                     self.skip_uncrossable.load(Ordering::Relaxed),
                     self.skip_min_trigger.load(Ordering::Relaxed),
                     self.skip_no_meteora_state.load(Ordering::Relaxed),
+                    self.skip_stale_meteora.load(Ordering::Relaxed),
                     self.skip_bad_price.load(Ordering::Relaxed),
                     self.skip_thin_pool.load(Ordering::Relaxed),
                     self.skip_implausible.load(Ordering::Relaxed),
