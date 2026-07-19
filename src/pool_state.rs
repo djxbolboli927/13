@@ -496,6 +496,60 @@ impl PoolStateCache {
         read_u64_le(entry.value(), 36)
     }
 
+    /// Token-2022 transfer-fee basis points for a token mint, or 0 if none.
+    ///
+    /// WHY THIS MATTERS: cp-amm (and every SPL-token program) charges the mint's
+    /// transfer fee on EVERY transfer of the token. The on-chain DAMM v2 swap
+    /// applies `calculate_transfer_fee_excluded_amount` to BOTH the input and the
+    /// output (`process_swap_exact_in`), so the pool receives less than we send
+    /// and we receive less than the curve output. Our pool math models NEITHER,
+    /// so on a fee-bearing token our predicted output is systematically HIGHER
+    /// than reality — an over-prediction that grows with size and causes 0x1771
+    /// slippage reverts even on "profitable" trades.
+    ///
+    /// A classic (Tokenkeg) SPL mint is EXACTLY 82 bytes and can never carry this
+    /// extension, so any transfer fee lives only in a Token-2022 mint whose data
+    /// is longer and holds a TLV extension list after the 82-byte base + 1-byte
+    /// account-type tag. We scan that TLV for `TransferFeeConfig` (type 1) and
+    /// return the LARGER of its two epoch fees (older/newer) — never understating
+    /// the fee, so profit is never overstated.
+    pub fn mint_transfer_fee_bps(&self, mint: &Pubkey) -> u16 {
+        let entry = match self.inner.get(mint) {
+            Some(e) => e,
+            None => return 0,
+        };
+        let d = entry.value();
+        // Base Mint is 82 bytes; extensions require [82]=account_type then TLV.
+        if d.len() <= 83 {
+            return 0;
+        }
+        let mut off = 83usize; // first TLV entry (after base 82 + account_type 1)
+        while off + 4 <= d.len() {
+            let ext_type = u16::from_le_bytes([d[off], d[off + 1]]);
+            let ext_len = u16::from_le_bytes([d[off + 2], d[off + 3]]) as usize;
+            let data_start = off + 4;
+            let data_end = data_start + ext_len;
+            if data_end > d.len() {
+                break;
+            }
+            // TransferFeeConfig extension = type 1. Its data layout:
+            //   authority(32) + withdraw_authority(32) + withheld_amount(8)
+            //   + older_transfer_fee(18) + newer_transfer_fee(18)
+            // where TransferFee = epoch(8)+maximum_fee(8)+basis_points(u16,2),
+            // so basis_points sits at data offset 88 (older) and 106 (newer).
+            if ext_type == 1 && ext_len >= 108 {
+                let older = u16::from_le_bytes([d[data_start + 88], d[data_start + 89]]);
+                let newer = u16::from_le_bytes([d[data_start + 106], d[data_start + 107]]);
+                return older.max(newer);
+            }
+            if ext_len == 0 {
+                break; // malformed / end-of-list guard
+            }
+            off = data_end;
+        }
+        0
+    }
+
     /// Spawn the subscription task with reconnect/backoff. `accounts` seeds the
     /// initial set; more can be added later via [`add_accounts`].
     pub fn spawn_subscription(

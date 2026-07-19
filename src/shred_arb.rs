@@ -267,6 +267,8 @@ struct Recheck {
     amount_in: u64,
     /// Minimum WSOL out we need (input + network fee + tip).
     min_out: u64,
+    /// Token-2022 transfer-fee bps of the intermediate token (0 for classic SPL).
+    tfee_bps: u16,
 }
 
 /// On-chain fate of the direct-sent transactions (checked a few seconds after
@@ -558,6 +560,20 @@ impl ShredArbEngine {
             BuyOn::Meteora
         };
 
+        // Token-2022 transfer fee (0 for classic SPL). The intermediate token is
+        // transferred TWICE — out of the buy pool to us, then from us into the
+        // sell pool — and the on-chain program excludes the transfer fee on both
+        // legs. Model it, or our predicted output over-states reality and the tx
+        // reverts 0x1771. Ceiling the fee (pool-favorable) so we never understate.
+        let tfee_bps = self.pool_state.mint_transfer_fee_bps(&pair.token_mint) as u128;
+        let apply_tfee = move |amt: u64| -> u64 {
+            if tfee_bps == 0 {
+                return amt;
+            }
+            let fee = ((amt as u128) * tfee_bps + 9_999) / 10_000;
+            (amt as u128).saturating_sub(fee) as u64
+        };
+
         // 4) Optimal size.
         let eval = |x: u64| -> Option<u64> {
             match buy_on {
@@ -566,14 +582,22 @@ impl ShredArbEngine {
                     if base_out == 0 {
                         return None;
                     }
-                    meteora.sell_token_for_wsol(base_out, token_is_a)
+                    let tok = apply_tfee(apply_tfee(base_out));
+                    if tok == 0 {
+                        return None;
+                    }
+                    meteora.sell_token_for_wsol(tok, token_is_a)
                 }
                 BuyOn::Meteora => {
                     let base_out = meteora.buy_token_with_wsol(x, token_is_a)?;
                     if base_out == 0 {
                         return None;
                     }
-                    Some(PumpPool::quote_sell(&pump_after, base_out))
+                    let tok = apply_tfee(apply_tfee(base_out));
+                    if tok == 0 {
+                        return None;
+                    }
+                    Some(PumpPool::quote_sell(&pump_after, tok))
                 }
             }
         };
@@ -719,6 +743,7 @@ impl ShredArbEngine {
             fallback_fee: fallback_fee_numerator,
             amount_in: best_x,
             min_out: onchain_floor,
+            tfee_bps: tfee_bps as u16,
         };
         self.execute(pair, key, buy_kind, sell_kind, best_x, onchain_floor, tip, recheck)
             .await;
@@ -1208,15 +1233,29 @@ impl ShredArbEngine {
             Some(m) => m,
             None => return true,
         };
+        // Same transfer-fee model as the assess-time eval: the intermediate token
+        // is taxed twice (out of the buy pool, into the sell pool).
+        let tfee_bps = r.tfee_bps as u128;
+        let apply_tfee = |amt: u64| -> u64 {
+            if tfee_bps == 0 {
+                return amt;
+            }
+            let fee = ((amt as u128) * tfee_bps + 9_999) / 10_000;
+            (amt as u128).saturating_sub(fee) as u64
+        };
         let out = if r.buy_on_pump {
             let base = r.pump_after.quote_buy(r.amount_in);
             if base == 0 {
                 return false;
             }
-            met.sell_token_for_wsol(base, r.token_is_a)
+            let tok = apply_tfee(apply_tfee(base));
+            met.sell_token_for_wsol(tok, r.token_is_a)
         } else {
             match met.buy_token_with_wsol(r.amount_in, r.token_is_a) {
-                Some(base) if base > 0 => Some(PumpPool::quote_sell(&r.pump_after, base)),
+                Some(base) if base > 0 => {
+                    let tok = apply_tfee(apply_tfee(base));
+                    Some(PumpPool::quote_sell(&r.pump_after, tok))
+                }
                 _ => None,
             }
         };
