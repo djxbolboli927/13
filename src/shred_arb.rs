@@ -1094,12 +1094,14 @@ impl ShredArbEngine {
         };
 
         // `tip` is the dynamic tip computed in assess (min + profit share).
+        let data_limit = self.params.loaded_accounts_data_limit;
         let tx = match tokio::task::spawn_blocking(move || {
             transaction::build_arb_transaction(
                 &swap_ixs,
                 &keypair,
                 tip,
                 cu,
+                data_limit,
                 recent_blockhash,
                 &alt,
                 &rpc,

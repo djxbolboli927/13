@@ -85,6 +85,10 @@ pub fn build_arb_transaction(
     payer: &Keypair,
     tip_lamports: u64,
     cu_limit: u32,
+    // SetLoadedAccountsDataSizeLimit byte value (0 = don't add). Every competitor
+    // sets this — it caps the account-data bytes billed, cutting the CU the
+    // leader charges for loading accounts, which materially helps the tx land.
+    loaded_accounts_data_limit: u32,
     recent_blockhash: Hash,
     alt_cache: &AltCache,
     rpc_client: &RpcClient,
@@ -111,6 +115,19 @@ pub fn build_arb_transaction(
         },
     };
     instructions.push(cu_limit_ix);
+
+    // #1b -- SetLoadedAccountsDataSizeLimit, optional (0x04, u32 bytes).
+    if loaded_accounts_data_limit > 0 {
+        instructions.push(Instruction {
+            program_id: Pubkey::from_str("ComputeBudget111111111111111111111111111111")?,
+            accounts: vec![],
+            data: {
+                let mut data = vec![0x04];
+                data.extend_from_slice(&loaded_accounts_data_limit.to_le_bytes());
+                data
+            },
+        });
+    }
 
     // #2 -- Single route_v2 for the entire circular swap
     instructions.push(to_sdk_instruction(&swap_ixs.swap_instruction)?);

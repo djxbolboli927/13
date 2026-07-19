@@ -360,6 +360,7 @@ pub fn spawn_workers(
                         &keypair,
                         JITO_TIP_LAMPORTS,
                         cu_limit,
+                        0, // legacy scanner: no data-size-limit ix
                         recent_blockhash,
                         &alt,
                         &rpc,
