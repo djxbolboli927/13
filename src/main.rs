@@ -107,6 +107,22 @@ async fn async_main(config: config::Config) -> Result<()> {
     // so that traffic never rate-limits the trading RPC.
     let rpc_secondary = Arc::new(RpcClient::new(config.rpc.secondary().to_string()));
 
+    // Load the REAL PumpSwap fee tiers from the on-chain FeeConfig once, so the
+    // Pump.fun AMM fee is exactly what the program charges (not a hardcoded
+    // guess). Best-effort: keeps the built-in schedule if the read/parse fails.
+    match pumpfun_math::load_onchain_fee_tiers(&rpc_secondary) {
+        Some(tiers) => {
+            eprintln!(
+                "[pump-fee] loaded {} on-chain PumpSwap fee tiers from FeeConfig",
+                tiers.len()
+            );
+            pumpfun_math::set_onchain_fee_tiers(tiers);
+        }
+        None => eprintln!(
+            "[pump-fee] could not read on-chain FeeConfig — using built-in fee schedule"
+        ),
+    }
+
     let wsol_mint = solana_sdk::pubkey::Pubkey::from_str_const(tokens::WSOL_MINT);
     let wsol_ata = spl_associated_token_account::get_associated_token_address(
         &trading_keypair.pubkey(),

@@ -21,6 +21,47 @@ const BPS_DENOM: u64 = 10_000;
 
 const LAMPORTS_PER_SOL: u128 = 1_000_000_000;
 
+/// PumpSwap fee tiers read from the ACTUAL on-chain `FeeConfig` account at
+/// startup, ascending by market-cap threshold **in lamports**:
+/// `(mcap_threshold_lamports, total_bps, lp_bps)`. This is the exact schedule
+/// the on-chain Fee Program applies (canonical PumpSwap pools). When present it
+/// overrides the hardcoded `FEE_TIERS` table below, so the fee auto-tracks any
+/// change Pump makes to the tiers — no code change, no guessing.
+static ONCHAIN_TIERS: std::sync::OnceLock<Vec<(u128, u64, u64)>> = std::sync::OnceLock::new();
+
+/// Install the on-chain PumpSwap fee tiers (called once at startup after the
+/// FeeConfig account is read + validated). Ascending by lamport threshold.
+pub fn set_onchain_fee_tiers(tiers: Vec<(u128, u64, u64)>) {
+    let _ = ONCHAIN_TIERS.set(tiers);
+}
+
+/// Whether on-chain tiers have been installed (for the audit log).
+pub fn onchain_fee_tiers_loaded() -> bool {
+    ONCHAIN_TIERS.get().map(|t| !t.is_empty()).unwrap_or(false)
+}
+
+/// `calculateFeeTier` over the on-chain tiers (thresholds in lamports, ascending):
+/// the highest-threshold tier whose threshold ≤ mcap; if mcap is below the first
+/// threshold, the first (highest-fee) tier. Returns `(total_bps, lp_bps)`.
+fn fee_from_onchain_tiers(mcap_lamports: u128) -> Option<(u64, u64)> {
+    let tiers = ONCHAIN_TIERS.get()?;
+    if tiers.is_empty() {
+        return None;
+    }
+    if mcap_lamports < tiers[0].0 {
+        return Some((tiers[0].1, tiers[0].2));
+    }
+    let mut chosen = (tiers[0].1, tiers[0].2);
+    for &(thresh, total, lp) in tiers {
+        if mcap_lamports >= thresh {
+            chosen = (total, lp);
+        } else {
+            break;
+        }
+    }
+    Some(chosen)
+}
+
 /// Official PumpSwap dynamic-fee schedule, DESCENDING by market-cap threshold:
 /// `(mcap_threshold_sol, total_fee_bps, lp_fee_bps)`. The row whose threshold
 /// the market cap meets first applies. Fractional-bps totals (e.g. 0.525%) are
@@ -78,6 +119,11 @@ pub fn fee_for_reserves(
     }
     let mcap_lamports =
         (quote_reserve as u128).saturating_mul(supply_base_units) / base_reserve as u128;
+    // Prefer the ACTUAL on-chain fee tiers (read from FeeConfig at startup).
+    if let Some(f) = fee_from_onchain_tiers(mcap_lamports) {
+        return f;
+    }
+    // Fallback: the hardcoded schedule (matches the published fees.png tiers).
     let mcap_sol = (mcap_lamports / LAMPORTS_PER_SOL).min(u64::MAX as u128) as u64;
     for &(thresh, total, lp) in FEE_TIERS {
         if mcap_sol >= thresh {
@@ -85,6 +131,53 @@ pub fn fee_for_reserves(
         }
     }
     (125, 2)
+}
+
+/// Read + validate the on-chain PumpSwap `FeeConfig` and install its fee tiers.
+/// Best-effort: on any RPC/parse/sanity failure we keep the hardcoded schedule.
+///
+/// FeeConfig account (Fee Program `pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ`,
+/// PDA seeds `["fee_config", pAMMBay…]`) borsh layout after the 8-byte anchor
+/// discriminator: `bump u8`, `admin Pubkey(32)`, `flat_fees Fees(3×u64=24)`,
+/// `fee_tiers Vec<FeeTier>` (u32 len + N×40), `stable_fee_tiers Vec<FeeTier>`.
+/// `FeeTier { market_cap_lamports_threshold u128(16), fees Fees(24) }`;
+/// `Fees { lp_fee_bps u64, protocol_fee_bps u64, creator_fee_bps u64 }`.
+pub fn load_onchain_fee_tiers(
+    rpc: &solana_client::rpc_client::RpcClient,
+) -> Option<Vec<(u128, u64, u64)>> {
+    use solana_sdk::pubkey::Pubkey;
+    let fee_program = Pubkey::from_str_const("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
+    let pamm = Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+    let (fee_config, _) =
+        Pubkey::find_program_address(&[b"fee_config", pamm.as_ref()], &fee_program);
+    let acct = rpc.get_account(&fee_config).ok()?;
+    let d = &acct.data;
+    // 8 disc + 1 bump + 32 admin + 24 flat_fees = 65, then the fee_tiers Vec.
+    let mut off = 65usize;
+    let len = u32::from_le_bytes(d.get(off..off + 4)?.try_into().ok()?) as usize;
+    off += 4;
+    if len == 0 || len > 64 {
+        return None; // implausible → wrong offset/layout, bail to fallback
+    }
+    let mut tiers: Vec<(u128, u64, u64)> = Vec::with_capacity(len);
+    for _ in 0..len {
+        let threshold = u128::from_le_bytes(d.get(off..off + 16)?.try_into().ok()?);
+        let lp = u64::from_le_bytes(d.get(off + 16..off + 24)?.try_into().ok()?);
+        let protocol = u64::from_le_bytes(d.get(off + 24..off + 32)?.try_into().ok()?);
+        let creator = u64::from_le_bytes(d.get(off + 32..off + 40)?.try_into().ok()?);
+        off += 40;
+        let total = lp.saturating_add(protocol).saturating_add(creator);
+        // Sanity: fees never exceed 10% and each component is a plausible bps.
+        if total > 1_000 || lp > 1_000 || protocol > 1_000 || creator > 1_000 {
+            return None;
+        }
+        tiers.push((threshold, total, lp));
+    }
+    // Thresholds must be non-decreasing (ascending schedule).
+    if tiers.windows(2).any(|w| w[1].0 < w[0].0) {
+        return None;
+    }
+    Some(tiers)
 }
 
 #[inline]
