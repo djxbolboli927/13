@@ -206,6 +206,10 @@ pub struct ShredArbEngine {
     skip_no_pump_state: AtomicU64,
     skip_no_meteora_state: AtomicU64,
     skip_bad_price: AtomicU64,
+    /// Skipped because one side's WSOL depth was below min_pool_wsol_lamports
+    /// (the both-sides liquidity guard). Split out of `bad_price` so the operator
+    /// can tell a thin-pool skip from a genuinely broken price read.
+    skip_thin_pool: AtomicU64,
     skip_implausible: AtomicU64,
     /// Rolling counter to sample the (very chatty) eval-detail trace.
     eval_log_counter: AtomicU64,
@@ -341,6 +345,7 @@ impl ShredArbEngine {
             skip_no_pump_state: AtomicU64::new(0),
             skip_no_meteora_state: AtomicU64::new(0),
             skip_bad_price: AtomicU64::new(0),
+            skip_thin_pool: AtomicU64::new(0),
             skip_implausible: AtomicU64::new(0),
             eval_log_counter: AtomicU64::new(0),
             skip_uncrossable: AtomicU64::new(0),
@@ -550,7 +555,7 @@ impl ShredArbEngine {
         if pump_wsol_depth < self.params.min_pool_wsol_lamports
             || met_wsol_depth < self.params.min_pool_wsol_lamports
         {
-            self.skip_bad_price.fetch_add(1, Ordering::Relaxed);
+            self.skip_thin_pool.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
@@ -745,7 +750,7 @@ impl ShredArbEngine {
             min_out: onchain_floor,
             tfee_bps: tfee_bps as u16,
         };
-        self.execute(pair, key, buy_kind, sell_kind, best_x, onchain_floor, tip, recheck)
+        self.execute(pair, key, buy_kind, sell_kind, best_x, onchain_floor, best_out, tip, recheck)
             .await;
     }
 
@@ -758,6 +763,7 @@ impl ShredArbEngine {
         sell_kind: DexKind,
         amount_in: u64,
         floor: u64,
+        predicted_out: u64,
         tip: u64,
         recheck: Recheck,
     ) {
@@ -1083,7 +1089,7 @@ impl ShredArbEngine {
                     let token_l = token.clone();
                     let delay = self.params.status_check_delay_secs;
                     tokio::spawn(async move {
-                        resolve_fate(rpc3, stats, sig, token_l, delay).await;
+                        resolve_fate(rpc3, stats, sig, token_l, predicted_out, delay).await;
                     });
                 }
                 Ok(Err(e)) => {
@@ -1211,7 +1217,7 @@ impl ShredArbEngine {
                     let token_l = token.clone();
                     let delay = self.params.status_check_delay_secs;
                     tokio::spawn(async move {
-                        resolve_fate(rpc3, stats, sig, token_l, delay).await;
+                        resolve_fate(rpc3, stats, sig, token_l, predicted_out, delay).await;
                     });
                 }
             }
@@ -1416,7 +1422,7 @@ impl ShredArbEngine {
                 let unknown = ss.unknown.load(Ordering::Relaxed);
                 eprintln!(
                     "\n[shred-arb 30s] watching_pools={}\n\
-                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} bad_price={} implausible={}]\n\
+                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} bad_price={} thin_pool={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
@@ -1428,6 +1434,7 @@ impl ShredArbEngine {
                     self.skip_min_trigger.load(Ordering::Relaxed),
                     self.skip_no_meteora_state.load(Ordering::Relaxed),
                     self.skip_bad_price.load(Ordering::Relaxed),
+                    self.skip_thin_pool.load(Ordering::Relaxed),
                     self.skip_implausible.load(Ordering::Relaxed),
                     self.sent.load(Ordering::Relaxed),
                     landed_ok,
@@ -1461,6 +1468,7 @@ async fn resolve_fate(
     stats: Arc<SentStats>,
     sig: solana_sdk::signature::Signature,
     token: String,
+    predicted_out: u64,
     delay_secs: u64,
 ) {
     tokio::time::sleep(Duration::from_secs(delay_secs.max(1))).await;
@@ -1479,10 +1487,20 @@ async fn resolve_fate(
                         if let Some(err) = st.err {
                             stats.landed_err.fetch_add(1, Ordering::Relaxed);
                             warn!(%sig, error = ?err, "sent tx LANDED but REVERTED");
+                            // Pull the REAL on-chain logs so we can see the exact
+                            // program error (e.g. 0x1771 slippage) and the real
+                            // amounts, next to OUR predicted output. This is the
+                            // ground-truth diagnostic — it only works when the tx
+                            // actually lands (i.e. direct_send, not a Jito bundle
+                            // that gets silently sim-dropped).
+                            let real_logs = fetch_tx_logs(&rpc, sig).await;
                             crate::errlog::log(
                                 "lost",
-                                &format!("token={token} sig={sig} fate=reverted err={err:?}"),
+                                &format!(
+                                    "token={token} sig={sig} fate=reverted predicted_out={predicted_out} err={err:?} logs=[{real_logs}]"
+                                ),
                             );
+                            warn!(%sig, predicted_out, logs = %real_logs, "REVERT detail (predicted vs real)");
                         } else {
                             stats.landed_ok.fetch_add(1, Ordering::Relaxed);
                             info!(%sig, "sent tx landed OK ✅");
@@ -1504,6 +1522,38 @@ async fn resolve_fate(
         stats.dropped.fetch_add(1, Ordering::Relaxed);
         warn!(%sig, "sent tx NOT FOUND on-chain (dropped/never landed)");
         crate::errlog::log("lost", &format!("token={token} sig={sig} fate=dropped-not-found"));
+    }
+}
+
+/// Fetch a landed transaction's on-chain log messages (the program's own
+/// `sol_log` output), joined into one line. Used on the REVERT path to surface
+/// the real error and amounts. Best-effort: returns a short marker on any RPC or
+/// decode miss so the caller can always log something.
+async fn fetch_tx_logs(rpc: &Arc<RpcClient>, sig: solana_sdk::signature::Signature) -> String {
+    use solana_client::rpc_config::RpcTransactionConfig;
+    use solana_transaction_status::UiTransactionEncoding;
+    let rpc = rpc.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        rpc.get_transaction_with_config(
+            &sig,
+            RpcTransactionConfig {
+                encoding: Some(UiTransactionEncoding::Base64),
+                commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
+                max_supported_transaction_version: Some(0),
+            },
+        )
+    })
+    .await;
+    match res {
+        Ok(Ok(tx)) => match tx.transaction.meta.and_then(|m| {
+            let l: Option<Vec<String>> = m.log_messages.into();
+            l
+        }) {
+            Some(logs) => logs.join(" | "),
+            None => "no-log-messages".to_string(),
+        },
+        Ok(Err(e)) => format!("get-tx-err:{e}"),
+        Err(e) => format!("join-err:{e}"),
     }
 }
 
