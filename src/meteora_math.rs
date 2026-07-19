@@ -198,6 +198,22 @@ impl MeteoraPool {
         let a_to_b = token_is_a;
         self.swap_exact_in(token_in, a_to_b).map(|s| s.amount_out)
     }
+
+    /// Advance this pool's `sqrt_price` by an OBSERVED swap of `amount_in` in the
+    /// given direction — used to keep the live state in sync with shred txs that
+    /// haven't hit the gRPC account stream yet. `liquidity` is unchanged by a
+    /// swap. Returns the pool AFTER the swap; on any range/overflow issue the
+    /// pool is returned unchanged (better to keep the last good price than to
+    /// corrupt it).
+    pub fn apply_observed_swap(&self, amount_in: u64, a_to_b: bool) -> MeteoraPool {
+        match self.swap_exact_in(amount_in, a_to_b) {
+            Some(s) => MeteoraPool {
+                sqrt_price: s.next_sqrt_price,
+                ..*self
+            },
+            None => *self,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -462,11 +462,14 @@ impl ShredArbEngine {
             return;
         };
 
-        // 1) Current Pump reserves → predicted post-trade reserves (the Pump
-        // vaults are identical across every pair of this pool).
+        // 1) Current Pump reserves (live overlay: includes any earlier shred txs
+        // on this pool not yet delivered by gRPC). The Pump vaults are identical
+        // across every pair of this pool.
+        let token_vault = first.pump.token_vault();
+        let wsol_vault = first.pump.wsol_vault();
         let pump_now = match self
             .pool_state
-            .pump_pool(&first.pump.token_vault(), &first.pump.wsol_vault(), &first.token_mint)
+            .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint)
         {
             Some(p) => p,
             None => {
@@ -486,11 +489,39 @@ impl ShredArbEngine {
                 return;
             }
         }
-        // Predicted post-trade Pump reserves — we are ahead of Metis/chain.
-        let pump_after = if sig.is_buy {
-            pump_now.after_observed_buy(sig.base_amount)
-        } else {
-            pump_now.after_observed_sell(sig.base_amount)
+        // ── Keep the LIVE state in sync with this shred ─────────────────────
+        // Persist this observed Pump swap into the live pump overlay so the NEXT
+        // shred in the same block prices against a pool that already reflects it.
+        self.pool_state.apply_pump_swap(
+            &token_vault, &wsol_vault, &first.token_mint, sig.is_buy, sig.base_amount, sig.slot,
+        );
+        // If this tx also carried a Meteora leg on one of our pools (a circular
+        // arb), advance that Meteora pool's live sqrt_price too — this is the ONLY
+        // way we see Meteora activity (we get no standalone Meteora shreds), and
+        // it fixes the thin-pool staleness that caused the over-prediction.
+        // Direction: competitor Pump BUY ⇒ they SELL token into Meteora (token in
+        // ⇒ a_to_b = token_is_a); Pump SELL ⇒ they BUY token (a_to_b = !token_is_a).
+        if let (Some(mpool), Some(amt)) = (sig.meteora_pool, sig.meteora_amount_in) {
+            if let Some(pair) = pairs.iter().find(|p| p.meteora.pool == mpool) {
+                let a_to_b = if sig.is_buy {
+                    pair.meteora.token_is_a
+                } else {
+                    !pair.meteora.token_is_a
+                };
+                let fallback = self.params.meteora_fee_bps.saturating_mul(100_000);
+                self.pool_state.apply_meteora_swap(
+                    &mpool, fallback, self.params.meteora_fee_worst_case, amt, a_to_b, sig.slot,
+                );
+            }
+        }
+        // Predicted post-trade Pump reserves — the live overlay now includes this
+        // shred, so read it back for pricing.
+        let pump_after = match self
+            .pool_state
+            .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint)
+        {
+            Some(p) => p,
+            None => pump_now,
         };
         // Assess every Meteora counter-pool of this token IN PARALLEL — each on
         // its own task, sends go straight out with no shared queue.

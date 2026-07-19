@@ -106,6 +106,15 @@ pub struct PoolStateCache {
     /// and pinging `change` re-sends the (overwriting) SubscribeRequest live.
     accounts: Arc<std::sync::Mutex<Vec<Pubkey>>>,
     change: Arc<tokio::sync::Notify>,
+    /// LIVE overlay of pump pools, keyed by the pool's token vault: the pool
+    /// state advanced by shred txs that haven't hit the gRPC stream yet, tagged
+    /// with the `built_on` slot (the account's last-update slot at rebuild time).
+    /// When gRPC catches up (last_update_slot > built_on) the overlay is ignored
+    /// and rebuilt from the fresh cache — so we never drift from ground truth.
+    live_pump: Arc<DashMap<Pubkey, (u64, PumpPool)>>,
+    /// LIVE overlay of Meteora pools, keyed by pool account (only `sqrt_price`
+    /// advances on a swap; liquidity/fees stay from the decoded cache).
+    live_meteora: Arc<DashMap<Pubkey, (u64, MeteoraPool)>>,
 }
 
 fn read_u128_le(data: &[u8], off: usize) -> Option<u128> {
@@ -311,6 +320,8 @@ impl PoolStateCache {
             updates: Arc::new(AtomicU64::new(0)),
             accounts: Arc::new(std::sync::Mutex::new(Vec::new())),
             change: Arc::new(tokio::sync::Notify::new()),
+            live_pump: Arc::new(DashMap::with_capacity(256)),
+            live_meteora: Arc::new(DashMap::with_capacity(256)),
         }
     }
 
@@ -441,6 +452,18 @@ impl PoolStateCache {
         {
             return None;
         }
+        // LIVE overlay: if a shred-advanced sqrt_price exists that is still based
+        // on the CURRENT cache slot, use it (keeps us in sync with in-flight txs
+        // the gRPC stream hasn't delivered yet). Only sqrt_price is overridden;
+        // liquidity/fees come from the fresh decode. Re-validate the range.
+        if let Some(e) = self.live_meteora.get(pool) {
+            if e.value().0 == self.last_update_slot(pool).unwrap_or(0) {
+                let sp = e.value().1.sqrt_price;
+                if sp >= p.sqrt_min_price && sp <= p.sqrt_max_price {
+                    return Some(MeteoraPool { sqrt_price: sp, ..p });
+                }
+            }
+        }
         Some(p)
     }
 
@@ -500,6 +523,88 @@ impl PoolStateCache {
         let quote = self.spl_amount(wsol_vault)?;
         let supply = self.spl_mint_supply(token_mint).unwrap_or(0) as u128;
         Some(PumpPool::new(base, quote, supply))
+    }
+
+    // ── Live state: advance pool state by in-flight shred txs ─────────────────
+    // The gRPC account stream lags the network by a few slots, and a thin Meteora
+    // pool may not update for several blocks. So we advance a LIVE overlay from
+    // the swaps we see in shreds. Each overlay entry is tagged with the slot the
+    // underlying cache was at when we (re)built it; once gRPC catches up past that
+    // slot the overlay is dropped and rebuilt from ground truth — no drift.
+
+    /// Apply an observed Pump swap (from a shred) to the live pump overlay.
+    /// `shred_slot` is the shred's slot; if it's not newer than the cached state
+    /// the swap is already reflected on-chain and only the base is (re)seeded.
+    pub fn apply_pump_swap(
+        &self,
+        token_vault: &Pubkey,
+        wsol_vault: &Pubkey,
+        token_mint: &Pubkey,
+        is_buy: bool,
+        base_amount: u64,
+        shred_slot: u64,
+    ) {
+        let cur = self.last_update_slot(token_vault).unwrap_or(0);
+        let base = match self.live_pump.get(token_vault) {
+            Some(e) if e.value().0 == cur => e.value().1,
+            _ => match self.pump_pool(token_vault, wsol_vault, token_mint) {
+                Some(p) => p,
+                None => return,
+            },
+        };
+        let advanced = if shred_slot <= cur {
+            base // already on-chain / in the cache
+        } else if is_buy {
+            base.after_observed_buy(base_amount)
+        } else {
+            base.after_observed_sell(base_amount)
+        };
+        self.live_pump.insert(*token_vault, (cur, advanced));
+    }
+
+    /// Pump pool including any live (shred-advanced) state, if it is still based
+    /// on the current cache slot; otherwise the fresh cache decode.
+    pub fn pump_pool_live(
+        &self,
+        token_vault: &Pubkey,
+        wsol_vault: &Pubkey,
+        token_mint: &Pubkey,
+    ) -> Option<PumpPool> {
+        let cur = self.last_update_slot(token_vault).unwrap_or(0);
+        if let Some(e) = self.live_pump.get(token_vault) {
+            if e.value().0 == cur {
+                return Some(e.value().1);
+            }
+        }
+        self.pump_pool(token_vault, wsol_vault, token_mint)
+    }
+
+    /// Apply an observed Meteora swap (from a shred) to the live meteora overlay.
+    /// `a_to_b` is the swap direction; the caller derives it from the arb's Pump
+    /// leg and the pool's token side.
+    pub fn apply_meteora_swap(
+        &self,
+        pool: &Pubkey,
+        fallback_fee_numerator: u64,
+        worst_case_fee: bool,
+        amount_in: u64,
+        a_to_b: bool,
+        shred_slot: u64,
+    ) {
+        let cur = self.last_update_slot(pool).unwrap_or(0);
+        let base = match self.live_meteora.get(pool) {
+            Some(e) if e.value().0 == cur => e.value().1,
+            _ => match self.meteora_pool(pool, fallback_fee_numerator, worst_case_fee) {
+                Some(p) => p,
+                None => return,
+            },
+        };
+        let advanced = if shred_slot <= cur {
+            base
+        } else {
+            base.apply_observed_swap(amount_in, a_to_b)
+        };
+        self.live_meteora.insert(*pool, (cur, advanced));
     }
 
     /// SPL mint total supply (u64 @ offset 36 of a Mint account). `None` if the

@@ -30,6 +30,8 @@ const DISC_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 const DISC_SELL: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 /// `withdraw` (remove liquidity) — the direct rug signal.
 const DISC_WITHDRAW: [u8; 8] = [183, 18, 70, 156, 148, 109, 161, 34];
+/// Meteora DAMM v2 `swap` anchor discriminator (sha256("global:swap")[..8]).
+const DISC_METEORA_SWAP: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
 
 /// A Pump.fun swap observed on ShredStream, before it reaches Metis/chain.
 #[derive(Debug, Clone, Copy)]
@@ -44,6 +46,15 @@ pub struct PumpSwapSignal {
     /// Signature of the observed on-chain tx this shred carried — recorded so the
     /// fee-audit log can print the exact tx whose fee the bot computed.
     pub sig: solana_sdk::signature::Signature,
+    /// Slot this shred belongs to — used to keep the live pool state in sync
+    /// (apply only shreds newer than the last gRPC account update).
+    pub slot: u64,
+    /// If this same tx also carried a Meteora DAMM v2 `swap` (i.e. it is an
+    /// arb that touches a Meteora pool), the Meteora pool and its `amount_in`.
+    /// Direction is the OPPOSITE of the Pump leg (a circular arb), resolved by
+    /// the engine which knows each pool's token side.
+    pub meteora_pool: Option<Pubkey>,
+    pub meteora_amount_in: Option<u64>,
 }
 
 /// Runtime counters for observability.
@@ -65,6 +76,8 @@ pub struct ShredConsumer {
     /// Pool pubkeys we care about (Pump.fun side of each arb pair). Mutable at
     /// runtime so newly-discovered pools can be added without a restart.
     target_pools: std::sync::RwLock<HashSet<Pubkey>>,
+    /// Meteora DAMM v2 program id — to spot the arb's Meteora leg in the same tx.
+    meteora: Pubkey,
     /// Global library of address-lookup-table contents harvested from every
     /// Pump tx we see (key → member pubkeys). Two uses: resolving ALT-hidden
     /// accounts on the hot path, and as the pool of PUBLIC pre-built tables the
@@ -104,6 +117,7 @@ impl ShredConsumer {
             target_pools: std::sync::RwLock::new(target_pools),
             alt_map: Arc::new(std::sync::RwLock::new(alt_map)),
             pumpfun: pumpfun_program(),
+            meteora: crate::dex_ids::meteora_program(),
             remove_tx: std::sync::RwLock::new(None),
             rpc,
             pending_alts: std::sync::Mutex::new(HashSet::new()),
@@ -238,6 +252,7 @@ impl ShredConsumer {
 
         while let Some(msg) = stream.message().await? {
             self.metrics.entries.fetch_add(1, Ordering::Relaxed);
+            let slot = msg.slot;
             let entries: Vec<solana_entry::entry::Entry> =
                 match bincode::deserialize(&msg.entries) {
                     Ok(e) => e,
@@ -246,7 +261,7 @@ impl ShredConsumer {
             for entry in &entries {
                 for vtx in &entry.transactions {
                     self.metrics.txns.fetch_add(1, Ordering::Relaxed);
-                    self.scan_tx(vtx, tx);
+                    self.scan_tx(slot, vtx, tx);
                 }
             }
         }
@@ -255,6 +270,7 @@ impl ShredConsumer {
 
     fn scan_tx(
         &self,
+        slot: u64,
         vtx: &solana_sdk::transaction::VersionedTransaction,
         tx: &mpsc::Sender<PumpSwapSignal>,
     ) {
@@ -270,6 +286,13 @@ impl ShredConsumer {
         // Resolve the full ordered account list (static + ALT writable + ALT
         // readonly), filling unknown-ALT slots with a placeholder.
         let full_keys = self.resolve_keys(msg);
+
+        // Is there also a Meteora DAMM v2 `swap` in THIS tx? In a circular arb the
+        // competitor's Meteora leg rides in the same tx as the Pump leg we detect,
+        // so we can advance our cached Meteora price from it — even though we never
+        // receive standalone Meteora shreds. Extract (meteora_pool, amount_in);
+        // direction is resolved by the engine as the opposite of the Pump leg.
+        let meteora = self.find_meteora_swap(msg, &full_keys);
 
         // The ALT keys this tx used — candidates for whichever watched pool it
         // touches (fed to the AltRegistry, which picks the best-coverage table).
@@ -332,12 +355,19 @@ impl ShredConsumer {
             let quote_amount = u64::from_le_bytes(ix.data[16..24].try_into().unwrap());
 
             self.metrics.matched.fetch_add(1, Ordering::Relaxed);
+            let (meteora_pool, meteora_amount_in) = match meteora {
+                Some((p, a)) => (Some(p), Some(a)),
+                None => (None, None),
+            };
             let signal = PumpSwapSignal {
                 pool,
                 is_buy,
                 base_amount,
                 quote_amount,
                 sig: vtx.signatures.first().copied().unwrap_or_default(),
+                slot,
+                meteora_pool,
+                meteora_amount_in,
             };
             // Non-blocking: if the engine is busy, drop (staleness makes an old
             // signal worthless anyway).
@@ -346,6 +376,34 @@ impl ShredConsumer {
                 Err(_) => self.metrics.signals_dropped.fetch_add(1, Ordering::Relaxed),
             };
         }
+    }
+
+    /// Find a Meteora DAMM v2 `swap` instruction in this tx and return its pool
+    /// (account index 1 of the swap) and `amount_in` (first u64 after the 8-byte
+    /// discriminator). `None` if the tx has no Meteora swap. We take the FIRST
+    /// one — a Pump↔Meteora circular arb has exactly one Meteora leg.
+    fn find_meteora_swap(
+        &self,
+        msg: &solana_sdk::message::VersionedMessage,
+        full_keys: &[Pubkey],
+    ) -> Option<(Pubkey, u64)> {
+        for ix in msg.instructions() {
+            let program = full_keys.get(ix.program_id_index as usize)?;
+            if *program != self.meteora {
+                continue;
+            }
+            if ix.data.len() < 16 || ix.data[0..8] != DISC_METEORA_SWAP {
+                continue;
+            }
+            // cp-amm swap accounts: [pool_authority, pool, ...]; index 1 = pool.
+            let pool = ix.accounts.get(1).and_then(|i| full_keys.get(*i as usize))?;
+            if *pool == Pubkey::default() {
+                continue;
+            }
+            let amount_in = u64::from_le_bytes(ix.data[8..16].try_into().ok()?);
+            return Some((*pool, amount_in));
+        }
+        None
     }
 
     fn resolve_keys(&self, msg: &solana_sdk::message::VersionedMessage) -> Vec<Pubkey> {
