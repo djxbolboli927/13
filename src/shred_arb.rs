@@ -732,6 +732,29 @@ impl ShredArbEngine {
             BuyOn::Pump => (DexKind::PumpFunAmm, DexKind::MeteoraDammV2),
             BuyOn::Meteora => (DexKind::MeteoraDammV2, DexKind::PumpFunAmm),
         };
+        // ── Staleness diagnostic (per DEX) ───────────────────────────────────
+        // For each venue: the slot we last got fresh account data, how many slots
+        // behind the newest slot we've seen that is, and the wall-clock age. On a
+        // thin Meteora pool that hasn't traded for a couple of blocks, this shows
+        // the cached state is many slots old — the root of the over-prediction we
+        // proved is NOT a formula bug. Pump vaults update almost every block, so
+        // their gap should stay ~0.
+        let cur_slot = self.pool_state.slot();
+        let fmt_stale = |acct: &solana_sdk::pubkey::Pubkey| -> String {
+            let upd = self.pool_state.last_update_slot(acct);
+            let age_ms = self
+                .pool_state
+                .last_update_age(acct)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            match upd {
+                Some(s) => format!("slot={s} behind={} age={age_ms}ms", cur_slot.saturating_sub(s)),
+                None => "uncached".to_string(),
+            }
+        };
+        let met_stale = fmt_stale(&pair.meteora.pool);
+        let pump_base_stale = fmt_stale(&pair.pump.token_vault());
+        let pump_quote_stale = fmt_stale(&pair.pump.wsol_vault());
         info!(
             pool = %pair.pump.pool,
             meteora = %pair.meteora.pool,
@@ -740,6 +763,10 @@ impl ShredArbEngine {
             input = best_x,
             predicted_out = best_out,
             net_lamports = net,
+            calc_slot = cur_slot,
+            meteora_state = %met_stale,
+            pump_token_vault_state = %pump_base_stale,
+            pump_wsol_vault_state = %pump_quote_stale,
             "shred-arb opportunity"
         );
 

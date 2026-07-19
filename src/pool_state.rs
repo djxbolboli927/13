@@ -95,6 +95,10 @@ pub struct PoolStateCache {
     /// Last time each account's data changed (seeded at prefetch, refreshed on
     /// every stream update). Used by the rug monitor's idle-timeout check.
     last_update: Arc<DashMap<Pubkey, std::time::Instant>>,
+    /// The SLOT at which each account last changed (from the stream update's
+    /// slot). Used by the staleness diagnostic to show how many slots behind the
+    /// cached state is versus the newest slot we've seen.
+    last_update_slot: Arc<DashMap<Pubkey, u64>>,
     slot: Arc<AtomicU64>,
     /// Total account updates received (for diagnostics).
     updates: Arc<AtomicU64>,
@@ -302,6 +306,7 @@ impl PoolStateCache {
         Self {
             inner: Arc::new(DashMap::with_capacity(256)),
             last_update: Arc::new(DashMap::with_capacity(256)),
+            last_update_slot: Arc::new(DashMap::with_capacity(256)),
             slot: Arc::new(AtomicU64::new(0)),
             updates: Arc::new(AtomicU64::new(0)),
             accounts: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -354,11 +359,13 @@ impl PoolStateCache {
     pub fn prefetch(&self, rpc: &RpcClient, accounts: &[Pubkey]) {
         let mut ok = 0usize;
         let now = std::time::Instant::now();
+        let seed_slot = rpc.get_slot().unwrap_or_else(|_| self.slot.load(Ordering::Relaxed));
         for pk in accounts {
             match rpc.get_account(pk) {
                 Ok(acct) => {
                     self.inner.insert(*pk, acct.data);
                     self.last_update.insert(*pk, now);
+                    self.last_update_slot.insert(*pk, seed_slot);
                     ok += 1;
                 }
                 Err(e) => warn!(account = %pk, error = %e, "pool-state prefetch miss"),
@@ -378,6 +385,12 @@ impl PoolStateCache {
     /// have never seen it. Used to detect abandoned/rugged pools by idleness.
     pub fn last_update_age(&self, account: &Pubkey) -> Option<std::time::Duration> {
         self.last_update.get(account).map(|t| t.elapsed())
+    }
+
+    /// The slot at which `account` last changed. `None` if never seen. Used by
+    /// the staleness diagnostic (current slot − this = how many slots behind).
+    pub fn last_update_slot(&self, account: &Pubkey) -> Option<u64> {
+        self.last_update_slot.get(account).map(|v| *v.value())
     }
 
     /// Decode a Meteora pool account into its pricing slice. The fee is read
@@ -566,6 +579,7 @@ impl PoolStateCache {
         }
         let inner = self.inner.clone();
         let last_update = self.last_update.clone();
+        let last_update_slot = self.last_update_slot.clone();
         let slot = self.slot.clone();
         let updates = self.updates.clone();
         let acct_set = self.accounts.clone();
@@ -574,7 +588,8 @@ impl PoolStateCache {
             let mut backoff = Duration::from_millis(500);
             loop {
                 match run_stream(
-                    &endpoint, &x_token, &acct_set, &change, &inner, &last_update, &slot, &updates,
+                    &endpoint, &x_token, &acct_set, &change, &inner, &last_update,
+                    &last_update_slot, &slot, &updates,
                 )
                 .await
                 {
@@ -613,6 +628,7 @@ async fn run_stream(
     change: &Arc<tokio::sync::Notify>,
     cache: &Arc<DashMap<Pubkey, Vec<u8>>>,
     last_update: &Arc<DashMap<Pubkey, std::time::Instant>>,
+    last_update_slot: &Arc<DashMap<Pubkey, u64>>,
     slot: &Arc<AtomicU64>,
     updates: &Arc<AtomicU64>,
 ) -> Result<()> {
@@ -658,6 +674,7 @@ async fn run_stream(
                     if let Ok(pk) = Pubkey::try_from(info.pubkey.as_slice()) {
                         cache.insert(pk, info.data);
                         last_update.insert(pk, std::time::Instant::now());
+                        last_update_slot.insert(pk, a.slot);
                         updates.fetch_add(1, Ordering::Relaxed);
                     }
                 }
