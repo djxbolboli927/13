@@ -74,19 +74,6 @@ queue_max_age_ms = 5000
 # اگر سرور 16 هسته دارد: متیس روی 0-11، ربات روی 12-15
 bot_cpu_cores = [12,13,14,15,28,29,30,31]
 
-[simulation]
-# LiteSVM pre-flight: قبل از ارسال هر باندل به Jito، همان tx را محلی روی
-# بایت‌کد واقعی DEXها اجرا می‌کنیم. اگر revert شد یا سود نداشت، ارسال لغو
-# می‌شود و base fee ذخیره می‌شود.
-#
-# منبع داده‌ی sim = همان gRPC شیفت که Metis هم می‌خواند (یک اتصال جدا،
-# هیچ سربار متقابلی با Metis ندارد).
-enabled = false
-so_dir = "/root/g/so"
-# fail_closed=true  (امن)  : اگر sim خطا داد ⇒ ارسال نکن
-# fail_closed=false (رول‌اوت) : اگر sim خطا داد ⇒ فقط log بزن و بفرست
-fail_closed = true
-
 [jito_grpc]
 # مسیر دوم ارسال باندل از طریق SearcherService gRPC جیتو با کیف whitelist.
 # کیف whitelist شده ⇒ rate limit جیتو = 5 req/s per region (8 ریجن × 5 = 40/sec).
@@ -154,8 +141,6 @@ shred_keypair = "/root/g/wallet/shred.json"
 # سقف CU برای تراکنش دو-هاپ. تراکنش‌های آربیتراژ رقبا ~178k CU مصرف می‌کنند، پس
 # 170k قدیمی کم بود و تراکنش می‌ترکید. 300000 با حاشیه‌ی امن.
 cu_limit = 300000
-# ثابت‌های فاز تست.
-tip_lamports = 1600
 network_fee_lamports = 5000
 # کارمزد fallback متورا (bps). کارمزد واقعی هر استخر حالا کامل از روی زنجیره
 # محاسبه می‌شود (کارمزد پایه با fee scheduler + کارمزد داینامیک نوسان، سقف 50%).
@@ -180,8 +165,6 @@ size_safety_margin_pct = 3.0
 # رد فرصت‌هایی که سود پیش‌بینی‌شده‌شان از این درصدِ ورودی بیشتر است (آرتیفکت
 # استخر مرده). پایین‌تر = سخت‌گیرتر.
 max_profit_fraction_pct = 50.0
-# منسوخ شده (فاز تست تمام شد). false بگذارید. فقط برای سازگاری با فایل قدیمی مانده.
-force_send_test = false
 
 # ─── گرفتن ALT رایگان از جوپیتر/دیفلو/رپتور (روش ارزان و بدون هزینه) ───
 # به‌جای پرداخت رنت برای ساخت ALT، از این ارائه‌دهنده‌ها که ALT بهینه برای مسیر
@@ -282,6 +265,11 @@ metis_max_accounts = 50
 # 31630833 (~31.6MB) همان مقداری است که رقیب استفاده می‌کند و امن است (پیش‌فرض
 # شبکه 64MB). 0 = اصلاً اضافه نشود. ⚠️ هرگز عدد کوچک مثل 131072 نگذارید!
 direct_loaded_accounts_data_limit = 31630833
+# SetComputeUnitPrice: کارمزد اولویت (micro-lamport به‌ازای هر CU) روی مسیر جیتو.
+# در باندل جیتو معمولاً انعام (tip) کافی است، ولی رقبا priority fee هم می‌گذارند.
+# این را روشن کنید (مثلاً 1000 تا 50000) تا تست کنید آیا روی landing اثر دارد.
+# 0 = اصلاً اضافه نشود (پیش‌فرض). مسیر مستقیم از direct_priority_fee استفاده می‌کند.
+compute_unit_price_microlamports = 0
 
 # useSharedAccounts: ⚠️ باید false بماند! با کوت circular ادغام‌شدهٔ ما ناسازگار
 # است و باعث خطای «swap_instructions failed» می‌شود. متیس خودش ALTها را بعد از
@@ -347,11 +335,3 @@ target_wallets = [
 # هر ۵ دقیقه اجرا کرد تا استخرها همیشه تازه بمانند.
 wallet_mine_interval_secs = 300
 wallet_mine_tx_limit = 1000
-
-[template_cache]
-# Tier-1: route_signature دقیق → patch amounts → بدون Metis call
-# Tier-2: hop-pair index (هر دو pool دیده شده) → patch amounts → بدون Metis call
-# Tier-3: fallback به /swap-instructions + ذخیره template برای دفعات بعد
-save_new = false
-serve_route = false
-serve_from_metis = true

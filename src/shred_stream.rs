@@ -41,6 +41,9 @@ pub struct PumpSwapSignal {
     /// The SOL-side limit arg (`max_quote_amount_in` / `min_quote_amount_out`),
     /// a cheap proxy for trade size before we price it exactly.
     pub quote_amount: u64,
+    /// Signature of the observed on-chain tx this shred carried — recorded so the
+    /// fee-audit log can print the exact tx whose fee the bot computed.
+    pub sig: solana_sdk::signature::Signature,
 }
 
 /// Runtime counters for observability.
@@ -334,6 +337,7 @@ impl ShredConsumer {
                 is_buy,
                 base_amount,
                 quote_amount,
+                sig: vtx.signatures.first().copied().unwrap_or_default(),
             };
             // Non-blocking: if the engine is busy, drop (staleness makes an old
             // signal worthless anyway).

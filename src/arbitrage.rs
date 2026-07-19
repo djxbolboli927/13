@@ -361,6 +361,7 @@ pub fn spawn_workers(
                         JITO_TIP_LAMPORTS,
                         cu_limit,
                         0, // legacy scanner: no data-size-limit ix
+                        0, // legacy scanner: no priority fee
                         recent_blockhash,
                         &alt,
                         &rpc,

@@ -114,6 +114,9 @@ pub struct ArbParams {
     pub metis_max_accounts: u64,
     /// SetLoadedAccountsDataSizeLimit byte value (0 = don't add).
     pub loaded_accounts_data_limit: u32,
+    /// SetComputeUnitPrice priority fee, micro-lamports/CU (0 = don't add). Used
+    /// on the Jito path too; toggled from config for A/B testing landing rates.
+    pub compute_unit_price_microlamports: u64,
     /// Only react to observed trades ≥ this fraction of the Pump WSOL reserve
     /// (0 = disabled, use the absolute min_trigger only).
     pub min_trigger_reserve_frac: f64,
@@ -186,6 +189,9 @@ pub struct ShredArbEngine {
     /// Last time we actually SENT a tx for a pair — de-dupes the spam of
     /// re-firing the same standing gap every 100ms.
     last_sent: dashmap::DashMap<PairKey, Instant>,
+    /// Last shred tx signature observed on each Pump pool — printed by the
+    /// fee-audit so the operator can pull that exact tx and hand-check the fee.
+    last_shred_sig: dashmap::DashMap<solana_sdk::pubkey::Pubkey, solana_sdk::signature::Signature>,
     /// On-chain fate of sent txs.
     sent_stats: Arc<SentStats>,
     /// Consecutive forced-quote route failures per pair. A pair that can't be
@@ -334,6 +340,7 @@ impl ShredArbEngine {
             route_cache: dashmap::DashMap::new(),
             last_fired: dashmap::DashMap::new(),
             last_sent: dashmap::DashMap::new(),
+            last_shred_sig: dashmap::DashMap::new(),
             sent_stats: Arc::new(SentStats::default()),
             route_fail: dashmap::DashMap::new(),
             load_fail: dashmap::DashMap::new(),
@@ -435,6 +442,8 @@ impl ShredArbEngine {
 
     async fn handle(self: Arc<Self>, sig: PumpSwapSignal) {
         self.signals_received.fetch_add(1, Ordering::Relaxed);
+        // Record the observed tx signature for this pool (for the fee-audit log).
+        self.last_shred_sig.insert(sig.pool, sig.sig);
         if sig.quote_amount < self.params.min_trigger_lamports {
             self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
             return;
@@ -1126,6 +1135,7 @@ impl ShredArbEngine {
 
         // `tip` is the dynamic tip computed in assess (min + profit share).
         let data_limit = self.params.loaded_accounts_data_limit;
+        let cu_price = self.params.compute_unit_price_microlamports;
         let tx = match tokio::task::spawn_blocking(move || {
             transaction::build_arb_transaction(
                 &swap_ixs,
@@ -1133,6 +1143,7 @@ impl ShredArbEngine {
                 tip,
                 cu,
                 data_limit,
+                cu_price,
                 recent_blockhash,
                 &alt,
                 &rpc,
@@ -1378,11 +1389,18 @@ impl ShredArbEngine {
                     );
                     let pump_fee_bps = pump.map(|p| p.total_fee_bps).unwrap_or(0);
                     let supply = self.pool_state.spl_mint_supply(&pair.token_mint).unwrap_or(0);
+                    // The exact shred tx whose fee this line reflects (empty if we
+                    // haven't seen a trade on this Pump pool yet this run).
+                    let shred_sig = self
+                        .last_shred_sig
+                        .get(&pair.pump.pool)
+                        .map(|s| s.value().to_string())
+                        .unwrap_or_else(|| "none-yet".to_string());
                     eprintln!(
-                        "[fee-audit] token={} | PUMP pool={} fee={}bps supply={} | METEORA pool={} \
+                        "[fee-audit] shred_tx={} | PUMP pool={} fee={}bps supply={} | METEORA pool={} \
                          cliff={:.1}bps base={:.1}bps dyn_now={:.1}bps dyn_worst={:.1}bps \
                          TOTAL now={:.1}bps worst={:.1}bps dyn_enabled={} | meteora_using={}",
-                        pair.token_mint,
+                        shred_sig,
                         pair.pump.pool,
                         pump_fee_bps,
                         supply,
@@ -1397,8 +1415,8 @@ impl ShredArbEngine {
                         if self.params.meteora_fee_worst_case { "WORST" } else { "now" },
                     );
                     printed += 1;
-                    if printed >= 12 {
-                        break; // cap the log volume per tick
+                    if printed >= 3 {
+                        break; // cap the log volume per tick (operator asked for 3)
                     }
                 }
             }

@@ -166,6 +166,12 @@ pub struct ShredArbConfig {
     /// NOT reduce tx size — it adds a few bytes — so leave off if size-bound.
     #[serde(default)]
     pub direct_loaded_accounts_data_limit: u32,
+    /// SetComputeUnitPrice priority fee, micro-lamports per CU (0 = don't add).
+    /// Applies on the JITO path (the direct path uses
+    /// `direct_priority_fee_microlamports`). Competitors set a priority fee on top
+    /// of the Jito tip; toggle this to A/B test whether it helps landing.
+    #[serde(default)]
+    pub compute_unit_price_microlamports: u64,
     /// Token mints whose ATA is assumed to ALWAYS exist — never checked, never
     /// created at startup. Put SOL/WSOL/USDC/USDT (and any other permanent
     /// holdings) here. Edited in config.toml under `[shred_arb]`.
@@ -432,6 +438,7 @@ impl Default for ShredArbConfig {
             metis_use_shared_accounts: false,
             metis_max_accounts: default_metis_max_accounts(),
             direct_loaded_accounts_data_limit: 0,
+            compute_unit_price_microlamports: 0,
         }
     }
 }

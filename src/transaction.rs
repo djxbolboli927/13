@@ -89,6 +89,10 @@ pub fn build_arb_transaction(
     // sets this — it caps the account-data bytes billed, cutting the CU the
     // leader charges for loading accounts, which materially helps the tx land.
     loaded_accounts_data_limit: u32,
+    // SetComputeUnitPrice priority fee (micro-lamports per CU; 0 = don't add).
+    // In a Jito bundle the tip usually dominates, but competitors also set a
+    // priority fee; exposed as a config toggle so it can be A/B tested.
+    compute_unit_price_microlamports: u64,
     recent_blockhash: Hash,
     alt_cache: &AltCache,
     rpc_client: &RpcClient,
@@ -115,6 +119,19 @@ pub fn build_arb_transaction(
         },
     };
     instructions.push(cu_limit_ix);
+
+    // #1a -- SetComputeUnitPrice, optional (0x03, u64 micro-lamports/CU).
+    if compute_unit_price_microlamports > 0 {
+        instructions.push(Instruction {
+            program_id: Pubkey::from_str("ComputeBudget111111111111111111111111111111")?,
+            accounts: vec![],
+            data: {
+                let mut data = vec![0x03];
+                data.extend_from_slice(&compute_unit_price_microlamports.to_le_bytes());
+                data
+            },
+        });
+    }
 
     // #1b -- SetLoadedAccountsDataSizeLimit, optional (0x04, u32 bytes).
     if loaded_accounts_data_limit > 0 {
