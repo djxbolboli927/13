@@ -325,6 +325,13 @@ pub struct ShredArbConfig {
     /// Fraction of the detected net profit paid to Jito as tip (0.20 = 20%).
     #[serde(default = "default_jito_tip_profit_frac")]
     pub jito_tip_profit_fraction: f64,
+    /// DIAGNOSTIC: after each send, re-run the EXACT tx through the RPC
+    /// `simulateTransaction` against live chain state and log our predicted
+    /// output vs. the network's real output (plus the raw Pump/Meteora swap
+    /// logs, so per-leg amounts and fees can be hand-compared). Off the hot
+    /// path (runs in a spawned task; adds zero send latency). Default false.
+    #[serde(default)]
+    pub rpc_sim_compare: bool,
 }
 
 fn default_alt_fetch_providers() -> Vec<String> {
@@ -452,6 +459,7 @@ impl Default for ShredArbConfig {
             compute_unit_price_microlamports: 0,
             metis_load_retry_limit: default_metis_load_retry_limit(),
             meteora_max_stale_slots: 0,
+            rpc_sim_compare: false,
         }
     }
 }

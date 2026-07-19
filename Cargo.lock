@@ -4812,6 +4812,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solana-account 3.4.0",
+ "solana-account-decoder",
  "solana-address 2.6.0",
  "solana-client",
  "solana-entry",

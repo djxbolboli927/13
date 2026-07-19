@@ -14,6 +14,7 @@
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::signature::Keypair;
+use solana_sdk::signer::Signer;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -151,6 +152,9 @@ pub struct ArbParams {
     /// config symmetry; teardown is gated in main.rs, so it's not read here.
     #[allow(dead_code)]
     pub never_close: bool,
+    /// DIAGNOSTIC: after each send, re-simulate the exact tx via RPC and log our
+    /// predicted output vs. the network's real output + raw swap logs.
+    pub rpc_sim_compare: bool,
 }
 
 pub struct ShredArbEngine {
@@ -851,6 +855,28 @@ impl ShredArbEngine {
             .await;
     }
 
+    /// Spawn the off-hot-path RPC sim-compare for a just-sent tx (no-op unless
+    /// `rpc_sim_compare` is enabled). Clones only what the task needs.
+    fn spawn_sim_compare(
+        &self,
+        tx: solana_sdk::transaction::VersionedTransaction,
+        predicted_out: u64,
+        amount_in: u64,
+        token: String,
+    ) {
+        if !self.params.rpc_sim_compare {
+            return;
+        }
+        let wsol_ata = spl_associated_token_account::get_associated_token_address(
+            &self.trading_keypair.pubkey(),
+            &crate::dex_ids::wsol_mint(),
+        );
+        let rpc = self.rpc_client.clone();
+        tokio::spawn(async move {
+            sim_compare(rpc, tx, predicted_out, amount_in, token, wsol_ata).await;
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
@@ -1159,6 +1185,13 @@ impl ShredArbEngine {
                 return;
             }
 
+            // Clone the exact tx for the post-send RPC sim-compare diagnostic
+            // (only when enabled — otherwise this is a cheap no-op branch).
+            let sim_tx = if self.params.rpc_sim_compare {
+                Some(tx.clone())
+            } else {
+                None
+            };
             let rpc2 = self.rpc_client.clone();
             let send_res = tokio::task::spawn_blocking(move || {
                 use solana_client::rpc_config::RpcSendTransactionConfig;
@@ -1177,6 +1210,9 @@ impl ShredArbEngine {
                     self.sent.fetch_add(1, Ordering::Relaxed);
                     self.last_sent.insert(key, Instant::now());
                     info!(signature = %sig, input = amount_in, "shred-arb tx sent (direct)");
+                    if let Some(t) = sim_tx {
+                        self.spawn_sim_compare(t, predicted_out, amount_in, token.clone());
+                    }
                     // Resolve the on-chain fate so EVERY sent tx is accounted for
                     // (landed_ok / reverted / dropped / unknown always sums to
                     // sent). Uses history-searching status lookups + retries so a
@@ -1294,6 +1330,11 @@ impl ShredArbEngine {
         // landed (Jito accepting a bundle ≠ it landing; it may lose the auction
         // or its tx may revert). Without this the Jito path is blind.
         let sig = tx.signatures.first().copied();
+        let sim_tx = if self.params.rpc_sim_compare {
+            Some(tx.clone())
+        } else {
+            None
+        };
         let result = if use_grpc {
             match &self.jito_grpc {
                 Some(g) => g.send_bundle(&tx).await,
@@ -1308,6 +1349,9 @@ impl ShredArbEngine {
                 self.sent.fetch_add(1, Ordering::Relaxed);
                 self.last_sent.insert(key, Instant::now());
                 info!(bundle = %id, input = amount_in, tip, via = if use_grpc { "grpc" } else { "rest" }, "shred-arb bundle sent");
+                if let Some(t) = sim_tx {
+                    self.spawn_sim_compare(t, predicted_out, amount_in, token.clone());
+                }
                 // Track on-chain fate so we KNOW: landed_ok / reverted / dropped
                 // (auction-lost or never landed). A dropped bundle costs nothing.
                 if let Some(sig) = sig {
@@ -1666,6 +1710,132 @@ async fn fetch_tx_logs(rpc: &Arc<RpcClient>, sig: solana_sdk::signature::Signatu
         },
         Ok(Err(e)) => format!("get-tx-err:{e}"),
         Err(e) => format!("join-err:{e}"),
+    }
+}
+
+/// DIAGNOSTIC: re-run the EXACT built tx through the RPC `simulateTransaction`
+/// against live chain state, then log OUR predicted output next to the network's
+/// REAL output — plus the raw program logs so the per-leg Pump/Meteora amounts
+/// and fees can be hand-compared. Zero rounding: the WSOL delta is read straight
+/// from the post-simulation token-account balance (lamport-exact).
+///
+/// Runs in a spawned task off the hot path — it adds NO latency to the send.
+/// `replace_recent_blockhash = true` + `sig_verify = false` so an old blockhash
+/// or the fact we didn't re-sign never causes a spurious failure; the sim uses
+/// the node's freshest state.
+async fn sim_compare(
+    rpc: Arc<RpcClient>,
+    tx: solana_sdk::transaction::VersionedTransaction,
+    predicted_out: u64,
+    amount_in: u64,
+    token: String,
+    wsol_ata: solana_sdk::pubkey::Pubkey,
+) {
+    use solana_account_decoder::{UiAccountData, UiAccountEncoding};
+    use solana_client::rpc_config::{
+        RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig,
+    };
+
+    let cfg = RpcSimulateTransactionConfig {
+        sig_verify: false,
+        replace_recent_blockhash: true,
+        commitment: Some(solana_sdk::commitment_config::CommitmentConfig::processed()),
+        accounts: Some(RpcSimulateTransactionAccountsConfig {
+            encoding: Some(UiAccountEncoding::Base64),
+            addresses: vec![wsol_ata.to_string()],
+        }),
+        ..Default::default()
+    };
+
+    let rpc2 = rpc.clone();
+    let res =
+        tokio::task::spawn_blocking(move || rpc2.simulate_transaction_with_config(&tx, cfg)).await;
+
+    let value = match res {
+        Ok(Ok(r)) => r.value,
+        Ok(Err(e)) => {
+            warn!(%token, error = %e, "sim-compare RPC error");
+            return;
+        }
+        Err(e) => {
+            warn!(%token, error = %e, "sim-compare join error");
+            return;
+        }
+    };
+
+    // Real post-simulation WSOL balance (lamport-exact). The tx starts and ends
+    // in WSOL, so post − in-flight is the true realized output of the round-trip.
+    let real_out: Option<u64> = value
+        .accounts
+        .as_ref()
+        .and_then(|v| v.first().cloned().flatten())
+        .and_then(|acc| match acc.data {
+            UiAccountData::Binary(b64, UiAccountEncoding::Base64) => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.decode(b64).ok()
+            }
+            _ => None,
+        })
+        .filter(|d| d.len() >= 72)
+        .map(|d| {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&d[64..72]);
+            u64::from_le_bytes(buf)
+        });
+
+    let reverted = value.err.is_some();
+    let logs = value
+        .logs
+        .as_ref()
+        .map(|l| l.join(" | "))
+        .unwrap_or_else(|| "no-logs".to_string());
+
+    // predicted_out is the round-trip WSOL out our math computed for `amount_in`.
+    // real_out is the node's WSOL balance AFTER the same tx ran on live state.
+    match real_out {
+        Some(real) => {
+            let delta = real as i64 - predicted_out as i64;
+            let delta_pct = if predicted_out > 0 {
+                delta as f64 / predicted_out as f64 * 100.0
+            } else {
+                0.0
+            };
+            info!(
+                %token,
+                input = amount_in,
+                predicted_out,
+                real_out = real,
+                delta,
+                delta_pct,
+                reverted,
+                "SIM-COMPARE (our calc vs network)"
+            );
+            crate::errlog::log(
+                "sim-compare",
+                &format!(
+                    "token={token} input={amount_in} predicted_out={predicted_out} \
+                     real_out={real} delta={delta} delta_pct={delta_pct:.4} \
+                     reverted={reverted} logs=[{logs}]"
+                ),
+            );
+        }
+        None => {
+            // No post balance (usually because the sim reverted before the sell
+            // leg settled). The err + logs still show WHERE it diverged.
+            warn!(
+                %token, predicted_out, reverted,
+                err = ?value.err,
+                "SIM-COMPARE reverted / no post-balance"
+            );
+            crate::errlog::log(
+                "sim-compare",
+                &format!(
+                    "token={token} input={amount_in} predicted_out={predicted_out} \
+                     real_out=NONE reverted={reverted} err={:?} logs=[{logs}]",
+                    value.err
+                ),
+            );
+        }
     }
 }
 

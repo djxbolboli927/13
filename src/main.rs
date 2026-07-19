@@ -404,6 +404,7 @@ fn spawn_shred_arb(
         meteora_fee_worst_case: sa.meteora_fee_worst_case,
         min_pool_wsol_lamports: sa.min_pool_wsol_lamports,
         never_close: sa.never_close_pools,
+        rpc_sim_compare: sa.rpc_sim_compare,
     };
 
     // Errors-only file log (errors + why-not-sent + why-lost) under /root/g.
