@@ -68,6 +68,10 @@ struct CachedRoute {
     /// swap_instruction data (discovered once at capture time).
     in_off: usize,
     out_off: usize,
+    /// The Pump pool's `coin_creator` at capture time. Pump can rotate it after
+    /// creation, which moves the creator_vault accounts baked into `swap_ixs`;
+    /// on reuse we re-derive from the LIVE creator and patch any stale vault.
+    coin_creator: Option<solana_sdk::pubkey::Pubkey>,
 }
 
 /// Tunables sourced from `[shred_arb]` config.
@@ -932,7 +936,7 @@ impl ShredArbEngine {
             })
         };
 
-        let swap_ixs = if let Some(ixs) = cached_ixs {
+        let mut swap_ixs = if let Some(ixs) = cached_ixs {
             from_cache = true;
             self.route_cache_hits.fetch_add(1, Ordering::Relaxed);
             ixs
@@ -1046,7 +1050,12 @@ impl ShredArbEngine {
                 {
                     self.route_cache.insert(
                         cache_key,
-                        CachedRoute { swap_ixs: swap_ixs.clone(), in_off, out_off },
+                        CachedRoute {
+                            swap_ixs: swap_ixs.clone(),
+                            in_off,
+                            out_off,
+                            coin_creator: self.pool_state.pump_coin_creator(&pair.pump.pool),
+                        },
                     );
                     debug!(token = %token, "route instructions cached in RAM");
                 }
@@ -1054,6 +1063,33 @@ impl ShredArbEngine {
             }
             swap_ixs
         };
+
+        // ── Pump coin_creator vault freshness ────────────────────────────────
+        // The Pump AMM `coin_creator_vault_ata` / `coin_creator_vault_authority`
+        // accounts are PDAs of the pool's `coin_creator`, which pump can set or
+        // rotate AFTER creation (default zero → real creator, populated by its
+        // backend). A cached route — or a Metis quote built off a stale pool
+        // snapshot — carries the OLD vault and the swap reverts. Re-derive from
+        // the LIVE `coin_creator` (read from the subscribed pool account) and
+        // rewrite any stale vault account in place. No-op when nothing is stale.
+        if let Some(current_creator) = self.pool_state.pump_coin_creator(&pair.pump.pool) {
+            let cached_creator = if from_cache {
+                self.route_cache.get(&cache_key).and_then(|c| c.coin_creator)
+            } else {
+                None
+            };
+            let patched = patch_pump_creator_vault(
+                &mut swap_ixs.swap_instruction,
+                &current_creator,
+                cached_creator.as_ref(),
+            );
+            if patched {
+                debug!(
+                    token = %token, pool = %pair.pump.pool, creator = %current_creator,
+                    "patched stale pump coin_creator vault accounts"
+                );
+            }
+        }
 
         // Teach our self-learning ALT every account in this route so subsequent
         // txs for this pool compress fully. Cheap: only unseen pubkeys enqueue.
@@ -1870,6 +1906,76 @@ fn harvest_accounts(
         visit(ix);
     }
     out
+}
+
+/// Derive the Pump.fun AMM `coin_creator_vault_authority` PDA and its WSOL ATA
+/// (`coin_creator_vault_ata`) for a given pool `coin_creator`, exactly as the
+/// on-chain program does (IDL `pump_amm.json`):
+///   authority = PDA([b"creator_vault", coin_creator], PUMP_AMM_PROGRAM)
+///   ata       = ATA(authority, quote_mint=WSOL, SPL Token program)
+fn pump_creator_vault(
+    coin_creator: &solana_sdk::pubkey::Pubkey,
+) -> (solana_sdk::pubkey::Pubkey, solana_sdk::pubkey::Pubkey) {
+    let program = crate::dex_ids::pumpfun_program();
+    let (authority, _) = solana_sdk::pubkey::Pubkey::find_program_address(
+        &[b"creator_vault", coin_creator.as_ref()],
+        &program,
+    );
+    // WSOL is a classic SPL token, so the vault ATA lives under the SPL Token
+    // program (Tokenkeg…), which is what the pool passes as `quote_token_program`.
+    let spl_token = solana_sdk::pubkey::Pubkey::from_str_const(
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    );
+    let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+        &authority,
+        &crate::dex_ids::wsol_mint(),
+        &spl_token,
+    );
+    (authority, ata)
+}
+
+/// Rewrite the Pump `coin_creator_vault_ata` / `coin_creator_vault_authority`
+/// accounts in a (possibly cached or Metis-stale) swap instruction so they match
+/// the pool's CURRENT `coin_creator`. Pump can rotate `coin_creator` after pool
+/// creation (default zero → real creator), which moves both PDAs; a frozen
+/// instruction then carries the OLD vault and the swap reverts. We re-derive the
+/// correct pair and swap out any account that equals a KNOWN-stale vault
+/// (derived from the default/zero creator and from whatever creator was current
+/// when the route was cached). A no-op when nothing is stale.
+fn patch_pump_creator_vault(
+    ix: &mut crate::metis::InstructionData,
+    current_creator: &solana_sdk::pubkey::Pubkey,
+    cached_creator: Option<&solana_sdk::pubkey::Pubkey>,
+) -> bool {
+    let (new_auth, new_ata) = pump_creator_vault(current_creator);
+    let new_auth_s = new_auth.to_string();
+    let new_ata_s = new_ata.to_string();
+    // Stale candidates: the zero/default creator (the pre-population value) and
+    // the creator captured when this route was cached, if different.
+    let mut stale: Vec<solana_sdk::pubkey::Pubkey> =
+        vec![solana_sdk::pubkey::Pubkey::default()];
+    if let Some(c) = cached_creator {
+        stale.push(*c);
+    }
+    let mut patched = false;
+    for old in stale {
+        if old == *current_creator {
+            continue;
+        }
+        let (old_auth, old_ata) = pump_creator_vault(&old);
+        let old_auth_s = old_auth.to_string();
+        let old_ata_s = old_ata.to_string();
+        for a in ix.accounts.iter_mut() {
+            if a.pubkey == old_auth_s {
+                a.pubkey = new_auth_s.clone();
+                patched = true;
+            } else if a.pubkey == old_ata_s {
+                a.pubkey = new_ata_s.clone();
+                patched = true;
+            }
+        }
+    }
+    patched
 }
 
 fn buy_kind_label(k: DexKind) -> &'static str {

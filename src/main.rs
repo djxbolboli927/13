@@ -462,6 +462,9 @@ fn spawn_shred_arb(
         let mut accounts: Vec<solana_sdk::pubkey::Pubkey> = Vec::new();
         for p in &pairs {
             accounts.push(p.meteora.pool);
+            // Pump POOL account: its `coin_creator` @211 drives the creator_vault
+            // accounts (re-derived live before each send).
+            accounts.push(p.pump.pool);
             accounts.push(p.pump.token_vault());
             accounts.push(p.pump.wsol_vault());
             // Token mint too — its `supply` field drives the Pump market-cap fee tier.

@@ -414,6 +414,32 @@ impl PoolStateCache {
     pub fn meteora_pool(
         &self,
         pool: &Pubkey,
+        fallback_fee_numerator: u64,
+        worst_case_fee: bool,
+    ) -> Option<MeteoraPool> {
+        let p = self.meteora_pool_decoded(pool, fallback_fee_numerator, worst_case_fee)?;
+        // LIVE overlay: if a shred-advanced sqrt_price exists that is still based
+        // on the CURRENT cache slot, use it (keeps us in sync with in-flight txs
+        // the gRPC stream hasn't delivered yet). Only sqrt_price is overridden;
+        // liquidity/fees come from the fresh decode. Re-validate the range.
+        if let Some(e) = self.live_meteora.get(pool) {
+            if e.value().0 == self.last_update_slot(pool).unwrap_or(0) {
+                let sp = e.value().1.sqrt_price;
+                if sp >= p.sqrt_min_price && sp <= p.sqrt_max_price {
+                    return Some(MeteoraPool { sqrt_price: sp, ..p });
+                }
+            }
+        }
+        Some(p)
+    }
+
+    /// Raw decode of a Meteora pool WITHOUT the live shred overlay — the
+    /// gRPC-confirmed ground truth. Used as the base for the in-flight overlay so
+    /// we never advance a price that is itself already advanced (which would
+    /// accumulate in-flight swaps). Same validity gating as `meteora_pool`.
+    fn meteora_pool_decoded(
+        &self,
+        pool: &Pubkey,
         _fallback_fee_numerator: u64,
         worst_case_fee: bool,
     ) -> Option<MeteoraPool> {
@@ -451,18 +477,6 @@ impl PoolStateCache {
             || p.sqrt_price > p.sqrt_max_price
         {
             return None;
-        }
-        // LIVE overlay: if a shred-advanced sqrt_price exists that is still based
-        // on the CURRENT cache slot, use it (keeps us in sync with in-flight txs
-        // the gRPC stream hasn't delivered yet). Only sqrt_price is overridden;
-        // liquidity/fees come from the fresh decode. Re-validate the range.
-        if let Some(e) = self.live_meteora.get(pool) {
-            if e.value().0 == self.last_update_slot(pool).unwrap_or(0) {
-                let sp = e.value().1.sqrt_price;
-                if sp >= p.sqrt_min_price && sp <= p.sqrt_max_price {
-                    return Some(MeteoraPool { sqrt_price: sp, ..p });
-                }
-            }
         }
         Some(p)
     }
@@ -545,12 +559,13 @@ impl PoolStateCache {
         shred_slot: u64,
     ) {
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
-        let base = match self.live_pump.get(token_vault) {
-            Some(e) if e.value().0 == cur => e.value().1,
-            _ => match self.pump_pool(token_vault, wsol_vault, token_mint) {
-                Some(p) => p,
-                None => return,
-            },
+        // Base is ALWAYS the gRPC-confirmed vault decode (no overlay); we apply
+        // only THIS single in-flight swap. Accumulating every observed swap would
+        // over-move the reserves — if more than one had truly executed the vaults
+        // would have updated (cur would advance) and the overlay would rebuild.
+        let base = match self.pump_pool(token_vault, wsol_vault, token_mint) {
+            Some(p) => p,
+            None => return,
         };
         let advanced = if shred_slot <= cur {
             base // already on-chain / in the cache
@@ -592,12 +607,15 @@ impl PoolStateCache {
         shred_slot: u64,
     ) {
         let cur = self.last_update_slot(pool).unwrap_or(0);
-        let base = match self.live_meteora.get(pool) {
-            Some(e) if e.value().0 == cur => e.value().1,
-            _ => match self.meteora_pool(pool, fallback_fee_numerator, worst_case_fee) {
-                Some(p) => p,
-                None => return,
-            },
+        // Base is ALWAYS the gRPC-confirmed decode (no overlay), and we apply only
+        // THIS single in-flight swap on top. Accumulating every observed in-flight
+        // swap over-moves the price: if more than one had actually executed, the
+        // account would have updated (cur would advance) and the overlay would be
+        // rebuilt. At most one swap is genuinely pending unconfirmed, so summing
+        // them is the thin-pool over-prediction that produced the 0x1771 reverts.
+        let base = match self.meteora_pool_decoded(pool, fallback_fee_numerator, worst_case_fee) {
+            Some(p) => p,
+            None => return,
         };
         let advanced = if shred_slot <= cur {
             base
@@ -605,6 +623,20 @@ impl PoolStateCache {
             base.apply_observed_swap(amount_in, a_to_b)
         };
         self.live_meteora.insert(*pool, (cur, advanced));
+    }
+
+    /// The Pump.fun AMM pool's `coin_creator` (pubkey @ offset 211 of the Pool
+    /// account, discriminator included). This drives the `creator_vault` PDA and
+    /// its ATA. Pump can SET/rotate `coin_creator` after pool creation (default
+    /// zero → the real creator, populated by pump's backend on first trades), so
+    /// it must be read LIVE — a snapshot taken at discovery can go stale and the
+    /// derived vault accounts then mismatch, reverting the swap. `None` if the
+    /// pool account isn't cached (it must be subscribed for this to work).
+    pub fn pump_coin_creator(&self, pool: &Pubkey) -> Option<Pubkey> {
+        let entry = self.inner.get(pool)?;
+        let d = entry.value();
+        d.get(211..211 + 32)
+            .map(|s| Pubkey::new_from_array(s.try_into().unwrap()))
     }
 
     /// SPL mint total supply (u64 @ offset 36 of a Mint account). `None` if the
@@ -629,9 +661,25 @@ impl PoolStateCache {
     /// extension, so any transfer fee lives only in a Token-2022 mint whose data
     /// is longer and holds a TLV extension list after the 82-byte base + 1-byte
     /// account-type tag. We scan that TLV for `TransferFeeConfig` (type 1) and
-    /// return the LARGER of its two epoch fees (older/newer) — never understating
-    /// the fee, so profit is never overstated.
+    /// return the fee that is ACTUALLY IN EFFECT this epoch — exactly what the
+    /// on-chain program charges.
+    ///
+    /// A `TransferFeeConfig` stores TWO fee snapshots, `older_transfer_fee` and
+    /// `newer_transfer_fee`, each tagged with the epoch it takes effect. SPL
+    /// Token-2022 `get_epoch_fee` uses `newer` once `current_epoch >= newer.epoch`
+    /// and `older` before that. Taking the LARGER of the two (the old behaviour)
+    /// is a FICTION: when a mint lowers its fee (e.g. to 0, as MEMIPEDE/FABLE
+    /// did) the newer/lower fee is what the chain applies, so `max()` invents a
+    /// fee that no real transfer pays and mis-prices every leg. We reproduce the
+    /// on-chain epoch selection instead, reading the true current-epoch fee
+    /// (which may legitimately be 0). Current epoch is derived from the live slot
+    /// (mainnet: 432_000 slots/epoch); if the slot isn't seeded yet we fall back
+    /// to the conservative `max()` so we never understate before the first slot.
     pub fn mint_transfer_fee_bps(&self, mint: &Pubkey) -> u16 {
+        // Mainnet-beta has a fixed 432_000 slots per epoch and no warmup, so the
+        // epoch is simply slot / SLOTS_PER_EPOCH.
+        const SLOTS_PER_EPOCH: u64 = 432_000;
+        let current_epoch = self.slot.load(Ordering::Relaxed) / SLOTS_PER_EPOCH;
         let entry = match self.inner.get(mint) {
             Some(e) => e,
             None => return 0,
@@ -653,12 +701,25 @@ impl PoolStateCache {
             // TransferFeeConfig extension = type 1. Its data layout:
             //   authority(32) + withdraw_authority(32) + withheld_amount(8)
             //   + older_transfer_fee(18) + newer_transfer_fee(18)
-            // where TransferFee = epoch(8)+maximum_fee(8)+basis_points(u16,2),
-            // so basis_points sits at data offset 88 (older) and 106 (newer).
+            // where TransferFee = epoch(u64,8)+maximum_fee(u64,8)+basis_points(u16,2).
+            // So, from data_start: older.epoch@72, older.bps@88;
+            //                      newer.epoch@90, newer.bps@106.
             if ext_type == 1 && ext_len >= 108 {
-                let older = u16::from_le_bytes([d[data_start + 88], d[data_start + 89]]);
-                let newer = u16::from_le_bytes([d[data_start + 106], d[data_start + 107]]);
-                return older.max(newer);
+                let older_bps = u16::from_le_bytes([d[data_start + 88], d[data_start + 89]]);
+                let newer_epoch = u64::from_le_bytes(
+                    d[data_start + 90..data_start + 98].try_into().unwrap(),
+                );
+                let newer_bps = u16::from_le_bytes([d[data_start + 106], d[data_start + 107]]);
+                // On-chain `get_epoch_fee`: newer applies once epoch >= newer.epoch.
+                if current_epoch == 0 {
+                    // Slot not seeded yet — stay conservative (never understate).
+                    return older_bps.max(newer_bps);
+                }
+                return if current_epoch >= newer_epoch {
+                    newer_bps
+                } else {
+                    older_bps
+                };
             }
             if ext_len == 0 {
                 break; // malformed / end-of-list guard
