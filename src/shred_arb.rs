@@ -159,6 +159,17 @@ pub struct ArbParams {
     /// DIAGNOSTIC: after each send, re-simulate the exact tx via RPC and log our
     /// predicted output vs. the network's real output + raw swap logs.
     pub rpc_sim_compare: bool,
+    /// Disable the "preempted" last-moment recheck. When true, a profitable
+    /// opportunity is sent even if the pool moved during our compute window —
+    /// we already model both the reverted-competitor and landed-competitor
+    /// states, so this second-guess only suppresses good sends. Default false.
+    pub disable_preempt: bool,
+    /// Force-send every profitable opportunity. Bypasses the send-dedup throttle
+    /// (and, implicitly, the preempt recheck) so the ONLY thing that stops a
+    /// profitable send is Metis failing to route it (and it not being in our
+    /// template cache). Physical limits (tx > 1232 bytes / > 64 locks) still
+    /// apply — those txs literally cannot be sent. Default false.
+    pub force_send_profitable: bool,
 }
 
 pub struct ShredArbEngine {
@@ -263,6 +274,9 @@ pub struct ShredArbEngine {
     /// Skipped at the last moment because the pool moved during our compute
     /// window (a competitor's trade landed) so the tx would now revert.
     nosend_preempted: AtomicU64,
+    /// Multi-hop arbitrage txs observed on a Pump pool that we IGNORED for state
+    /// prediction (assume-first model — they mostly revert on the Meteora side).
+    arb_ignored: AtomicU64,
     /// Route-instruction cache: sends served from RAM (no Metis round-trip)
     /// vs. sends that had to fetch instructions from Metis first.
     route_cache_hits: AtomicU64,
@@ -386,6 +400,7 @@ impl ShredArbEngine {
             nosend_too_locks: AtomicU64::new(0),
             nosend_send_err: AtomicU64::new(0),
             nosend_preempted: AtomicU64::new(0),
+            arb_ignored: AtomicU64::new(0),
             route_cache_hits: AtomicU64::new(0),
             route_cache_misses: AtomicU64::new(0),
             best_net_seen: AtomicI64::new(i64::MIN),
@@ -505,39 +520,35 @@ impl ShredArbEngine {
                 return;
             }
         }
-        // ── Keep the LIVE state in sync with this shred ─────────────────────
-        // Persist this observed Pump swap into the live pump overlay so the NEXT
-        // shred in the same block prices against a pool that already reflects it.
-        self.pool_state.apply_pump_swap(
-            &token_vault, &wsol_vault, &first.token_mint, sig.is_buy, sig.base_amount, sig.slot,
-        );
-        // If this tx also carried a Meteora leg on one of our pools (a circular
-        // arb), advance that Meteora pool's live sqrt_price too — this is the ONLY
-        // way we see Meteora activity (we get no standalone Meteora shreds), and
-        // it fixes the thin-pool staleness that caused the over-prediction.
-        // Direction: competitor Pump BUY ⇒ they SELL token into Meteora (token in
-        // ⇒ a_to_b = token_is_a); Pump SELL ⇒ they BUY token (a_to_b = !token_is_a).
-        if let (Some(mpool), Some(amt)) = (sig.meteora_pool, sig.meteora_amount_in) {
-            if let Some(pair) = pairs.iter().find(|p| p.meteora.pool == mpool) {
-                let a_to_b = if sig.is_buy {
-                    pair.meteora.token_is_a
-                } else {
-                    !pair.meteora.token_is_a
-                };
-                let fallback = self.params.meteora_fee_bps.saturating_mul(100_000);
-                self.pool_state.apply_meteora_swap(
-                    &mpool, fallback, self.params.meteora_fee_worst_case, amt, a_to_b, sig.slot,
-                );
+        // ── Classify the observed tx: holder/sniper swap vs multi-hop arb ────
+        // A tx that ALSO carries a Meteora leg on one of our pools is a circular
+        // ARBITRAGE tx (competitor bot). Thousands of these fire per opportunity
+        // and all but ONE revert on the thin Meteora side, so treating them as
+        // real pool movement is exactly what over-predicted the state and caused
+        // our reverts. We therefore IGNORE arb txs for state prediction — on BOTH
+        // pools — and assess as if we are first to see the gap. Only SIMPLE Pump
+        // buys/sells (holders/snipers, no Meteora leg) actually land reliably, so
+        // only THOSE are accumulated into the live Pump overlay.
+        let is_arb = sig.meteora_pool.is_some();
+        let pump_after = if is_arb {
+            self.arb_ignored.fetch_add(1, Ordering::Relaxed);
+            // Assume we are first: price against the current (confirmed + prior
+            // holder-flow) Pump state, without advancing from this arb tx. Meteora
+            // is likewise left at its confirmed state (no advance from arb legs).
+            pump_now
+        } else {
+            // Holder/sniper simple swap — accumulate it into the live overlay so
+            // the next shred in this block prices against a pool that reflects it.
+            self.pool_state.apply_pump_swap(
+                &token_vault, &wsol_vault, &first.token_mint, sig.is_buy, sig.base_amount, sig.slot,
+            );
+            match self
+                .pool_state
+                .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint)
+            {
+                Some(p) => p,
+                None => pump_now,
             }
-        }
-        // Predicted post-trade Pump reserves — the live overlay now includes this
-        // shred, so read it back for pricing.
-        let pump_after = match self
-            .pool_state
-            .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint)
-        {
-            Some(p) => p,
-            None => pump_now,
         };
         // Assess every Meteora counter-pool of this token IN PARALLEL — each on
         // its own task, sends go straight out with no shared queue.
@@ -897,7 +908,7 @@ impl ShredArbEngine {
         // De-dupe: don't blast the same pool with identical txs while an earlier
         // one is still unconfirmed. Kept SMALL and configurable (send_dedup_ms,
         // 0 = off) so multiple distinct opportunities in one block can each send.
-        if self.params.send_dedup_ms > 0 {
+        if self.params.send_dedup_ms > 0 && !self.params.force_send_profitable {
             if let Some(prev) = self.last_sent.get(&key) {
                 if prev.elapsed() < Duration::from_millis(self.params.send_dedup_ms) {
                     self.nosend_dedup.fetch_add(1, Ordering::Relaxed);
@@ -1211,8 +1222,12 @@ impl ShredArbEngine {
 
             // Last-moment freshness gate: if the pool moved against us while we
             // fetched quotes/built the tx (a competitor's trade landed), this tx
-            // would revert — skip it instead of sending a doomed tx.
-            if !self.still_profitable(&recheck) {
+            // would revert — skip it instead of sending a doomed tx. Disabled by
+            // `disable_preempt` / `force_send_profitable`: we already model both
+            // the reverted- and landed-competitor states, so the recheck only
+            // suppresses good sends.
+            let preempt_on = !self.params.disable_preempt && !self.params.force_send_profitable;
+            if preempt_on && !self.still_profitable(&recheck) {
                 self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
                 crate::errlog::log(
                     "not-sent",
@@ -1613,7 +1628,7 @@ impl ShredArbEngine {
                 let unknown = ss.unknown.load(Ordering::Relaxed);
                 eprintln!(
                     "\n[shred-arb 30s] watching_pools={}\n\
-                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}]\n\
+                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
@@ -1622,6 +1637,7 @@ impl ShredArbEngine {
                     self.profitable.load(Ordering::Relaxed),
                     self.not_profitable.load(Ordering::Relaxed),
                     self.skip_uncrossable.load(Ordering::Relaxed),
+                    self.arb_ignored.load(Ordering::Relaxed),
                     self.skip_min_trigger.load(Ordering::Relaxed),
                     self.skip_no_meteora_state.load(Ordering::Relaxed),
                     self.skip_stale_meteora.load(Ordering::Relaxed),
@@ -1989,9 +2005,11 @@ fn buy_kind_label(k: DexKind) -> &'static str {
 ///
 /// The objective is not guaranteed unimodal (the swap can return `None` for
 /// oversized trades that cross a range bound), so a plain ternary search can
-/// get stuck. We instead sweep a GEOMETRIC grid across `[lo, hi]` — which is
-/// dense at the small sizes these low-liquidity pools actually want — then
-/// refine linearly around the best grid point. Returns `(best_x, best_net)`.
+/// get stuck. We first sweep a GEOMETRIC grid across `[lo, hi]` — which is
+/// dense at the small sizes these low-liquidity pools actually want — to locate
+/// the basin, then converge on the EXACT profit-maximizing lamport with an
+/// integer ternary search (no grid rounding: the size we send is the true
+/// optimum, to the last lamport). Returns `(best_x, best_net)`.
 fn optimize_size<F: Fn(u64) -> Option<u64>>(
     lo: u64,
     hi: u64,
@@ -2009,7 +2027,7 @@ fn optimize_size<F: Fn(u64) -> Option<u64>>(
         return (lo, net(lo));
     }
 
-    // Geometric sweep.
+    // Geometric sweep to locate the basin of the optimum.
     const STEPS: usize = 240;
     let lo_f = lo as f64;
     let ratio = (hi as f64 / lo_f).powf(1.0 / STEPS as f64);
@@ -2026,11 +2044,23 @@ fn optimize_size<F: Fn(u64) -> Option<u64>>(
         xf *= ratio;
     }
 
-    // Linear refinement around the best grid point.
-    let span = (best_x / 10).max(1);
-    let a = best_x.saturating_sub(span).max(lo);
-    let b = best_x.saturating_add(span).min(hi);
-    let step = ((b - a) / 50).max(1);
+    // EXACT integer ternary search inside the bracket around the best grid point.
+    // The basin around a valid maximum is unimodal (oversized trades read as
+    // i128::MIN and push the bracket back toward the valid side), so this
+    // converges to the single best lamport — no snapping to a coarse grid.
+    let span = (best_x / 10).max(2);
+    let mut a = best_x.saturating_sub(span).max(lo);
+    let mut b = best_x.saturating_add(span).min(hi);
+    while b - a > 2 {
+        let m1 = a + (b - a) / 3;
+        let m2 = b - (b - a) / 3;
+        if net(m1) < net(m2) {
+            a = m1 + 1;
+        } else {
+            b = m2;
+        }
+    }
+    // Final exact scan of the tiny residual window (≤3 points).
     let mut x = a;
     while x <= b {
         let n = net(x);
@@ -2038,7 +2068,7 @@ fn optimize_size<F: Fn(u64) -> Option<u64>>(
             best_net = n;
             best_x = x;
         }
-        x = x.saturating_add(step);
+        x += 1;
     }
     (best_x, best_net)
 }

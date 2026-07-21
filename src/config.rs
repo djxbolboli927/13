@@ -332,6 +332,15 @@ pub struct ShredArbConfig {
     /// path (runs in a spawned task; adds zero send latency). Default false.
     #[serde(default)]
     pub rpc_sim_compare: bool,
+    /// Disable the "preempted" last-moment recheck (send even if the pool moved
+    /// during the compute window). Default false.
+    #[serde(default)]
+    pub disable_preempt: bool,
+    /// Force-send every profitable opportunity: bypass the send-dedup throttle
+    /// and the preempt recheck, so only a Metis routing failure stops a send.
+    /// Default false.
+    #[serde(default)]
+    pub force_send_profitable: bool,
 }
 
 fn default_alt_fetch_providers() -> Vec<String> {
@@ -460,6 +469,8 @@ impl Default for ShredArbConfig {
             metis_load_retry_limit: default_metis_load_retry_limit(),
             meteora_max_stale_slots: 0,
             rpc_sim_compare: false,
+            disable_preempt: false,
+            force_send_profitable: false,
         }
     }
 }

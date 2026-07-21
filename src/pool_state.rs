@@ -559,13 +559,19 @@ impl PoolStateCache {
         shred_slot: u64,
     ) {
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
-        // Base is ALWAYS the gRPC-confirmed vault decode (no overlay); we apply
-        // only THIS single in-flight swap. Accumulating every observed swap would
-        // over-move the reserves — if more than one had truly executed the vaults
-        // would have updated (cur would advance) and the overlay would rebuild.
-        let base = match self.pump_pool(token_vault, wsol_vault, token_mint) {
-            Some(p) => p,
-            None => return,
+        // ACCUMULATE in-flight Pump swaps: base is the existing overlay (if it is
+        // still built on the current confirmed slot), else the fresh confirmed
+        // decode. Successive holder/sniper buys+sells on Pump land almost every
+        // block, so summing them until the vaults update keeps our predicted
+        // reserves in step with the block being built. NOTE: the caller only
+        // feeds SIMPLE (non-arb) Pump swaps here — multi-hop arb legs are ignored
+        // for state prediction (they mostly revert on the Meteora side).
+        let base = match self.live_pump.get(token_vault) {
+            Some(e) if e.value().0 == cur => e.value().1,
+            _ => match self.pump_pool(token_vault, wsol_vault, token_mint) {
+                Some(p) => p,
+                None => return,
+            },
         };
         let advanced = if shred_slot <= cur {
             base // already on-chain / in the cache
@@ -597,6 +603,12 @@ impl PoolStateCache {
     /// Apply an observed Meteora swap (from a shred) to the live meteora overlay.
     /// `a_to_b` is the swap direction; the caller derives it from the arb's Pump
     /// leg and the pool's token side.
+    ///
+    /// NOT called on the default path: we assume we are first on Meteora, since
+    /// the only Meteora activity we can observe rides on competitor ARB txs and
+    /// those overwhelmingly revert. Retained for the future "exactly one tx
+    /// ahead" scenario model.
+    #[allow(dead_code)]
     pub fn apply_meteora_swap(
         &self,
         pool: &Pubkey,

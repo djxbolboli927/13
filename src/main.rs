@@ -405,6 +405,8 @@ fn spawn_shred_arb(
         min_pool_wsol_lamports: sa.min_pool_wsol_lamports,
         never_close: sa.never_close_pools,
         rpc_sim_compare: sa.rpc_sim_compare,
+        disable_preempt: sa.disable_preempt,
+        force_send_profitable: sa.force_send_profitable,
     };
 
     // Errors-only file log (errors + why-not-sent + why-lost) under /root/g.
