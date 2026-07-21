@@ -250,8 +250,8 @@ async fn async_main(config: config::Config) -> Result<()> {
         jito_grpc_limiter: jito_grpc_limiter.clone(),
         cu_limits: config.performance.cu_limits.clone(),
         user_pubkey: trading_keypair.pubkey().to_string(),
-        sim_cache,
-        sim_pool,
+        sim_cache: sim_cache.clone(),
+        sim_pool: sim_pool.clone(),
         template_store,
     });
 
@@ -294,6 +294,9 @@ async fn async_main(config: config::Config) -> Result<()> {
             jito_grpc_client.clone(),
             jito_limiter.clone(),
             jito_grpc_limiter.clone(),
+            sim_cache.clone(),
+            sim_pool.clone(),
+            metrics.clone(),
         ) {
             error!(error = %e, "failed to start shred-arb strategy");
         }
@@ -337,6 +340,9 @@ fn spawn_shred_arb(
     jito_grpc_client: Option<Arc<jito_grpc::JitoGrpcClient>>,
     jito_limiter: Arc<Mutex<RateLimiter>>,
     jito_grpc_limiter: Option<Arc<Mutex<RateLimiter>>>,
+    sim_cache: Option<Arc<account_cache::AccountCache>>,
+    sim_pool: Option<Arc<litesvm_sim::SimulatorPool>>,
+    metrics: Arc<metrics::Metrics>,
 ) -> Result<()> {
     let sa = config.shred_arb.clone();
     // Dedicated CU limit for the 2-hop Pump↔Meteora tx. Competitor arb txs
@@ -770,6 +776,9 @@ fn spawn_shred_arb(
             alt_builder,
             alt_fetcher,
             alt_registry,
+            sim_pool,
+            sim_cache,
+            metrics,
         ));
         engine.clone().spawn_reporter();
         engine.clone().spawn_fee_audit(sa.fee_audit_log_secs);

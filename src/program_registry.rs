@@ -24,6 +24,10 @@ pub const PROGRAMS: &[(&str, &str)] = &[
 
     // --- AMM / CLMM / orderbook DEXes ---
     ("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG", "Meteora_DAMM_v2.so"),
+    // Pump.fun AMM (PumpSwap) — the buy leg of the shred-arb route. Required
+    // so LiteSVM can execute the Pump swap instruction and so the pool + vault
+    // accounts stream into the AccountCache via this owner filter (no RPC).
+    ("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", "Pump_AMM.so"),
     ("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", "Raydium_Concentrated_Liquidity.so"),
     ("MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms", "Manifest.so"),
     ("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", "Whirlpools_Program.so"),

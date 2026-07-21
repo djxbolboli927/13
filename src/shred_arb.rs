@@ -204,6 +204,17 @@ pub struct ShredArbEngine {
     /// Best-ALT-per-pool registry harvested from competitor shreds (primary
     /// source for fresh pools). One max-coverage ALT per pool.
     pub alt_registry: Arc<crate::alt_registry::AltRegistry>,
+    /// LiteSVM pre-send simulation. When `Some`, the EXACT built tx is executed
+    /// locally against live gRPC-fed pool state before it is sent; if it reverts
+    /// or comes out unprofitable the send is dropped. `None` = simulation off
+    /// (legacy send-everything behaviour).
+    sim_pool: Option<Arc<crate::litesvm_sim::SimulatorPool>>,
+    sim_cache: Option<Arc<crate::account_cache::AccountCache>>,
+    /// Metrics handle the simulator increments (tx_dropped etc.).
+    metrics: Arc<crate::metrics::Metrics>,
+    /// Sim outcome counters.
+    sim_reverted: AtomicU64,
+    sim_ok: AtomicU64,
     /// In-RAM whole-route instruction cache: one Metis swap-instructions
     /// response per (pair, direction), amount-patched on every reuse so hot
     /// opportunities skip the Metis round-trip entirely. RAM-only by design —
@@ -348,6 +359,9 @@ impl ShredArbEngine {
         alt_builder: Option<Arc<crate::alt_builder::AltBuilder>>,
         alt_fetcher: Option<Arc<crate::alt_fetch::AltFetcher>>,
         alt_registry: Arc<crate::alt_registry::AltRegistry>,
+        sim_pool: Option<Arc<crate::litesvm_sim::SimulatorPool>>,
+        sim_cache: Option<Arc<crate::account_cache::AccountCache>>,
+        metrics: Arc<crate::metrics::Metrics>,
     ) -> Self {
         Self {
             metis,
@@ -368,6 +382,11 @@ impl ShredArbEngine {
             alt_builder,
             alt_fetcher,
             alt_registry,
+            sim_pool,
+            sim_cache,
+            metrics,
+            sim_reverted: AtomicU64::new(0),
+            sim_ok: AtomicU64::new(0),
             route_cache: dashmap::DashMap::new(),
             last_fired: dashmap::DashMap::new(),
             last_sent: dashmap::DashMap::new(),
@@ -887,6 +906,85 @@ impl ShredArbEngine {
             .await;
     }
 
+    /// LiteSVM pre-send gate. Executes the EXACT built tx locally against the
+    /// live gRPC-fed account cache (Yellowstone Processed — the same data Metis
+    /// consumes, so no extra delay) and returns `true` only if it succeeds.
+    ///
+    /// The on-chain output floor is already baked into the swap instruction at
+    /// break-even (input + network fee + Jito tip), so a tx that would net below
+    /// break-even reverts on-chain with slippage 0x1771 — and the simulator
+    /// reproduces exactly that revert. Dropping such txs here is precisely the
+    /// "don't send doomed txs" behaviour the operator asked for.
+    ///
+    /// Returns `true` (allow send) when simulation is disabled, so the gate is a
+    /// no-op unless `[simulation].enabled = true`.
+    async fn sim_check(
+        &self,
+        tx: &solana_sdk::transaction::VersionedTransaction,
+        token: &str,
+    ) -> bool {
+        let (pool, cache) = match (&self.sim_pool, &self.sim_cache) {
+            (Some(p), Some(c)) => (p.clone(), c.clone()),
+            _ => return true, // simulation off → allow
+        };
+
+        // Resolve the ALT keys the tx references so LiteSVM can expand its v0
+        // address-table lookups. Uses the cached ALT store (RPC only on a cold
+        // miss); if any ALT can't be resolved we allow the send rather than
+        // block a good opportunity on a lookup failure.
+        let alt_keys: Vec<String> = match &tx.message {
+            solana_sdk::message::VersionedMessage::V0(m) => m
+                .address_table_lookups
+                .iter()
+                .map(|l| l.account_key.to_string())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let alts = match crate::litesvm_sim::resolve_alts(
+            &alt_keys,
+            &self.alt_cache,
+            &self.rpc_client,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                debug!(token, error = %e, "sim: ALT resolve failed, allowing send");
+                return true;
+            }
+        };
+
+        let sim = pool.acquire();
+        let tx = tx.clone();
+        let metrics = self.metrics.clone();
+        // Off the async runtime: simulate locks a Mutex<LiteSVM> and may do a
+        // one-time lazy RPC fetch for an account not yet in the cache.
+        let res = tokio::task::spawn_blocking(move || {
+            // min_acceptable_out = 0: the profit threshold lives in the tx's
+            // on-chain floor, so we only need the simulator to catch reverts.
+            sim.simulate(&tx, &alts, &cache, 0, &metrics)
+        })
+        .await;
+
+        match res {
+            Ok(Ok(_)) => {
+                self.sim_ok.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Ok(Err(e)) => {
+                self.sim_reverted.fetch_add(1, Ordering::Relaxed);
+                crate::errlog::log(
+                    "not-sent",
+                    &format!("token={token} reason=sim-revert {e}"),
+                );
+                false
+            }
+            Err(e) => {
+                // Join failure (panic in the sim worker) — don't block the send.
+                warn!(token, error = %e, "sim task join failed, allowing send");
+                true
+            }
+        }
+    }
+
     /// Spawn the off-hot-path RPC sim-compare for a just-sent tx (no-op unless
     /// `rpc_sim_compare` is enabled). Clones only what the task needs.
     fn spawn_sim_compare(
@@ -1253,6 +1351,13 @@ impl ShredArbEngine {
                 return;
             }
 
+            // LiteSVM pre-send gate: execute the EXACT tx locally against live
+            // pool state. Drop it if it would revert (no-op when sim disabled).
+            if !self.sim_check(&tx, &token).await {
+                self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+
             // Clone the exact tx for the post-send RPC sim-compare diagnostic
             // (only when enabled — otherwise this is a cheap no-op branch).
             let sim_tx = if self.params.rpc_sim_compare {
@@ -1394,6 +1499,13 @@ impl ShredArbEngine {
                 "not-sent",
                 &format!("token={token} reason=preempted (pool moved before send)"),
             );
+            return;
+        }
+
+        // LiteSVM pre-send gate (same as the direct path): execute the EXACT
+        // bundle tx locally against live pool state and drop it if it reverts.
+        if !self.sim_check(&tx, &token).await {
+            self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
@@ -1652,6 +1764,7 @@ impl ShredArbEngine {
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
+                     SIM     : ok={} reverted={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
@@ -1678,6 +1791,8 @@ impl ShredArbEngine {
                     self.nosend_too_locks.load(Ordering::Relaxed),
                     self.nosend_send_err.load(Ordering::Relaxed),
                     self.nosend_preempted.load(Ordering::Relaxed),
+                    self.sim_ok.load(Ordering::Relaxed),
+                    self.sim_reverted.load(Ordering::Relaxed),
                     self.route_cache_hits.load(Ordering::Relaxed),
                     self.route_cache_misses.load(Ordering::Relaxed),
                     self.route_cache.len(),
