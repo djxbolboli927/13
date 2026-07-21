@@ -341,6 +341,14 @@ pub struct ShredArbConfig {
     /// Default false.
     #[serde(default)]
     pub force_send_profitable: bool,
+    /// Max fraction of Meteora's live WSOL reserve the SELL leg may extract
+    /// (thin-pool over-dump guard). Default 0.5.
+    #[serde(default = "default_meteora_sell_max_impact")]
+    pub meteora_sell_max_impact: f64,
+}
+
+fn default_meteora_sell_max_impact() -> f64 {
+    0.5
 }
 
 fn default_alt_fetch_providers() -> Vec<String> {
@@ -471,6 +479,7 @@ impl Default for ShredArbConfig {
             rpc_sim_compare: false,
             disable_preempt: false,
             force_send_profitable: false,
+            meteora_sell_max_impact: default_meteora_sell_max_impact(),
         }
     }
 }

@@ -164,6 +164,10 @@ pub struct ArbParams {
     /// we already model both the reverted-competitor and landed-competitor
     /// states, so this second-guess only suppresses good sends. Default false.
     pub disable_preempt: bool,
+    /// Max fraction of Meteora's live WSOL reserve the SELL leg may extract. Caps
+    /// the token dumped into a thin Meteora pool so the swap stays out of the
+    /// near-empty, error-amplifying region of the curve. Default 0.5.
+    pub meteora_sell_max_impact: f64,
     /// Force-send every profitable opportunity. Bypasses the send-dedup throttle
     /// (and, implicitly, the preempt recheck) so the ONLY thing that stops a
     /// profitable send is Metis failing to route it (and it not being in our
@@ -668,6 +672,22 @@ impl ShredArbEngine {
             (amt as u128).saturating_sub(fee) as u64
         };
 
+        // Meteora SELL-leg depth cap. When Meteora is the sell leg the trade-size
+        // ceiling further down bounds only the Pump BUY input, so nothing stops
+        // the optimizer from dumping a huge token amount into Meteora's tiny WSOL
+        // reserve — the near-empty region of the concave curve where any small
+        // state error explodes into a large output over-prediction (the proven
+        // revert driver: forensic reconstruction reproduced our 114040 vs the
+        // real 103599 from exactly this over-dump). We forbid any size whose
+        // predicted Meteora WSOL output exceeds `meteora_sell_max_impact` of
+        // Meteora's live WSOL reserve, keeping the sell leg out of that region.
+        let met_sell_out_cap: u64 = if matches!(buy_on, BuyOn::Pump) {
+            let depth = meteora.wsol_reserve(token_is_a) as f64;
+            (depth * self.params.meteora_sell_max_impact).max(0.0) as u64
+        } else {
+            u64::MAX
+        };
+
         // 4) Optimal size.
         let eval = |x: u64| -> Option<u64> {
             match buy_on {
@@ -680,7 +700,12 @@ impl ShredArbEngine {
                     if tok == 0 {
                         return None;
                     }
-                    meteora.sell_token_for_wsol(tok, token_is_a)
+                    let out = meteora.sell_token_for_wsol(tok, token_is_a)?;
+                    // Reject over-dumps into a thin Meteora WSOL reserve.
+                    if out > met_sell_out_cap {
+                        return None;
+                    }
+                    Some(out)
                 }
                 BuyOn::Meteora => {
                     let base_out = meteora.buy_token_with_wsol(x, token_is_a)?;
