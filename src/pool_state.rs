@@ -111,7 +111,12 @@ pub struct PoolStateCache {
     /// with the `built_on` slot (the account's last-update slot at rebuild time).
     /// When gRPC catches up (last_update_slot > built_on) the overlay is ignored
     /// and rebuilt from the fresh cache — so we never drift from ground truth.
-    live_pump: Arc<DashMap<Pubkey, (u64, PumpPool)>>,
+    /// Keyed by the pool's token vault → `(built_on_grpc_slot, shred_block_slot,
+    /// PumpPool)`. In-flight swaps accumulate only WITHIN one block: a new block
+    /// (shred_block_slot advances) discards the previous block's queued swaps and
+    /// restarts from confirmed state — landed ones show up as a gRPC account
+    /// update, unlanded ones are moot.
+    live_pump: Arc<DashMap<Pubkey, (u64, u64, PumpPool)>>,
     /// LIVE overlay of Meteora pools, keyed by pool account (only `sqrt_price`
     /// advances on a swap; liquidity/fees stay from the decoded cache).
     live_meteora: Arc<DashMap<Pubkey, (u64, MeteoraPool)>>,
@@ -559,15 +564,16 @@ impl PoolStateCache {
         shred_slot: u64,
     ) {
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
-        // ACCUMULATE in-flight Pump swaps: base is the existing overlay (if it is
-        // still built on the current confirmed slot), else the fresh confirmed
-        // decode. Successive holder/sniper buys+sells on Pump land almost every
-        // block, so summing them until the vaults update keeps our predicted
-        // reserves in step with the block being built. NOTE: the caller only
-        // feeds SIMPLE (non-arb) Pump swaps here — multi-hop arb legs are ignored
-        // for state prediction (they mostly revert on the Meteora side).
+        // ACCUMULATE in-flight Pump swaps, but only WITHIN THE SAME BLOCK: base is
+        // the existing overlay iff it was built on the same confirmed gRPC slot
+        // AND the same shred block slot, else the fresh confirmed decode.
+        // Successive holder/sniper buys+sells inside one block are summed so the
+        // NEXT shred prices against a pool reflecting them; a new block discards
+        // the previous block's queue (start fresh). NOTE: the caller only feeds
+        // SIMPLE (non-arb) Pump swaps here — multi-hop arb legs are ignored for
+        // state prediction (they mostly revert on the Meteora side).
         let base = match self.live_pump.get(token_vault) {
-            Some(e) if e.value().0 == cur => e.value().1,
+            Some(e) if e.value().0 == cur && e.value().1 == shred_slot => e.value().2,
             _ => match self.pump_pool(token_vault, wsol_vault, token_mint) {
                 Some(p) => p,
                 None => return,
@@ -580,21 +586,24 @@ impl PoolStateCache {
         } else {
             base.after_observed_sell(base_amount)
         };
-        self.live_pump.insert(*token_vault, (cur, advanced));
+        self.live_pump.insert(*token_vault, (cur, shred_slot, advanced));
     }
 
-    /// Pump pool including any live (shred-advanced) state, if it is still based
-    /// on the current cache slot; otherwise the fresh cache decode.
+    /// Pump pool including any live (shred-advanced) state, valid only when it is
+    /// still built on the current confirmed gRPC slot AND belongs to the block
+    /// `shred_slot` we are pricing for; otherwise the fresh cache decode. Passing
+    /// a NEW block slot therefore discards the previous block's accumulated queue.
     pub fn pump_pool_live(
         &self,
         token_vault: &Pubkey,
         wsol_vault: &Pubkey,
         token_mint: &Pubkey,
+        shred_slot: u64,
     ) -> Option<PumpPool> {
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
         if let Some(e) = self.live_pump.get(token_vault) {
-            if e.value().0 == cur {
-                return Some(e.value().1);
+            if e.value().0 == cur && e.value().1 == shred_slot {
+                return Some(e.value().2);
             }
         }
         self.pump_pool(token_vault, wsol_vault, token_mint)

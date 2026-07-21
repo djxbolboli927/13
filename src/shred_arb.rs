@@ -500,7 +500,7 @@ impl ShredArbEngine {
         let wsol_vault = first.pump.wsol_vault();
         let pump_now = match self
             .pool_state
-            .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint)
+            .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint, sig.slot)
         {
             Some(p) => p,
             None => {
@@ -544,7 +544,7 @@ impl ShredArbEngine {
             );
             match self
                 .pool_state
-                .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint)
+                .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint, sig.slot)
             {
                 Some(p) => p,
                 None => pump_now,
