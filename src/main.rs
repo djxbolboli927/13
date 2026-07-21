@@ -407,7 +407,6 @@ fn spawn_shred_arb(
         rpc_sim_compare: sa.rpc_sim_compare,
         disable_preempt: sa.disable_preempt,
         force_send_profitable: sa.force_send_profitable,
-        meteora_sell_max_impact: sa.meteora_sell_max_impact,
     };
 
     // Errors-only file log (errors + why-not-sent + why-lost) under /root/g.
