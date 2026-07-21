@@ -534,6 +534,7 @@ impl PoolStateCache {
     /// `PumpPool::new` fails closed to the highest fee tier.
     pub fn pump_pool(
         &self,
+        pool: &Pubkey,
         token_vault: &Pubkey,
         wsol_vault: &Pubkey,
         token_mint: &Pubkey,
@@ -541,7 +542,15 @@ impl PoolStateCache {
         let base = self.spl_amount(token_vault)?;
         let quote = self.spl_amount(wsol_vault)?;
         let supply = self.spl_mint_supply(token_mint).unwrap_or(0) as u128;
-        Some(PumpPool::new(base, quote, supply))
+        // `is_pump_pool` (canonical, market-cap-tiered fee) iff the pool's
+        // `coin_creator` is SET (non-default). Non-canonical pools charge the flat
+        // fee. If the pool account isn't cached yet, assume canonical — the
+        // conservative (higher-fee) path, so we never understate the fee.
+        let is_canonical = self
+            .pump_coin_creator(pool)
+            .map(|c| c != Pubkey::default())
+            .unwrap_or(true);
+        Some(PumpPool::new(base, quote, supply, is_canonical))
     }
 
     // ── Live state: advance pool state by in-flight shred txs ─────────────────
@@ -556,6 +565,7 @@ impl PoolStateCache {
     /// the swap is already reflected on-chain and only the base is (re)seeded.
     pub fn apply_pump_swap(
         &self,
+        pool: &Pubkey,
         token_vault: &Pubkey,
         wsol_vault: &Pubkey,
         token_mint: &Pubkey,
@@ -574,7 +584,7 @@ impl PoolStateCache {
         // state prediction (they mostly revert on the Meteora side).
         let base = match self.live_pump.get(token_vault) {
             Some(e) if e.value().0 == cur && e.value().1 == shred_slot => e.value().2,
-            _ => match self.pump_pool(token_vault, wsol_vault, token_mint) {
+            _ => match self.pump_pool(pool, token_vault, wsol_vault, token_mint) {
                 Some(p) => p,
                 None => return,
             },
@@ -595,6 +605,7 @@ impl PoolStateCache {
     /// a NEW block slot therefore discards the previous block's accumulated queue.
     pub fn pump_pool_live(
         &self,
+        pool: &Pubkey,
         token_vault: &Pubkey,
         wsol_vault: &Pubkey,
         token_mint: &Pubkey,
@@ -606,7 +617,7 @@ impl PoolStateCache {
                 return Some(e.value().2);
             }
         }
-        self.pump_pool(token_vault, wsol_vault, token_mint)
+        self.pump_pool(pool, token_vault, wsol_vault, token_mint)
     }
 
     /// Apply an observed Meteora swap (from a shred) to the live meteora overlay.

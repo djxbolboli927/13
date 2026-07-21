@@ -456,7 +456,7 @@ impl ShredArbEngine {
                     }
                     let pump_now = match self
                         .pool_state
-                        .pump_pool(&pair.pump.token_vault(), &pair.pump.wsol_vault(), &pair.token_mint)
+                        .pump_pool(&pair.pump.pool, &pair.pump.token_vault(), &pair.pump.wsol_vault(), &pair.token_mint)
                     {
                         Some(p) => p,
                         None => continue,
@@ -500,7 +500,7 @@ impl ShredArbEngine {
         let wsol_vault = first.pump.wsol_vault();
         let pump_now = match self
             .pool_state
-            .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint, sig.slot)
+            .pump_pool_live(&first.pump.pool, &token_vault, &wsol_vault, &first.token_mint, sig.slot)
         {
             Some(p) => p,
             None => {
@@ -540,11 +540,11 @@ impl ShredArbEngine {
             // Holder/sniper simple swap — accumulate it into the live overlay so
             // the next shred in this block prices against a pool that reflects it.
             self.pool_state.apply_pump_swap(
-                &token_vault, &wsol_vault, &first.token_mint, sig.is_buy, sig.base_amount, sig.slot,
+                &first.pump.pool, &token_vault, &wsol_vault, &first.token_mint, sig.is_buy, sig.base_amount, sig.slot,
             );
             match self
                 .pool_state
-                .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint, sig.slot)
+                .pump_pool_live(&first.pump.pool, &token_vault, &wsol_vault, &first.token_mint, sig.slot)
             {
                 Some(p) => p,
                 None => pump_now,
@@ -1574,6 +1574,7 @@ impl ShredArbEngine {
                         continue;
                     };
                     let pump = self.pool_state.pump_pool(
+                        &pair.pump.pool,
                         &pair.pump.token_vault(),
                         &pair.pump.wsol_vault(),
                         &pair.token_mint,

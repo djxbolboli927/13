@@ -35,6 +35,16 @@ pub fn set_onchain_fee_tiers(tiers: Vec<(u128, u64, u64)>) {
     let _ = ONCHAIN_TIERS.set(tiers);
 }
 
+/// The on-chain `flat_fees` (`(total_bps, lp_bps)`) that the Fee Program applies
+/// to NON-canonical pools (`is_pump_pool == false`) — those charge a flat fee
+/// and IGNORE market cap. Read from the FeeConfig at startup.
+static ONCHAIN_FLAT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+
+/// Install the on-chain flat fee (total_bps, lp_bps) for non-canonical pools.
+pub fn set_onchain_flat_fee(total_bps: u64, lp_bps: u64) {
+    let _ = ONCHAIN_FLAT.set((total_bps, lp_bps));
+}
+
 /// Whether on-chain tiers have been installed (for the audit log).
 pub fn onchain_fee_tiers_loaded() -> bool {
     ONCHAIN_TIERS.get().map(|t| !t.is_empty()).unwrap_or(false)
@@ -109,7 +119,23 @@ pub fn fee_for_reserves(
     base_reserve: u64,
     quote_reserve: u64,
     supply_base_units: u128,
+    is_canonical: bool,
 ) -> (u64, u64) {
+    // NON-canonical pools (`is_pump_pool == false`) charge the on-chain FLAT fee
+    // and IGNORE market cap. Running them through the market-cap tier schedule
+    // over-states the fee (up to 125 bps vs the real ~30 bps), which under-
+    // predicts profit and HIDES real opportunities on those pools. Empirically
+    // (verified across every observed sell/buy event) `is_pump_pool` is true iff
+    // the pool's `coin_creator` is set (non-default); the caller passes that as
+    // `is_canonical`.
+    if !is_canonical {
+        if let Some(&(total, lp)) = ONCHAIN_FLAT.get() {
+            return (total, lp);
+        }
+        // No on-chain flat fee read yet → the known flat schedule: lp 25 +
+        // protocol 5 = 30 bps total, lp portion 25.
+        return (30, 25);
+    }
     let highest = (
         FEE_TIERS[FEE_TIERS.len() - 1].1,
         FEE_TIERS[FEE_TIERS.len() - 1].2,
@@ -152,6 +178,20 @@ pub fn load_onchain_fee_tiers(
         Pubkey::find_program_address(&[b"fee_config", pamm.as_ref()], &fee_program);
     let acct = rpc.get_account(&fee_config).ok()?;
     let d = &acct.data;
+    // flat_fees `Fees` sits at bytes 41..65 (8 disc + 1 bump + 32 admin):
+    //   lp_fee_bps u64 @41, protocol_fee_bps u64 @49, creator_fee_bps u64 @57.
+    // Non-canonical pools (is_pump_pool == false) charge exactly this flat fee.
+    if let (Some(lp), Some(protocol), Some(creator)) = (
+        d.get(41..49).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes),
+        d.get(49..57).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes),
+        d.get(57..65).and_then(|s| s.try_into().ok()).map(u64::from_le_bytes),
+    ) {
+        let flat_total = lp.saturating_add(protocol).saturating_add(creator);
+        // Sanity: a plausible flat fee (≤10%); else leave the fallback in place.
+        if flat_total > 0 && flat_total <= 1_000 && lp <= 1_000 {
+            set_onchain_flat_fee(flat_total, lp);
+        }
+    }
     // 8 disc + 1 bump + 32 admin + 24 flat_fees = 65, then the fee_tiers Vec.
     let mut off = 65usize;
     let len = u32::from_le_bytes(d.get(off..off + 4)?.try_into().ok()?) as usize;
@@ -202,10 +242,17 @@ pub struct PumpPool {
 
 impl PumpPool {
     /// `supply_base_units` is the base token's real mint supply (0 = unknown →
-    /// highest fee tier, fail-closed).
-    pub fn new(base_reserve: u64, quote_reserve: u64, supply_base_units: u128) -> Self {
+    /// highest fee tier, fail-closed). `is_canonical` = the pool is a canonical
+    /// pump pool (`is_pump_pool == true`, i.e. its `coin_creator` is set); false
+    /// selects the flat fee instead of the market-cap tier.
+    pub fn new(
+        base_reserve: u64,
+        quote_reserve: u64,
+        supply_base_units: u128,
+        is_canonical: bool,
+    ) -> Self {
         let (total_fee_bps, lp_fee_bps) =
-            fee_for_reserves(base_reserve, quote_reserve, supply_base_units);
+            fee_for_reserves(base_reserve, quote_reserve, supply_base_units, is_canonical);
         Self {
             base_reserve,
             quote_reserve,
@@ -307,7 +354,7 @@ mod tests {
 
     #[test]
     fn buy_then_sell_loses_to_fees() {
-        let p = PumpPool::new(1_000_000_000, 200_000_000_000, 1_000_000_000_000_000);
+        let p = PumpPool::new(1_000_000_000, 200_000_000_000, 1_000_000_000_000_000, true);
         let base_out = p.quote_buy(1_000_000_000);
         assert!(base_out > 0);
         let back = p.quote_sell(base_out);
@@ -317,7 +364,7 @@ mod tests {
 
     #[test]
     fn observed_buy_raises_price() {
-        let p = PumpPool::new(1_000_000_000, 200_000_000_000, 1_000_000_000_000_000);
+        let p = PumpPool::new(1_000_000_000, 200_000_000_000, 1_000_000_000_000_000, true);
         let before = p.spot_price(6, 9);
         let after = p.after_observed_buy(10_000_000).spot_price(6, 9);
         assert!(after > before);
