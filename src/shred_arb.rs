@@ -833,12 +833,29 @@ impl ShredArbEngine {
         let met_stale = fmt_stale(&pair.meteora.pool);
         let pump_base_stale = fmt_stale(&pair.pump.token_vault());
         let pump_quote_stale = fmt_stale(&pair.pump.wsol_vault());
+        // Per-leg predicted amounts, so each leg can be compared to the on-chain
+        // events directly: `token_mid` = intermediate token we expect from the
+        // BUY leg (after transfer fees), `buy_leg_out` = raw BUY-leg output before
+        // transfer fees. If `token_mid` matches the on-chain buy event but the
+        // final `predicted_out` overshoots, the error is in the SELL leg.
+        let (pred_buy_out, pred_token_mid) = match buy_on {
+            BuyOn::Pump => {
+                let b = pump_after.quote_buy(best_x);
+                (b, apply_tfee(apply_tfee(b)))
+            }
+            BuyOn::Meteora => {
+                let b = meteora.buy_token_with_wsol(best_x, token_is_a).unwrap_or(0);
+                (b, apply_tfee(apply_tfee(b)))
+            }
+        };
         info!(
             pool = %pair.pump.pool,
             meteora = %pair.meteora.pool,
             token = %pair.token_mint,
             buy = ?buy_kind_label(buy_kind),
             input = best_x,
+            buy_leg_out = pred_buy_out,
+            token_mid = pred_token_mid,
             predicted_out = best_out,
             net_lamports = net,
             calc_slot = cur_slot,
