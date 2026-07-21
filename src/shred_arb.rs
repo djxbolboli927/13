@@ -1802,6 +1802,26 @@ async fn sim_compare(
         ..Default::default()
     };
 
+    // PRE balance of the WSOL ATA (before the tx). The round-trip spends
+    // `amount_in` WSOL out of this ATA and returns the realized output to it, so
+    //   post = pre − amount_in + realized_out  ⇒  realized_out = post − pre + amount_in.
+    // Without subtracting `pre` the "real_out" is just the absolute balance and
+    // the delta is meaningless.
+    let rpc_pre = rpc.clone();
+    let pre_ata = wsol_ata;
+    let pre_balance: Option<u64> = tokio::task::spawn_blocking(move || {
+        rpc_pre.get_account(&pre_ata).ok().and_then(|a| {
+            a.data.get(64..72).map(|s| {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(s);
+                u64::from_le_bytes(buf)
+            })
+        })
+    })
+    .await
+    .ok()
+    .flatten();
+
     let rpc2 = rpc.clone();
     let res =
         tokio::task::spawn_blocking(move || rpc2.simulate_transaction_with_config(&tx, cfg)).await;
@@ -1818,9 +1838,9 @@ async fn sim_compare(
         }
     };
 
-    // Real post-simulation WSOL balance (lamport-exact). The tx starts and ends
-    // in WSOL, so post − in-flight is the true realized output of the round-trip.
-    let real_out: Option<u64> = value
+    // Post-simulation WSOL balance (lamport-exact), then convert to the REALIZED
+    // round-trip output via realized_out = post − pre + amount_in.
+    let post_balance: Option<u64> = value
         .accounts
         .as_ref()
         .and_then(|v| v.first().cloned().flatten())
@@ -1837,6 +1857,13 @@ async fn sim_compare(
             buf.copy_from_slice(&d[64..72]);
             u64::from_le_bytes(buf)
         });
+    // realized_out = post − pre + amount_in (needs a known pre balance).
+    let real_out: Option<u64> = match (post_balance, pre_balance) {
+        (Some(post), Some(pre)) => {
+            Some((post as i128 - pre as i128 + amount_in as i128).max(0) as u64)
+        }
+        _ => None,
+    };
 
     let reverted = value.err.is_some();
     let logs = value
