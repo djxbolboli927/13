@@ -230,6 +230,9 @@ pub struct ShredArbEngine {
     key_wallets: std::collections::HashSet<solana_sdk::pubkey::Pubkey>,
     /// Count of scenario-B (competitor-lands) speculative assessments launched.
     scenario_b_launched: AtomicU64,
+    /// Shred signals dropped as BURNED at a block boundary (an older-block
+    /// opportunity superseded by a fresher one while we were busy).
+    skip_stale_signal: AtomicU64,
     /// Hot-reloadable tuning knobs (config.toml re-read every few minutes).
     live: Arc<LiveTuning>,
     /// In-RAM whole-route instruction cache: one Metis swap-instructions
@@ -486,6 +489,7 @@ impl ShredArbEngine {
             sim_ok: AtomicU64::new(0),
             key_wallets,
             scenario_b_launched: AtomicU64::new(0),
+            skip_stale_signal: AtomicU64::new(0),
             live,
             route_cache: dashmap::DashMap::new(),
             last_fired: dashmap::DashMap::new(),
@@ -533,11 +537,48 @@ impl ShredArbEngine {
     /// round-trip on one pool never delays another.
     pub async fn run(self: Arc<Self>, mut rx: mpsc::Receiver<PumpSwapSignal>) {
         info!(pools = self.registry.len(), "shred-arb engine running");
-        while let Some(sig) = rx.recv().await {
-            let me = self.clone();
-            tokio::spawn(async move {
-                me.handle(sig).await;
-            });
+        // How many slots behind the freshest buffered signal a signal may be
+        // before we treat it as BURNED (its opportunity already landed/reverted
+        // and the pool state moved). 1 = under a backlog only the current block
+        // survives.
+        const STALE_SIGNAL_SLOTS: u64 = 1;
+        while let Some(first) = rx.recv().await {
+            // Drain everything already buffered so we act on the FRESHEST view
+            // instead of plodding through a backlog of burned opportunities.
+            let mut batch = vec![first];
+            while let Ok(s) = rx.try_recv() {
+                batch.push(s);
+            }
+            // Fast path: no backlog → handle the single signal.
+            if batch.len() == 1 {
+                let me = self.clone();
+                let sig = batch.pop().unwrap();
+                tokio::spawn(async move { me.handle(sig).await; });
+                continue;
+            }
+            // Backlog: keep only the NEWEST signal per Pump pool and drop any
+            // whose block is already stale (burned) relative to the freshest.
+            let newest = batch.iter().map(|s| s.slot).max().unwrap_or(0);
+            let mut best: std::collections::HashMap<
+                solana_sdk::pubkey::Pubkey,
+                PumpSwapSignal,
+            > = std::collections::HashMap::new();
+            for s in batch {
+                if newest.saturating_sub(s.slot) > STALE_SIGNAL_SLOTS {
+                    self.skip_stale_signal.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                match best.get(&s.pool) {
+                    Some(prev) if prev.slot >= s.slot => {}
+                    _ => {
+                        best.insert(s.pool, s);
+                    }
+                }
+            }
+            for (_, sig) in best {
+                let me = self.clone();
+                tokio::spawn(async move { me.handle(sig).await; });
+            }
         }
     }
 
@@ -1099,7 +1140,9 @@ impl ShredArbEngine {
             BuyOn::Pump => (DexKind::PumpFunAmm, DexKind::MeteoraDammV2),
             BuyOn::Meteora => (DexKind::MeteoraDammV2, DexKind::PumpFunAmm),
         };
-        // Lean opportunity line (debug diagnostics removed — production mode).
+        // Lean opportunity line. `calc_slot` = the slot our pool state is at when
+        // we spotted the gap — compare it to the block the competitor's tx lands
+        // in to measure our speed.
         info!(
             pool = %pair.pump.pool,
             meteora = %pair.meteora.pool,
@@ -1108,6 +1151,7 @@ impl ShredArbEngine {
             input = best_x,
             predicted_out = best_out,
             net_lamports = net,
+            calc_slot = self.pool_state.slot(),
             "shred-arb opportunity"
         );
 
@@ -1610,7 +1654,7 @@ impl ShredArbEngine {
                 Ok(Ok(sig)) => {
                     self.sent.fetch_add(1, Ordering::Relaxed);
                     self.last_sent.insert(key, Instant::now());
-                    info!(signature = %sig, input = amount_in, "shred-arb tx sent (direct)");
+                    info!(signature = %sig, input = amount_in, sent_slot = self.pool_state.slot(), "shred-arb tx sent (direct)");
                     if let Some(t) = sim_tx {
                         self.spawn_sim_compare(t, predicted_out, amount_in, token.clone());
                     }
@@ -1757,7 +1801,7 @@ impl ShredArbEngine {
             Ok(id) => {
                 self.sent.fetch_add(1, Ordering::Relaxed);
                 self.last_sent.insert(key, Instant::now());
-                info!(bundle = %id, input = amount_in, tip, via = if use_grpc { "grpc" } else { "rest" }, "shred-arb bundle sent");
+                info!(bundle = %id, input = amount_in, tip, sent_slot = self.pool_state.slot(), via = if use_grpc { "grpc" } else { "rest" }, "shred-arb bundle sent");
                 if let Some(t) = sim_tx {
                     self.spawn_sim_compare(t, predicted_out, amount_in, token.clone());
                 }
@@ -1999,7 +2043,7 @@ impl ShredArbEngine {
                 let unknown = ss.unknown.load(Ordering::Relaxed);
                 eprintln!(
                     "\n[shred-arb 30s] watching_pools={}\n\
-                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}]\n\
+                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} burned_signals={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={} sim_dropped={}\n\
                      SIM     : ok={} reverted={} | scenario_b={}\n\
@@ -2010,6 +2054,7 @@ impl ShredArbEngine {
                     self.not_profitable.load(Ordering::Relaxed),
                     self.skip_uncrossable.load(Ordering::Relaxed),
                     self.arb_ignored.load(Ordering::Relaxed),
+                    self.skip_stale_signal.load(Ordering::Relaxed),
                     self.skip_min_trigger.load(Ordering::Relaxed),
                     self.skip_no_meteora_state.load(Ordering::Relaxed),
                     self.skip_stale_meteora.load(Ordering::Relaxed),
