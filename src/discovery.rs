@@ -307,14 +307,22 @@ impl Discovery {
         if let Some(pairs) = body.get("pairs").and_then(|p| p.as_array()) {
             for pair in pairs {
                 let dex = pair.get("dexId").and_then(|d| d.as_str()).unwrap_or("");
-                // Pre-filter to the two venues we support; on-chain owner is the
-                // authoritative check afterwards.
-                if !(dex.contains("pump") || dex.contains("meteora")) {
-                    continue;
+                // ── 3-market restriction ──────────────────────────────────────
+                // Reject the WHOLE token if it trades on ANY venue outside
+                // Pump.fun / Meteora (DAMM v2 + Dynamic Bonding Curve — both
+                // report dexId "meteora"). Multi-market tokens attract the
+                // high-frequency arb bots that fire 20-30 buys per block, and
+                // that per-block churn is exactly what wrecks our Pump state
+                // prediction. Keeping to the 3 markets keeps the block sparse.
+                if !dex.is_empty() && !(dex.contains("pump") || dex.contains("meteora")) {
+                    debug!(%mint, dex, "token rejected: trades outside the 3 allowed markets");
+                    return Ok(Vec::new());
                 }
-                if let Some(addr) = pair.get("pairAddress").and_then(|a| a.as_str()) {
-                    if let Ok(pk) = Pubkey::from_str(addr) {
-                        out.push(pk);
+                if dex.contains("pump") || dex.contains("meteora") {
+                    if let Some(addr) = pair.get("pairAddress").and_then(|a| a.as_str()) {
+                        if let Ok(pk) = Pubkey::from_str(addr) {
+                            out.push(pk);
+                        }
                     }
                 }
             }
