@@ -378,6 +378,7 @@ struct LiveTuning {
     max_amount_lamports: AtomicU64,
     min_trigger_lamports: AtomicU64,
     meteora_fee_bps: AtomicU64,
+    min_net_profit_lamports: AtomicU64,
 }
 
 impl LiveTuning {
@@ -391,6 +392,7 @@ impl LiveTuning {
             max_amount_lamports: AtomicU64::new(p.max_amount_lamports),
             min_trigger_lamports: AtomicU64::new(p.min_trigger_lamports),
             meteora_fee_bps: AtomicU64::new(p.meteora_fee_bps),
+            min_net_profit_lamports: AtomicU64::new(p.min_net_profit_lamports),
         }
     }
     #[inline]
@@ -420,6 +422,10 @@ impl LiveTuning {
     #[inline]
     fn meteora_fee_bps(&self) -> u64 {
         self.meteora_fee_bps.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn min_net_profit_lamports(&self) -> u64 {
+        self.min_net_profit_lamports.load(Ordering::Relaxed)
     }
 }
 
@@ -585,9 +591,12 @@ impl ShredArbEngine {
                         self.live
                             .meteora_fee_bps
                             .store(sa.meteora_fee_bps, Ordering::Relaxed);
+                        self.live
+                            .min_net_profit_lamports
+                            .store(sa.min_net_profit_lamports, Ordering::Relaxed);
                         eprintln!(
                             "[shred-arb] config reloaded: disable_preempt={} force_send={} \
-                             gate_sends={} min={} max={} trigger={} met_fee_bps={}",
+                             gate_sends={} min={} max={} trigger={} met_fee_bps={} min_profit={}",
                             sa.disable_preempt,
                             sa.force_send_profitable,
                             cfg.simulation.gate_sends,
@@ -595,6 +604,7 @@ impl ShredArbEngine {
                             self.live.max_amount_lamports(),
                             self.live.min_trigger_lamports(),
                             sa.meteora_fee_bps,
+                            sa.min_net_profit_lamports,
                         );
                     }
                     Err(e) => {
@@ -981,7 +991,7 @@ impl ShredArbEngine {
         // NOTE: this is only the gate — the on-chain minimum output is set to
         // exactly the input (break-even) at send time, so a trade that clears
         // the gate at predict time still lands as long as it doesn't lose money.
-        let required_extra = self.params.min_net_profit_lamports;
+        let required_extra = self.live.min_net_profit_lamports();
 
         // Ceiling on trade size: never add more WSOL than a fraction of the
         // BUY pool's current WSOL reserve (keeps the swap in a valid range and
@@ -1089,58 +1099,15 @@ impl ShredArbEngine {
             BuyOn::Pump => (DexKind::PumpFunAmm, DexKind::MeteoraDammV2),
             BuyOn::Meteora => (DexKind::MeteoraDammV2, DexKind::PumpFunAmm),
         };
-        // ── Staleness diagnostic (per DEX) ───────────────────────────────────
-        // For each venue: the slot we last got fresh account data, how many slots
-        // behind the newest slot we've seen that is, and the wall-clock age. On a
-        // thin Meteora pool that hasn't traded for a couple of blocks, this shows
-        // the cached state is many slots old — the root of the over-prediction we
-        // proved is NOT a formula bug. Pump vaults update almost every block, so
-        // their gap should stay ~0.
-        let cur_slot = self.pool_state.slot();
-        let fmt_stale = |acct: &solana_sdk::pubkey::Pubkey| -> String {
-            let upd = self.pool_state.last_update_slot(acct);
-            let age_ms = self
-                .pool_state
-                .last_update_age(acct)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            match upd {
-                Some(s) => format!("slot={s} behind={} age={age_ms}ms", cur_slot.saturating_sub(s)),
-                None => "uncached".to_string(),
-            }
-        };
-        let met_stale = fmt_stale(&pair.meteora.pool);
-        let pump_base_stale = fmt_stale(&pair.pump.token_vault());
-        let pump_quote_stale = fmt_stale(&pair.pump.wsol_vault());
-        // Per-leg predicted amounts, so each leg can be compared to the on-chain
-        // events directly: `token_mid` = intermediate token we expect from the
-        // BUY leg (after transfer fees), `buy_leg_out` = raw BUY-leg output before
-        // transfer fees. If `token_mid` matches the on-chain buy event but the
-        // final `predicted_out` overshoots, the error is in the SELL leg.
-        let (pred_buy_out, pred_token_mid) = match buy_on {
-            BuyOn::Pump => {
-                let b = pump_after.quote_buy(best_x);
-                (b, apply_tfee(apply_tfee(b)))
-            }
-            BuyOn::Meteora => {
-                let b = meteora.buy_token_with_wsol(best_x, token_is_a).unwrap_or(0);
-                (b, apply_tfee(apply_tfee(b)))
-            }
-        };
+        // Lean opportunity line (debug diagnostics removed — production mode).
         info!(
             pool = %pair.pump.pool,
             meteora = %pair.meteora.pool,
             token = %pair.token_mint,
             buy = ?buy_kind_label(buy_kind),
             input = best_x,
-            buy_leg_out = pred_buy_out,
-            token_mid = pred_token_mid,
             predicted_out = best_out,
             net_lamports = net,
-            calc_slot = cur_slot,
-            meteora_state = %met_stale,
-            pump_token_vault_state = %pump_base_stale,
-            pump_wsol_vault_state = %pump_quote_stale,
             "shred-arb opportunity"
         );
 
@@ -1170,37 +1137,28 @@ impl ShredArbEngine {
             .await;
     }
 
-    /// LiteSVM pre-send gate. Executes the EXACT built tx locally against the
-    /// live gRPC-fed account cache (Yellowstone Processed — the same data Metis
-    /// consumes, so no extra delay) and returns `true` only if it succeeds.
+    /// LiteSVM pre-send simulation. Executes the EXACT built tx locally against
+    /// the live gRPC-fed pool state (the same state the math priced off — zero
+    /// re-fetch) and returns whether to SEND it.
     ///
-    /// The on-chain output floor is already baked into the swap instruction at
-    /// break-even (input + network fee + Jito tip), so a tx that would net below
-    /// break-even reverts on-chain with slippage 0x1771 — and the simulator
-    /// reproduces exactly that revert. Dropping such txs here is precisely the
-    /// "don't send doomed txs" behaviour the operator asked for.
-    ///
-    /// Returns `true` (allow send) unless the sim is BOTH built AND allowed to
-    /// gate (`[simulation].gate_sends = true`). When gating is off this returns
-    /// immediately — no LiteSVM run, no latency on the hot send path — so a
-    /// mis-simulating pool can never silently halt trading.
+    /// The sim ALWAYS runs when the simulator is built (so the SIM ok/reverted
+    /// counters and full revert logs are always available). Only the DROP
+    /// decision is gated: on a revert we drop the tx ONLY when
+    /// `[simulation].gate_sends = true`; otherwise we log the revert and send
+    /// anyway (validation mode — trading never halts). On success we always send.
+    /// Runs on a pool worker so many sims execute in parallel.
     async fn sim_check(
         &self,
         tx: &solana_sdk::transaction::VersionedTransaction,
         token: &str,
     ) -> bool {
-        if !self.live.sim_gate_sends() {
-            return true; // gating disabled → don't even run the sim
-        }
         let (pool, cache) = match (&self.sim_pool, &self.sim_cache) {
             (Some(p), Some(c)) => (p.clone(), c.clone()),
-            _ => return true, // simulation off → allow
+            _ => return true, // simulator not built → allow
         };
 
         // Resolve the ALT keys the tx references so LiteSVM can expand its v0
-        // address-table lookups. Uses the cached ALT store (RPC only on a cold
-        // miss); if any ALT can't be resolved we allow the send rather than
-        // block a good opportunity on a lookup failure.
+        // address-table lookups (cached; RPC only on a cold miss).
         let alt_keys: Vec<String> = match &tx.message {
             solana_sdk::message::VersionedMessage::V0(m) => m
                 .address_table_lookups
@@ -1224,8 +1182,8 @@ impl ShredArbEngine {
         let sim = pool.acquire();
         let tx = tx.clone();
         let metrics = self.metrics.clone();
-        // Off the async runtime: simulate locks a Mutex<LiteSVM> and may do a
-        // one-time lazy RPC fetch for an account not yet in the cache.
+        // Off the async runtime: simulate locks its own LiteSVM instance (one per
+        // worker → parallel across workers) and reads live state, no RPC.
         let res = tokio::task::spawn_blocking(move || {
             // min_acceptable_out = 0: the profit threshold lives in the tx's
             // on-chain floor, so we only need the simulator to catch reverts.
@@ -1233,6 +1191,7 @@ impl ShredArbEngine {
         })
         .await;
 
+        let gate = self.live.sim_gate_sends();
         match res {
             Ok(Ok(_)) => {
                 self.sim_ok.fetch_add(1, Ordering::Relaxed);
@@ -1240,14 +1199,14 @@ impl ShredArbEngine {
             }
             Ok(Err(e)) => {
                 self.sim_reverted.fetch_add(1, Ordering::Relaxed);
-                crate::errlog::log(
-                    "not-sent",
-                    &format!("token={token} reason=sim-revert {e}"),
-                );
-                false
+                // FULL detail (err code + program logs) so the litesvm revert can
+                // be diagnosed. This is the ground-truth pre-send simulation —
+                // unlike the RPC re-sim it runs against OUR exact calc-time state.
+                warn!(token, gate_sends = gate, "LiteSVM sim REVERT: {e}");
+                // Drop only when gating is on; otherwise send anyway (validation).
+                !gate
             }
             Err(e) => {
-                // Join failure (panic in the sim worker) — don't block the send.
                 warn!(token, error = %e, "sim task join failed, allowing send");
                 true
             }
