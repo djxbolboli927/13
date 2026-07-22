@@ -399,3 +399,14 @@ wallet_mine_rpc_urls = [
   "https://rpc.fra.shyft.to?api_key=UHuyEj8zU19wcFMk",
 ]
 wallet_mine_rpc_calls_per_sec = 5
+# ولت‌های «کلیدی» رقبا که تراکنش‌های آربیتراژشان به‌ندرت revert می‌شود. وقتی یکی
+# از این‌ها یک آربیتراژ Pump↔Meteora می‌زند، ربات دو سناریو را قیمت‌گذاری می‌کند
+# (لگ متئوراشان land می‌کند / نمی‌کند) و برای هر سناریو یک تراکنش می‌فرستد.
+# خالی بگذارید تا از همان target_wallets بالا استفاده شود (همین ۵ ولت).
+key_wallets = [
+  "HuTshmtwcQkWBLzgW3m4uwcmik7Lmz4YFpYcTqMJpXiP",
+  "7DxeUQ1TQ2wnYKc3vxPsvr6c93vGUBJSuRdP9R6WueGL",
+  "DcQNaByvstRZCERvb9UJHgHiQe8YX2FMdPptM86psQyz",
+  "iGhZqmSdMBR8k4Ua3ViwsdXENAd8MTGqZKX9ARVbRkg",
+  "29eV5LuZwwVaoufKr5ShBejYVP6N4JZ14U3M5rffXsjp",
+]

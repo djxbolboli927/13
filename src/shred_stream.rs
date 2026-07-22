@@ -55,6 +55,10 @@ pub struct PumpSwapSignal {
     /// the engine which knows each pool's token side.
     pub meteora_pool: Option<Pubkey>,
     pub meteora_amount_in: Option<u64>,
+    /// Fee payer / first signer of the observed tx (static account key 0). Used
+    /// to decide whether an arb tx comes from one of the KEY competitor wallets
+    /// (which rarely revert), so we can run the two-scenario Meteora prediction.
+    pub fee_payer: Pubkey,
 }
 
 /// Runtime counters for observability.
@@ -368,6 +372,7 @@ impl ShredConsumer {
                 slot,
                 meteora_pool,
                 meteora_amount_in,
+                fee_payer: static_keys.first().copied().unwrap_or_default(),
             };
             // Non-blocking: if the engine is busy, drop (staleness makes an old
             // signal worthless anyway).

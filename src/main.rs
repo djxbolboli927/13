@@ -335,6 +335,13 @@ fn spawn_shred_arb(
         jito_tip_min_lamports: sa.jito_tip_min_lamports,
         jito_tip_profit_fraction: sa.jito_tip_profit_fraction,
         meteora_fee_bps: sa.meteora_fee_bps,
+        // Key competitor wallets for the two-scenario prediction; fall back to
+        // the mining target wallets when a dedicated list isn't configured.
+        key_wallets: if sa.key_wallets.is_empty() {
+            sa.target_wallets.clone()
+        } else {
+            sa.key_wallets.clone()
+        },
         min_trigger_lamports: lamports(sa.min_trigger_sol),
         min_amount_lamports: lamports(sa.min_amount_sol).max(1),
         max_amount_lamports: lamports(sa.max_amount_sol).max(1),

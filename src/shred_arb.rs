@@ -87,6 +87,10 @@ pub struct ArbParams {
     /// Fraction of detected net profit paid to Jito as tip (0.20 = 20%).
     pub jito_tip_profit_fraction: f64,
     pub meteora_fee_bps: u64,
+    /// KEY competitor wallets (base58) whose arb txs rarely revert. When one of
+    /// these lands a Pump↔Meteora arb we run the two-scenario Meteora prediction.
+    /// Empty = feature off.
+    pub key_wallets: Vec<String>,
     /// Ignore observed trades whose SOL-side arg is below this (small trades
     /// barely move price).
     pub min_trigger_lamports: u64,
@@ -215,6 +219,13 @@ pub struct ShredArbEngine {
     /// Sim outcome counters.
     sim_reverted: AtomicU64,
     sim_ok: AtomicU64,
+    /// KEY competitor wallets whose arb txs rarely revert. When one of these
+    /// fires a Pump↔Meteora arb, we run the two-scenario prediction (assume
+    /// their Meteora leg lands vs not) and send a tx for each. Empty = the
+    /// feature is off (all arb txs are ignored for state, as before).
+    key_wallets: std::collections::HashSet<solana_sdk::pubkey::Pubkey>,
+    /// Count of scenario-B (competitor-lands) speculative assessments launched.
+    scenario_b_launched: AtomicU64,
     /// In-RAM whole-route instruction cache: one Metis swap-instructions
     /// response per (pair, direction), amount-patched on every reuse so hot
     /// opportunities skip the Metis round-trip entirely. RAM-only by design —
@@ -363,6 +374,11 @@ impl ShredArbEngine {
         sim_cache: Option<Arc<crate::account_cache::AccountCache>>,
         metrics: Arc<crate::metrics::Metrics>,
     ) -> Self {
+        let key_wallets: std::collections::HashSet<solana_sdk::pubkey::Pubkey> = params
+            .key_wallets
+            .iter()
+            .filter_map(|s| solana_sdk::pubkey::Pubkey::try_from(s.as_str()).ok())
+            .collect();
         Self {
             metis,
             blockhash_cache,
@@ -387,6 +403,8 @@ impl ShredArbEngine {
             metrics,
             sim_reverted: AtomicU64::new(0),
             sim_ok: AtomicU64::new(0),
+            key_wallets,
+            scenario_b_launched: AtomicU64::new(0),
             route_cache: dashmap::DashMap::new(),
             last_fired: dashmap::DashMap::new(),
             last_sent: dashmap::DashMap::new(),
@@ -569,6 +587,46 @@ impl ShredArbEngine {
                 None => pump_now,
             }
         };
+        // ── Two-scenario prediction for KEY competitor wallets ───────────────
+        // Arb txs are ignored for state (assume-first) EXCEPT when they come from
+        // one of the key wallets that rarely revert. For those, additionally
+        // price a scenario where THEIR Meteora leg lands ahead of us — sized and
+        // floored for that post-competitor state — and send that tx too. The
+        // sim gate keeps it honest: it only ships if it still clears break-even.
+        let scenario_b: Option<(ArbPair, crate::meteora_math::MeteoraPool)> = match (
+            sig.meteora_pool,
+            sig.meteora_amount_in,
+        ) {
+            (Some(met_pool), Some(amt))
+                if is_arb
+                    && amt > 0
+                    && !self.key_wallets.is_empty()
+                    && self.key_wallets.contains(&sig.fee_payer) =>
+            {
+                pairs
+                    .iter()
+                    .find(|p| p.meteora.pool == met_pool)
+                    .and_then(|p| {
+                        let fee_num = self.params.meteora_fee_bps.saturating_mul(100_000);
+                        self.pool_state
+                            .meteora_pool(&met_pool, fee_num, self.params.meteora_fee_worst_case)
+                            .map(|base| {
+                                // Competitor's Meteora leg is the OPPOSITE of their
+                                // Pump leg (circular arb):
+                                //   pump buy  → meteora token→WSOL (a_to_b = token_is_a)
+                                //   pump sell → meteora WSOL→token (a_to_b = !token_is_a)
+                                let a_to_b = if sig.is_buy {
+                                    p.meteora.token_is_a
+                                } else {
+                                    !p.meteora.token_is_a
+                                };
+                                (p.clone(), base.apply_observed_swap(amt, a_to_b))
+                            })
+                    })
+            }
+            _ => None,
+        };
+
         // Assess every Meteora counter-pool of this token IN PARALLEL — each on
         // its own task, sends go straight out with no shared queue.
         let mut rest = pairs.into_iter();
@@ -579,6 +637,16 @@ impl ShredArbEngine {
                 me.assess(&pair, pump_after).await;
             });
         }
+
+        // Scenario B (competitor lands): a second, independently-sized tx.
+        if let Some((pair, met_b)) = scenario_b {
+            self.scenario_b_launched.fetch_add(1, Ordering::Relaxed);
+            let me = self.clone();
+            tokio::spawn(async move {
+                me.assess_scenario(&pair, pump_after, Some(met_b)).await;
+            });
+        }
+
         self.assess(&first_pair, pump_after).await;
     }
 
@@ -587,6 +655,20 @@ impl ShredArbEngine {
     /// to price/quote against — predicted post-trade reserves for a shred
     /// trigger, or the current reserves for a pool-state-update trigger.
     async fn assess(&self, pair: &ArbPair, pump_after: PumpPool) {
+        self.assess_scenario(pair, pump_after, None).await;
+    }
+
+    /// Two-scenario core. `meteora_override = Some(state)` prices the Meteora leg
+    /// against a PREDICTED post-competitor state (scenario "the key competitor's
+    /// tx lands ahead of ours"); `None` uses the current confirmed state
+    /// (scenario "it does not land"). The engine sends one tx per scenario so
+    /// whichever reality occurs, a correctly-sized tx is already on the wire.
+    async fn assess_scenario(
+        &self,
+        pair: &ArbPair,
+        pump_after: PumpPool,
+        meteora_override: Option<crate::meteora_math::MeteoraPool>,
+    ) {
         let key: PairKey = (pair.pump.pool, pair.meteora.pool);
         // Skip pairs we disabled after repeated Metis load failures (only one leg
         // ever loaded) — they'd only produce No-routes spam.
@@ -594,11 +676,15 @@ impl ShredArbEngine {
             return;
         }
         // Cooldown per pair — applies only after a fire, so the state evaluator
-        // can keep re-checking a not-yet-profitable pair every tick.
-        if let Some(prev) = self.last_fired.get(&key) {
-            if prev.elapsed() < Duration::from_millis(self.params.cooldown_ms) {
-                self.skip_cooldown.fetch_add(1, Ordering::Relaxed);
-                return;
+        // can keep re-checking a not-yet-profitable pair every tick. The
+        // scenario-B (competitor-lands) tx deliberately bypasses it: it is the
+        // second half of a two-tx pair and must not be blocked by scenario A.
+        if meteora_override.is_none() {
+            if let Some(prev) = self.last_fired.get(&key) {
+                if prev.elapsed() < Duration::from_millis(self.params.cooldown_ms) {
+                    self.skip_cooldown.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
             }
         }
         self.evaluated.fetch_add(1, Ordering::Relaxed);
@@ -606,16 +692,21 @@ impl ShredArbEngine {
         // 2) Meteora state.
         // config fallback fee is in bps; convert to the 1e9-denominated numerator.
         let fallback_fee_numerator = self.params.meteora_fee_bps.saturating_mul(100_000);
-        let meteora = match self
-            .pool_state
-            .meteora_pool(&pair.meteora.pool, fallback_fee_numerator, self.params.meteora_fee_worst_case)
-        {
+        let meteora = match meteora_override {
+            // Scenario B: competitor's Meteora leg already applied on top of the
+            // confirmed decode. Base decode still gates staleness below.
             Some(m) => m,
-            None => {
-                self.skip_no_meteora_state.fetch_add(1, Ordering::Relaxed);
-                debug!(pool = %pair.meteora.pool, "meteora state not cached yet");
-                return;
-            }
+            None => match self
+                .pool_state
+                .meteora_pool(&pair.meteora.pool, fallback_fee_numerator, self.params.meteora_fee_worst_case)
+            {
+                Some(m) => m,
+                None => {
+                    self.skip_no_meteora_state.fetch_add(1, Ordering::Relaxed);
+                    debug!(pool = %pair.meteora.pool, "meteora state not cached yet");
+                    return;
+                }
+            },
         };
 
         // ── Meteora freshness gate ───────────────────────────────────────────
@@ -1764,7 +1855,7 @@ impl ShredArbEngine {
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
-                     SIM     : ok={} reverted={}\n\
+                     SIM     : ok={} reverted={} | scenario_b={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
@@ -1793,6 +1884,7 @@ impl ShredArbEngine {
                     self.nosend_preempted.load(Ordering::Relaxed),
                     self.sim_ok.load(Ordering::Relaxed),
                     self.sim_reverted.load(Ordering::Relaxed),
+                    self.scenario_b_launched.load(Ordering::Relaxed),
                     self.route_cache_hits.load(Ordering::Relaxed),
                     self.route_cache_misses.load(Ordering::Relaxed),
                     self.route_cache.len(),

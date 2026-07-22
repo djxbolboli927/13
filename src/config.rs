@@ -279,6 +279,12 @@ pub struct ShredArbConfig {
     /// Pump.fun/Meteora pools (competitors' pools). Empty = wallet mining off.
     #[serde(default)]
     pub target_wallets: Vec<String>,
+    /// KEY competitor wallets whose Pump↔Meteora arb txs rarely revert. When
+    /// one of these fires, the engine runs the two-scenario Meteora prediction
+    /// (their leg lands vs not) and sends a tx for each. Empty = fall back to
+    /// `target_wallets`.
+    #[serde(default)]
+    pub key_wallets: Vec<String>,
     /// Re-run the wallet mining pass every this many seconds. Default 1800 (30m).
     #[serde(default = "default_wallet_mine_interval_secs")]
     pub wallet_mine_interval_secs: u64,
@@ -459,6 +465,7 @@ impl Default for ShredArbConfig {
             status_check_delay_secs: default_status_check_delay_secs(),
             error_log_dir: default_error_log_dir(),
             target_wallets: Vec::new(),
+            key_wallets: Vec::new(),
             wallet_mine_interval_secs: default_wallet_mine_interval_secs(),
             wallet_mine_tx_limit: default_wallet_mine_tx_limit(),
             wallet_mine_rpc_urls: Vec::new(),
