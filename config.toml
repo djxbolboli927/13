@@ -111,21 +111,25 @@ enabled = false
 
 [simulation]
 # شبیه‌سازی LiteSVM قبل از ارسال. تراکنش دقیقی که قرار است ارسال شود، محلی
-# روی وضعیت زندهٔ استخرها (که از gRPC/Yellowstone بدون تأخیر می‌آید) اجرا
-# می‌شود؛ اگر revert شود یا سودده نباشد ارسال نمی‌شود.
+# اجرا می‌شود؛ اگر revert شود ارسال نمی‌شود.
+# منبع وضعیت استخرها: همان PoolStateCache که با [shred_arb].pool_state_endpoint
+# آپدیت می‌شود — هیچ gRPC دوم یا فتچ دوباره‌ای انجام نمی‌شود؛ دقیقاً همان
+# وضعیتی که ریاضی روی آن تصمیم گرفته، شبیه‌سازی می‌شود.
 enabled = true
-# پوشهٔ حاوی فایل‌های .so صرافی‌ها (طبق src/program_registry.rs).
-# ⚠️ مهم: باید Pump_AMM.so (برنامهٔ pAMMBay…) و Meteora_DAMM_v2.so و
-#         Jupiter_Aggregator_v6.so در این پوشه باشند وگرنه با fail_closed=true
-#         همهٔ ارسال‌ها drop می‌شوند (سیم revert می‌کند چون برنامه اجرایی نیست).
+# پوشهٔ حاوی فایل‌های .so صرافی‌ها (طبق src/program_registry.rs، حواستان به
+# حروف بزرگ/کوچک باشد). برای مسیر Pump→Meteora این‌ها لازم‌اند:
+#   Jupiter_Aggregator_v6.so · Pump_AMM.so · Pump_Fees_Program.so · Meteora_DAMM_v2.so
 so_dir = "/root/g/so"
-# پوشهٔ فایل‌های اکانت هر استخر (اختیاری؛ اکانت‌های گمشده lazy از RPC خوانده می‌شوند).
+# پوشهٔ فایل‌های اکانت هر استخر (مسیر قدیمی؛ دیگر استفاده نمی‌شود چون وضعیت‌ها
+# از PoolStateCache می‌آیند). نگه داشته شده تا کانفیگ قدیمی نشکند.
 dex_dir = "vendor/litesvm/dex"
 # revert/خطا در سیم → drop ارسال (امن‌ترین حالت، همان چیزی که خواسته شد).
-# اگر Pump_AMM.so را هنوز ندارید، موقتاً false کنید تا سیم فقط لاگ کند و ارسال ادامه یابد.
 fail_closed = true
 # تعداد نمونه‌های مستقل شبیه‌ساز (هرکدام یک LiteSVM موازی).
 workers = 8
+# سقف فراخوانی RPC در ثانیه فقط برای seed کردن owner/lamports اکانت‌های پایه
+# (وضعیت زنده از gRPC می‌آید، نه RPC). پلن shyft سقف ۵ دارد.
+rpc_calls_per_sec = 5
 
 [shred_arb]
 # استراتژی جدید: تشخیص ترید بزرگ روی Pump.fun AMM با ShredStream جیتو و

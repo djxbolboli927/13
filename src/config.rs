@@ -692,6 +692,11 @@ pub struct SimulationConfig {
     /// sensible default (handles ~1600 sims/sec with headroom).
     #[serde(default = "default_workers")]
     pub workers: usize,
+    /// Global ceiling on RPC calls/sec used to seed base account owner/lamports
+    /// (the shyft plan caps at 5). Live pool state comes from gRPC, so this only
+    /// throttles the one-time base seeds — never the hot path.
+    #[serde(default = "default_sim_rpc_cps")]
+    pub rpc_calls_per_sec: u32,
 }
 
 impl Default for SimulationConfig {
@@ -702,8 +707,13 @@ impl Default for SimulationConfig {
             dex_dir: default_dex_dir(),
             fail_closed: true,
             workers: default_workers(),
+            rpc_calls_per_sec: default_sim_rpc_cps(),
         }
     }
+}
+
+fn default_sim_rpc_cps() -> u32 {
+    5
 }
 
 fn default_so_dir() -> String {

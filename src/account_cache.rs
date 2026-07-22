@@ -37,11 +37,23 @@ use yellowstone_grpc_proto::prelude::{
 /// an Arc-wrapped DashMap plus an Arc-wrapped RpcClient for fallbacks.
 #[derive(Clone)]
 pub struct AccountCache {
+    /// Base full accounts (owner/lamports/executable/data). Seeded once from
+    /// RPC; for live-moving pool accounts the `data` field is OVERLAID from
+    /// `live` on every read so the sim sees fresh state without any RPC.
     inner: Arc<DashMap<Pubkey, Account>>,
     rpc: Arc<RpcClient>,
-    /// Slot of the most recent Yellowstone account update. The simulator
-    /// reads this to set LiteSVM's Clock.slot — no RPC call needed.
+    /// Slot the simulator reads to set LiteSVM's Clock.slot — no RPC call.
+    /// When `live` is set this shares the pool-state gRPC's slot counter.
     stream_slot: Arc<AtomicU64>,
+    /// LIVE raw-bytes source: the shred-arb pool-state cache, already fed by
+    /// the `[shred_arb].pool_state_endpoint` gRPC. The sim reads the SAME state
+    /// the arb math priced off — no second subscription, no re-fetch.
+    live: Option<Arc<crate::pool_state::PoolStateCache>>,
+    /// Global RPC rate gate: at most one fetch per `rpc_min_interval` across all
+    /// callers/workers, so startup prefetch + lazy fetches never trip the shyft
+    /// 429 limit. Holds the timestamp of the last RPC call.
+    rpc_gate: Arc<std::sync::Mutex<std::time::Instant>>,
+    rpc_min_interval: Duration,
 }
 
 impl AccountCache {
@@ -50,6 +62,34 @@ impl AccountCache {
             inner: Arc::new(DashMap::with_capacity(4096)),
             rpc,
             stream_slot: Arc::new(AtomicU64::new(0)),
+            live: None,
+            // 5 RPC calls/sec (200ms apart) — the shyft plan's ceiling.
+            rpc_gate: Arc::new(std::sync::Mutex::new(
+                std::time::Instant::now() - Duration::from_secs(1),
+            )),
+            rpc_min_interval: Duration::from_millis(200),
+        }
+    }
+
+    /// Build a cache that overlays live raw bytes from the shred-arb
+    /// `PoolStateCache` and shares its slot counter. This is the ONLY source
+    /// of live pool state the simulator uses — no owner-wide Yellowstone
+    /// firehose is started.
+    pub fn with_live(
+        rpc: Arc<RpcClient>,
+        live: Arc<crate::pool_state::PoolStateCache>,
+        rpc_calls_per_sec: u32,
+    ) -> Self {
+        let interval = Duration::from_millis(1000 / rpc_calls_per_sec.max(1) as u64);
+        Self {
+            inner: Arc::new(DashMap::with_capacity(4096)),
+            rpc,
+            stream_slot: live.slot_handle(),
+            live: Some(live),
+            rpc_gate: Arc::new(std::sync::Mutex::new(
+                std::time::Instant::now() - Duration::from_secs(1),
+            )),
+            rpc_min_interval: interval,
         }
     }
 
@@ -66,17 +106,47 @@ impl AccountCache {
     }
 
     /// Fast path: read from the hot cache. Returns None if not yet populated.
+    ///
+    /// When a live `PoolStateCache` is attached, the `data` field is OVERLAID
+    /// with the freshest bytes for that account (pool / vault / mint), keeping
+    /// the RPC-seeded owner/lamports/executable. This is what makes the sim run
+    /// against the exact live state the arb math priced off. If no base account
+    /// has been seeded yet, returns `None` so the caller RPC-seeds it once; the
+    /// next read then overlays the live data on top.
     #[inline]
     pub fn get(&self, pubkey: &Pubkey) -> Option<Account> {
-        self.inner.get(pubkey).map(|v| v.value().clone())
+        let base = self.inner.get(pubkey).map(|v| v.value().clone());
+        if let Some(live) = &self.live {
+            if let Some(data) = live.account_data(pubkey) {
+                if let Some(mut acct) = base {
+                    acct.data = data;
+                    return Some(acct);
+                }
+                return None; // need an owner/lamports seed first
+            }
+        }
+        base
+    }
+
+    /// Sleep just long enough that RPC calls stay under the configured rate
+    /// (default 5/sec). Serialises all callers through one gate.
+    fn rate_gate(&self) {
+        let mut last = self.rpc_gate.lock().unwrap();
+        let elapsed = last.elapsed();
+        if elapsed < self.rpc_min_interval {
+            std::thread::sleep(self.rpc_min_interval - elapsed);
+        }
+        *last = std::time::Instant::now();
     }
 
     /// Slow path used only during startup warm-up and for rarely-changing
-    /// accounts (token mints, ALTs) that aren't streamed over Yellowstone.
+    /// accounts (token mints, ALTs, global config) not in the live cache.
+    /// Rate-limited so bursty prefetch never trips the RPC 429 limit.
     pub fn get_or_fetch(&self, pubkey: &Pubkey) -> Result<Account> {
         if let Some(a) = self.get(pubkey) {
             return Ok(a);
         }
+        self.rate_gate();
         let acct = self
             .rpc
             .get_account(pubkey)

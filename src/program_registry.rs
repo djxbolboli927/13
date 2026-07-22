@@ -28,6 +28,10 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     // so LiteSVM can execute the Pump swap instruction and so the pool + vault
     // accounts stream into the AccountCache via this owner filter (no RPC).
     ("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", "Pump_AMM.so"),
+    // Pump.fun fee program — the Pump AMM CPIs into it to route the protocol/
+    // creator fee. Without it loaded the buy leg reverts inside the sim with
+    // "Program pfeeUxB… is not executable".
+    ("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ", "Pump_Fees_Program.so"),
     ("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", "Raydium_Concentrated_Liquidity.so"),
     ("MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms", "Manifest.so"),
     ("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", "Whirlpools_Program.so"),
@@ -57,7 +61,7 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     // --- PMM DEX — LiteSVM simulatable (no oracle staleness check) ---
     // GoonFi V2: uses sysvar_instructions whitelist (passes because we send
     // real Jupiter txs). Token vault accounts lazily RPC-fetched on first sim.
-    ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", "goofni_v2.so"),
+    ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", "GoonFi_V2.so"),
 ];
 
 /// PMM (Proprietary Market Maker) program ids. Routes through these DEXes

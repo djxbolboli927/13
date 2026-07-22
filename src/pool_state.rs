@@ -354,6 +354,23 @@ impl PoolStateCache {
         self.slot.load(Ordering::Relaxed)
     }
 
+    /// Shared handle to the live slot counter (advanced on every account update
+    /// from the pool-state gRPC). The LiteSVM simulator reads this to set its
+    /// Clock.slot so simulation runs against the same slot as the fresh state —
+    /// no RPC `get_slot` needed.
+    pub fn slot_handle(&self) -> Arc<AtomicU64> {
+        self.slot.clone()
+    }
+
+    /// The most recent RAW account bytes for `pk` as seen by the pool-state
+    /// gRPC (or the RPC prefetch baseline). This is the SAME data the arb math
+    /// prices off, so the simulator executes against exactly the state the bot
+    /// decided on — zero extra network fetches. `None` if the account is not in
+    /// this narrow cache (mints/vaults/pools only).
+    pub fn account_data(&self, pk: &Pubkey) -> Option<Vec<u8>> {
+        self.inner.get(pk).map(|v| v.value().clone())
+    }
+
     /// Total account updates received since start.
     pub fn updates(&self) -> u64 {
         self.updates.load(Ordering::Relaxed)

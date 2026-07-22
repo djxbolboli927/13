@@ -123,12 +123,6 @@ async fn async_main(config: config::Config) -> Result<()> {
         ),
     }
 
-    let wsol_mint = solana_sdk::pubkey::Pubkey::from_str_const(tokens::WSOL_MINT);
-    let wsol_ata = spl_associated_token_account::get_associated_token_address(
-        &trading_keypair.pubkey(),
-        &wsol_mint,
-    );
-
     // ── Template cache: load hop templates from disk and start periodic flush ─
     let template_store = template_cache::TemplateStore::new();
     if config.template_cache.save_new || config.template_cache.serve_route {
@@ -188,54 +182,14 @@ async fn async_main(config: config::Config) -> Result<()> {
         (None, None)
     };
 
-    let (sim_cache, sim_pool) = if config.simulation.enabled {
-        let cache = account_cache::AccountCache::new(rpc_client.clone());
-
-        if let Ok(s) = rpc_client.get_slot() {
-            cache.seed_slot(s);
-        }
-
-        let dex_pools = dex_accounts::load(&config.simulation.dex_dir);
-        let mut live_extra = vec![wsol_ata];
-        live_extra.extend_from_slice(&dex_pools.subscribe_accounts);
-
-        cache.spawn_subscription(
-            config.yellowstone_grpc.endpoint.clone(),
-            config.yellowstone_grpc.x_token.clone(),
-            program_registry::all_program_ids(),
-            live_extra,
-        );
-
-        let mut warm: Vec<solana_sdk::pubkey::Pubkey> = token_mints
-            .iter()
-            .filter_map(|s| solana_sdk::pubkey::Pubkey::try_from(s.as_str()).ok())
-            .collect();
-        warm.push(wsol_mint);
-        warm.push(wsol_ata);
-        warm.push(trading_keypair.pubkey());
-        for mint_str in &token_mints {
-            if let Ok(mint) = solana_sdk::pubkey::Pubkey::try_from(mint_str.as_str()) {
-                let ata = spl_associated_token_account::get_associated_token_address(
-                    &trading_keypair.pubkey(),
-                    &mint,
-                );
-                warm.push(ata);
-            }
-        }
-        warm.extend_from_slice(&dex_pools.all_accounts);
-        cache.prefetch(&warm);
-
-        let pool = litesvm_sim::SimulatorPool::new(
-            config.simulation.workers,
-            &config.simulation.so_dir,
-            wsol_ata,
-            config.simulation.fail_closed,
-            cache.stream_slot(),
-        )?;
-        (Some(Arc::new(cache)), Some(Arc::new(pool)))
-    } else {
-        (None, None)
-    };
+    // LiteSVM pre-send simulation is wired inside `spawn_shred_arb`, where it
+    // can attach to the live `PoolStateCache` (fed by [shred_arb].
+    // pool_state_endpoint) — the SAME state the arb math prices off. The legacy
+    // scanner path (arbitrage.rs) never calls simulate(), so it gets None here.
+    let (sim_cache, sim_pool): (
+        Option<Arc<account_cache::AccountCache>>,
+        Option<Arc<litesvm_sim::SimulatorPool>>,
+    ) = (None, None);
 
     // ── Build shared CalcCtx ─────────────────────────────────────────────────
     let calc_ctx = Arc::new(arbitrage::CalcCtx {
@@ -294,8 +248,6 @@ async fn async_main(config: config::Config) -> Result<()> {
             jito_grpc_client.clone(),
             jito_limiter.clone(),
             jito_grpc_limiter.clone(),
-            sim_cache.clone(),
-            sim_pool.clone(),
             metrics.clone(),
         ) {
             error!(error = %e, "failed to start shred-arb strategy");
@@ -340,11 +292,10 @@ fn spawn_shred_arb(
     jito_grpc_client: Option<Arc<jito_grpc::JitoGrpcClient>>,
     jito_limiter: Arc<Mutex<RateLimiter>>,
     jito_grpc_limiter: Option<Arc<Mutex<RateLimiter>>>,
-    sim_cache: Option<Arc<account_cache::AccountCache>>,
-    sim_pool: Option<Arc<litesvm_sim::SimulatorPool>>,
     metrics: Arc<metrics::Metrics>,
 ) -> Result<()> {
     let sa = config.shred_arb.clone();
+    let simulation = config.simulation.clone();
     // Dedicated CU limit for the 2-hop Pump↔Meteora tx. Competitor arb txs
     // consume ~178k CU, so the legacy 170k default would run out — use a
     // roomier value (configurable).
@@ -488,6 +439,58 @@ fn spawn_shred_arb(
             sa.pool_state_x_token.clone(),
             accounts,
         );
+
+        // ── LiteSVM pre-send simulator ───────────────────────────────────────
+        // Reads live pool state straight from `pool_state` (no second gRPC, no
+        // re-fetch) and shares its slot counter. Base owner/lamports for the
+        // handful of accounts a swap touches are RPC-seeded ONCE, rate-limited
+        // to 5/sec on the non-trading RPC so we never hit a 429.
+        let (sim_cache, sim_pool): (
+            Option<Arc<account_cache::AccountCache>>,
+            Option<Arc<litesvm_sim::SimulatorPool>>,
+        ) = if simulation.enabled {
+            let wsol_ata = spl_associated_token_account::get_associated_token_address(
+                &trading_keypair.pubkey(),
+                &dex_ids::wsol_mint(),
+            );
+            let cache = account_cache::AccountCache::with_live(
+                rpc_secondary.clone(),
+                Arc::new(pool_state.clone()),
+                simulation.rpc_calls_per_sec,
+            );
+            // Seed owner/lamports for the wallet, its WSOL ATA and each pair's
+            // token ATA (the pool/vault/mint bases are seeded lazily on the
+            // first sim, then overlaid live). Rate-limited inside get_or_fetch.
+            let mut warm = vec![trading_keypair.pubkey(), wsol_ata];
+            for p in &pairs {
+                warm.push(spl_associated_token_account::get_associated_token_address(
+                    &trading_keypair.pubkey(),
+                    &p.token_mint,
+                ));
+            }
+            cache.prefetch(&warm);
+            match litesvm_sim::SimulatorPool::new(
+                simulation.workers,
+                &simulation.so_dir,
+                wsol_ata,
+                simulation.fail_closed,
+                pool_state.slot_handle(),
+            ) {
+                Ok(pool) => {
+                    eprintln!(
+                        "[shred-arb] LiteSVM simulator ready (workers={}, so_dir={}, fail_closed={})",
+                        simulation.workers, simulation.so_dir, simulation.fail_closed
+                    );
+                    (Some(Arc::new(cache)), Some(Arc::new(pool)))
+                }
+                Err(e) => {
+                    eprintln!("[shred-arb] LiteSVM init failed: {e} — sending WITHOUT sim gate");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
 
         // Preload (unfiltered) ALT contents for each Pump pool so the consumer
         // can resolve ALT-provided accounts without a hot-path RPC call.

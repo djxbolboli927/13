@@ -179,9 +179,26 @@ impl Simulator {
         // once via RPC and caches permanently — subsequent sims are zero-RPC.
         // Runs BEFORE the svm mutex so a blocking RPC does not stall workers.
         for pk in &accounts {
+            // Skip DEX/aggregator programs — already loaded as executables via
+            // add_program_from_file; RPC-fetching their (large) bytecode would
+            // waste a rate-limited slot and the injection loop skips them anyway.
+            if is_loaded_program(pk) {
+                continue;
+            }
             if cache.get(pk).is_none() {
                 if let Err(e) = cache.get_or_fetch(pk) {
                     debug!(pubkey = %pk, error = %e, "lazy RPC fetch for missing account");
+                }
+            }
+        }
+
+        // Seed the raw ALT table accounts themselves (not part of `accounts`)
+        // so the SVM can expand the tx's v0 address lookups below. Static —
+        // fetched once, then cached.
+        for alt in alts {
+            if cache.get(&alt.key).is_none() {
+                if let Err(e) = cache.get_or_fetch(&alt.key) {
+                    debug!(alt = %alt.key, error = %e, "lazy RPC fetch for ALT account");
                 }
             }
         }
@@ -277,6 +294,15 @@ impl Simulator {
             }
         }
     }
+}
+
+/// True if `pk` is a DEX/aggregator program already loaded into LiteSVM as an
+/// executable — those must not be RPC-fetched or overwritten from the cache.
+fn is_loaded_program(pk: &Pubkey) -> bool {
+    let s = pk.to_string();
+    crate::program_registry::PROGRAMS
+        .iter()
+        .any(|(id, _)| *id == s)
 }
 
 /// Read the SPL Token amount field from raw account data.
