@@ -1306,23 +1306,26 @@ impl ShredArbEngine {
         let pool_alts: Vec<solana_sdk::pubkey::Pubkey> =
             [pair.pump.alt, pair.meteora.alt].into_iter().flatten().collect();
 
+        // DIRECT send (no Jito): a reverting tx must LAND on-chain so we can read
+        // its 0x1771 and see which leg failed — Jito would just drop it. Both
+        // legs share one blockhash and carry the same priority fee.
+        let _ = tip; // split test uses direct priority fee, not a Jito tip
         let blockhash = self.blockhash_cache.get();
         let keypair = self.trading_keypair.clone();
         let alt = self.alt_cache.clone();
         let rpc = self.rpc_client.clone();
         let cu = self.params.cu_limit;
         let data_limit = self.params.loaded_accounts_data_limit;
-        let cu_price = self.params.compute_unit_price_microlamports;
+        let prio = self.params.direct_priority_fee_microlamports;
         let owned2 = owned_alts.clone();
         let alts2 = pool_alts.clone();
 
-        // tx0 = buy (no tip), tx1 = sell (carries the bundle tip).
         let built = tokio::task::spawn_blocking(move || {
             let tx0 = transaction::build_direct_transaction(
-                &ix1, &keypair, cu, 0, data_limit, blockhash, &alt, &rpc, &alts2, &owned2,
+                &ix1, &keypair, cu, prio, data_limit, blockhash, &alt, &rpc, &alts2, &owned2,
             )?;
-            let tx1 = transaction::build_arb_transaction(
-                &ix2, &keypair, tip, cu, data_limit, cu_price, blockhash, &alt, &rpc, &pool_alts, &owned_alts,
+            let tx1 = transaction::build_direct_transaction(
+                &ix2, &keypair, cu, prio, data_limit, blockhash, &alt, &rpc, &pool_alts, &owned_alts,
             )?;
             Ok::<_, anyhow::Error>((tx0, tx1))
         })
@@ -1343,15 +1346,45 @@ impl ShredArbEngine {
             }
         }
 
-        match self.jito.send_bundle_txs(&[tx0, tx1]).await {
-            Ok(id) => {
+        // Fire both directly (skip_preflight so reverts land) and resolve each
+        // leg's on-chain fate independently. tx0=buy, tx1=sell.
+        let sig0 = tx0.signatures.first().copied().unwrap_or_default();
+        let sig1 = tx1.signatures.first().copied().unwrap_or_default();
+        let rpc_send = self.rpc_client.clone();
+        let send_res = tokio::task::spawn_blocking(move || {
+            use solana_client::rpc_config::RpcSendTransactionConfig;
+            let cfg = RpcSendTransactionConfig { skip_preflight: true, max_retries: Some(0), ..Default::default() };
+            let r0 = rpc_send.send_transaction_with_config(&tx0, cfg);
+            let r1 = rpc_send.send_transaction_with_config(&tx1, cfg);
+            (r0, r1)
+        })
+        .await;
+        match send_res {
+            Ok((r0, r1)) => {
                 self.sent.fetch_add(1, Ordering::Relaxed);
                 self.last_sent.insert(key, Instant::now());
-                info!(bundle = %id, input = amount_in, predicted_tokens = token_amt, sent_slot = self.pool_state.slot(), "shred-arb SPLIT bundle sent (buy+sell)");
+                info!(
+                    buy_sig = %sig0, sell_sig = %sig1, input = amount_in,
+                    predicted_tokens = token_amt, sent_slot = self.pool_state.slot(),
+                    buy_send = ?r0.as_ref().map(|s| s.to_string()).map_err(|e| e.to_string()),
+                    sell_send = ?r1.as_ref().map(|s| s.to_string()).map_err(|e| e.to_string()),
+                    "shred-arb SPLIT sent (buy tx0 + sell tx1, direct)"
+                );
+                // Track each leg's fate so the TX funnel accounts for both, and
+                // the operator learns which leg reverted with 0x1771.
+                for (sig, leg) in [(sig0, "buy"), (sig1, "sell")] {
+                    let rpc3 = self.rpc_client.clone();
+                    let stats = self.sent_stats.clone();
+                    let token_l = format!("{token}[{leg}]");
+                    let delay = self.params.status_check_delay_secs;
+                    tokio::spawn(async move {
+                        resolve_fate(rpc3, stats, sig, token_l, 0, delay).await;
+                    });
+                }
             }
             Err(e) => {
                 self.nosend_send_err.fetch_add(1, Ordering::Relaxed);
-                crate::errlog::log("not-sent", &format!("token={token} reason=split-bundle-send-err err={e}"));
+                crate::errlog::log("not-sent", &format!("token={token} reason=split-send-join-err err={e}"));
             }
         }
     }
