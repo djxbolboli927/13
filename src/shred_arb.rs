@@ -377,26 +377,45 @@ struct LiveTuning {
     /// Whether the LiteSVM sim is allowed to BLOCK a send (drop on revert).
     /// Off by default so a mis-simulating pool never silently halts trading.
     sim_gate_sends: std::sync::atomic::AtomicBool,
+    /// Whether the LiteSVM sim RUNS at all. Mirrors `[simulation].enabled` and
+    /// is hot-reloaded, so setting `enabled = false` stops the sim within one
+    /// reload cycle WITHOUT a restart (the pool stays built but is never used).
+    sim_enabled: std::sync::atomic::AtomicBool,
     min_amount_lamports: AtomicU64,
     max_amount_lamports: AtomicU64,
     min_trigger_lamports: AtomicU64,
     meteora_fee_bps: AtomicU64,
     min_net_profit_lamports: AtomicU64,
+    /// Skip an opportunity when the Meteora pool's gRPC state is more than this
+    /// many slots stale. 0 = off. On THIN pools even a small lag over-predicts
+    /// the sell badly (the losing-tx root cause), so this is the main non-sim
+    /// guard — and it's hot-reloadable so you can tune it live.
+    meteora_max_stale_slots: AtomicU64,
 }
 
 impl LiveTuning {
-    fn from_params(p: &ArbParams, sim_gate_sends: bool) -> Self {
+    fn from_params(p: &ArbParams, sim_gate_sends: bool, sim_enabled: bool) -> Self {
         use std::sync::atomic::AtomicBool;
         Self {
             disable_preempt: AtomicBool::new(p.disable_preempt),
             force_send_profitable: AtomicBool::new(p.force_send_profitable),
             sim_gate_sends: AtomicBool::new(sim_gate_sends),
+            sim_enabled: AtomicBool::new(sim_enabled),
             min_amount_lamports: AtomicU64::new(p.min_amount_lamports),
             max_amount_lamports: AtomicU64::new(p.max_amount_lamports),
             min_trigger_lamports: AtomicU64::new(p.min_trigger_lamports),
             meteora_fee_bps: AtomicU64::new(p.meteora_fee_bps),
             min_net_profit_lamports: AtomicU64::new(p.min_net_profit_lamports),
+            meteora_max_stale_slots: AtomicU64::new(p.meteora_max_stale_slots),
         }
+    }
+    #[inline]
+    fn meteora_max_stale_slots(&self) -> u64 {
+        self.meteora_max_stale_slots.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn sim_enabled(&self) -> bool {
+        self.sim_enabled.load(Ordering::Relaxed)
     }
     #[inline]
     fn disable_preempt(&self) -> bool {
@@ -462,7 +481,11 @@ impl ShredArbEngine {
             .iter()
             .filter_map(|s| solana_sdk::pubkey::Pubkey::try_from(s.as_str()).ok())
             .collect();
-        let live = Arc::new(LiveTuning::from_params(&params, params.sim_gate_sends));
+        let live = Arc::new(LiveTuning::from_params(
+            &params,
+            params.sim_gate_sends,
+            sim_pool.is_some(),
+        ));
         Self {
             metis,
             blockhash_cache,
@@ -621,6 +644,9 @@ impl ShredArbEngine {
                             .sim_gate_sends
                             .store(cfg.simulation.gate_sends, Ordering::Relaxed);
                         self.live
+                            .sim_enabled
+                            .store(cfg.simulation.enabled, Ordering::Relaxed);
+                        self.live
                             .min_amount_lamports
                             .store(lamports(sa.min_amount_sol).max(1), Ordering::Relaxed);
                         self.live
@@ -635,6 +661,9 @@ impl ShredArbEngine {
                         self.live
                             .min_net_profit_lamports
                             .store(sa.min_net_profit_lamports, Ordering::Relaxed);
+                        self.live
+                            .meteora_max_stale_slots
+                            .store(sa.meteora_max_stale_slots, Ordering::Relaxed);
                         eprintln!(
                             "[shred-arb] config reloaded: disable_preempt={} force_send={} \
                              gate_sends={} min={} max={} trigger={} met_fee_bps={} min_profit={}",
@@ -938,12 +967,13 @@ impl ShredArbEngine {
         // gRPC feed lags for low-activity Meteora accounts). Refuse to trade a
         // Meteora pool whose cached state is more than `meteora_max_stale_slots`
         // behind the newest slot we've seen. 0 = gate off.
-        if self.params.meteora_max_stale_slots > 0 {
+        let max_stale = self.live.meteora_max_stale_slots();
+        if max_stale > 0 {
             let behind = self
                 .pool_state
                 .slot()
                 .saturating_sub(self.pool_state.last_update_slot(&pair.meteora.pool).unwrap_or(0));
-            if behind > self.params.meteora_max_stale_slots {
+            if behind > max_stale {
                 self.skip_stale_meteora.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -1196,6 +1226,12 @@ impl ShredArbEngine {
         tx: &solana_sdk::transaction::VersionedTransaction,
         token: &str,
     ) -> bool {
+        // Hot-reloadable off switch: when [simulation].enabled = false the sim
+        // never runs (no LiteSVM, no latency) — applied within one reload cycle
+        // without a restart.
+        if !self.live.sim_enabled() {
+            return true;
+        }
         let (pool, cache) = match (&self.sim_pool, &self.sim_cache) {
             (Some(p), Some(c)) => (p.clone(), c.clone()),
             _ => return true, // simulator not built → allow
