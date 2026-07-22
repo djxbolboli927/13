@@ -254,6 +254,11 @@ pub struct ShredArbConfig {
     /// route cache (skip Metis on repeat opportunities). true = on.
     #[serde(default = "default_true", rename = "Instructions++")]
     pub instructions_pp: bool,
+    /// Split-leg diagnostic: send Pump buy + Meteora sell as two separate
+    /// transactions in one Jito bundle so the leg that under-delivers reverts
+    /// alone. Default false.
+    #[serde(default)]
+    pub split_legs: bool,
     /// Worst-case Meteora fee: price the volatility (dynamic) fee at the pool's
     /// `max_volatility_accumulator` ceiling so the fee is never understated
     /// (kills phantom profit on volatile new pools). Default false.
@@ -459,6 +464,7 @@ impl Default for ShredArbConfig {
             min_trigger_reserve_frac: 0.0,
             send_dedup_ms: default_send_dedup_ms(),
             instructions_pp: true,
+            split_legs: false,
             meteora_fee_worst_case: false,
             min_pool_wsol_lamports: default_min_pool_wsol_lamports(),
             fee_audit_log_secs: default_fee_audit_log_secs(),

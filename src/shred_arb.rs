@@ -151,6 +151,12 @@ pub struct ArbParams {
     /// "Instructions++": serve repeat routes from the in-RAM instruction cache
     /// instead of calling Metis. Off = always fetch from Metis.
     pub instructions_pp: bool,
+    /// Split-leg diagnostic: send the Pump buy and the Meteora sell as TWO
+    /// separate route_v2 transactions inside ONE Jito bundle (tx0 buy → tx1
+    /// sell, input = predicted Pump output). The leg that under-delivers reverts
+    /// on its own, so the on-chain result tells us whether Pump or Meteora is the
+    /// culprit. Forces the Jito bundle path.
+    pub split_legs: bool,
     /// Worst-case Meteora fee: price the volatility (dynamic) fee at the pool's
     /// `max_volatility_accumulator` ceiling instead of the stored value, so the
     /// fee is never understated (kills phantom profit). Toggle in config.
@@ -1207,8 +1213,147 @@ impl ShredArbEngine {
                 .last_update_slot(&pair.meteora.pool)
                 .unwrap_or(0),
         };
+        if self.params.split_legs {
+            self.execute_split(pair, key, buy_kind, sell_kind, best_x, onchain_floor, tip)
+                .await;
+            return;
+        }
         self.execute(pair, key, buy_kind, sell_kind, best_x, onchain_floor, best_out, tip, recheck)
             .await;
+    }
+
+    /// Split-leg diagnostic sender. Builds the Pump buy and the Meteora sell as
+    /// two SEPARATE route_v2 transactions and sends them in ONE Jito bundle
+    /// (atomic, in order). tx0's minimum-out is the PREDICTED Pump token output,
+    /// so if Pump under-delivers (many competing buys landed first) tx0 reverts;
+    /// otherwise tx1 (the sell) reverts if Meteora under-delivers. Whichever
+    /// reverts on-chain names the guilty leg. Always fetches fresh instructions
+    /// from Metis (no RAM route cache).
+    async fn execute_split(
+        &self,
+        pair: &ArbPair,
+        key: PairKey,
+        buy_kind: DexKind,
+        sell_kind: DexKind,
+        amount_in: u64,
+        onchain_floor: u64,
+        tip: u64,
+    ) {
+        let token = pair.token_mint.to_string();
+        let buy_label = self.label_for(buy_kind);
+        let sell_label = self.label_for(sell_kind);
+
+        // Leg 1 quote: WSOL → token on the buy venue.
+        let q1 = match self
+            .metis
+            .get_quote_forced(WSOL_MINT, &token, amount_in, buy_label, self.params.metis_max_accounts)
+            .await
+        {
+            Ok(q) => q,
+            Err(e) => {
+                self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
+                crate::errlog::log("not-sent", &format!("token={token} reason=split-buy-quote-fail err={e}"));
+                return;
+            }
+        };
+        let token_amt: u64 = match q1.out_amount.parse().ok().filter(|&v| v > 0) {
+            Some(v) => v,
+            None => {
+                self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        // Leg 2 quote: token → WSOL on the sell venue, input = predicted tokens.
+        let q2 = match self
+            .metis
+            .get_quote_forced(&token, WSOL_MINT, token_amt, sell_label, self.params.metis_max_accounts)
+            .await
+        {
+            Ok(q) => q,
+            Err(e) => {
+                self.nosend_quote_fail.fetch_add(1, Ordering::Relaxed);
+                crate::errlog::log("not-sent", &format!("token={token} reason=split-sell-quote-fail err={e}"));
+                return;
+            }
+        };
+        self.note_route_success(key);
+
+        // Build each leg as its own route_v2 with an explicit floor:
+        //   tx0 (buy)  min-out = token_amt  → reverts if Pump under-delivers.
+        //   tx1 (sell) min-out = onchain_floor (break-even WSOL).
+        let q1_leg = MetisClient::single_leg_quote(&q1, token_amt);
+        let q2_leg = MetisClient::single_leg_quote(&q2, onchain_floor);
+        let mut ix1 = match self.metis.get_swap_instructions(&self.user_pubkey, &q1_leg, self.params.use_shared_accounts).await {
+            Ok(s) => s,
+            Err(e) => { self.nosend_swapix_fail.fetch_add(1, Ordering::Relaxed); crate::errlog::log("not-sent", &format!("token={token} reason=split-buy-ix-fail err={e:?}")); return; }
+        };
+        let ix2 = match self.metis.get_swap_instructions(&self.user_pubkey, &q2_leg, self.params.use_shared_accounts).await {
+            Ok(s) => s,
+            Err(e) => { self.nosend_swapix_fail.fetch_add(1, Ordering::Relaxed); crate::errlog::log("not-sent", &format!("token={token} reason=split-sell-ix-fail err={e:?}")); return; }
+        };
+
+        // Freshen the Pump coin_creator vault on the BUY leg (it can rotate).
+        if let Some(creator) = self.pool_state.pump_coin_creator(&pair.pump.pool) {
+            patch_pump_creator_vault(&mut ix1.swap_instruction, &creator, None);
+        }
+
+        // Teach the self-learning ALT both routes' accounts.
+        if let Some(ab) = &self.alt_builder {
+            ab.note(harvest_accounts(&ix1));
+            ab.note(harvest_accounts(&ix2));
+        }
+        let owned_alts = self.alt_builder.as_ref().map(|ab| ab.tables()).unwrap_or_default();
+        let pool_alts: Vec<solana_sdk::pubkey::Pubkey> =
+            [pair.pump.alt, pair.meteora.alt].into_iter().flatten().collect();
+
+        let blockhash = self.blockhash_cache.get();
+        let keypair = self.trading_keypair.clone();
+        let alt = self.alt_cache.clone();
+        let rpc = self.rpc_client.clone();
+        let cu = self.params.cu_limit;
+        let data_limit = self.params.loaded_accounts_data_limit;
+        let cu_price = self.params.compute_unit_price_microlamports;
+        let owned2 = owned_alts.clone();
+        let alts2 = pool_alts.clone();
+
+        // tx0 = buy (no tip), tx1 = sell (carries the bundle tip).
+        let built = tokio::task::spawn_blocking(move || {
+            let tx0 = transaction::build_direct_transaction(
+                &ix1, &keypair, cu, 0, data_limit, blockhash, &alt, &rpc, &alts2, &owned2,
+            )?;
+            let tx1 = transaction::build_arb_transaction(
+                &ix2, &keypair, tip, cu, data_limit, cu_price, blockhash, &alt, &rpc, &pool_alts, &owned_alts,
+            )?;
+            Ok::<_, anyhow::Error>((tx0, tx1))
+        })
+        .await;
+        let (tx0, tx1) = match built {
+            Ok(Ok(pair)) => pair,
+            _ => {
+                self.nosend_build_fail.fetch_add(1, Ordering::Relaxed);
+                crate::errlog::log("not-sent", &format!("token={token} reason=split-build-fail"));
+                return;
+            }
+        };
+        for (label, tx) in [("buy", &tx0), ("sell", &tx1)] {
+            if transaction::serialized_len(tx) > 1232 {
+                self.nosend_too_large.fetch_add(1, Ordering::Relaxed);
+                crate::errlog::log("not-sent", &format!("token={token} reason=split-{label}-too-large"));
+                return;
+            }
+        }
+
+        match self.jito.send_bundle_txs(&[tx0, tx1]).await {
+            Ok(id) => {
+                self.sent.fetch_add(1, Ordering::Relaxed);
+                self.last_sent.insert(key, Instant::now());
+                info!(bundle = %id, input = amount_in, predicted_tokens = token_amt, sent_slot = self.pool_state.slot(), "shred-arb SPLIT bundle sent (buy+sell)");
+            }
+            Err(e) => {
+                self.nosend_send_err.fetch_add(1, Ordering::Relaxed);
+                crate::errlog::log("not-sent", &format!("token={token} reason=split-bundle-send-err err={e}"));
+            }
+        }
     }
 
     /// LiteSVM pre-send simulation. Executes the EXACT built tx locally against

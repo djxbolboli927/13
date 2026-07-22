@@ -366,6 +366,7 @@ fn spawn_shred_arb(
         send_dedup_ms: sa.send_dedup_ms,
         status_check_delay_secs: sa.status_check_delay_secs,
         instructions_pp: sa.instructions_pp,
+        split_legs: sa.split_legs,
         meteora_fee_worst_case: sa.meteora_fee_worst_case,
         min_pool_wsol_lamports: sa.min_pool_wsol_lamports,
         never_close: sa.never_close_pools,

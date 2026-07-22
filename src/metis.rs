@@ -316,6 +316,19 @@ impl MetisClient {
         })
     }
 
+    /// Clone a SINGLE-leg quote and overwrite its output floor. Used by the
+    /// split-leg diagnostic: each leg becomes its own route_v2 tx with an
+    /// explicit minimum-out, so the leg that under-delivers reverts on its own
+    /// (and we learn whether Pump or Meteora is the culprit).
+    pub fn single_leg_quote(quote: &QuoteResponse, min_acceptable_out: u64) -> QuoteResponse {
+        QuoteResponse {
+            out_amount: min_acceptable_out.to_string(),
+            other_amount_threshold: min_acceptable_out.to_string(),
+            price_impact_pct: "0".to_string(),
+            ..quote.clone()
+        }
+    }
+
     /// Get swap instructions for a merged circular quote.
     ///
     /// CRITICAL for circular arbitrage:
