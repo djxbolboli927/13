@@ -712,6 +712,11 @@ pub struct SimulationConfig {
     /// sensible default (handles ~1600 sims/sec with headroom).
     #[serde(default = "default_workers")]
     pub workers: usize,
+    /// Whether the sim may BLOCK a send (drop on revert). OFF by default: the
+    /// sim is a safety net, and a mis-simulating pool must never silently halt
+    /// trading. Turn on only after the SIM ok/reverted counters look healthy.
+    #[serde(default)]
+    pub gate_sends: bool,
     /// Global ceiling on RPC calls/sec used to seed base account owner/lamports
     /// (the shyft plan caps at 5). Live pool state comes from gRPC, so this only
     /// throttles the one-time base seeds — never the hot path.
@@ -727,6 +732,7 @@ impl Default for SimulationConfig {
             dex_dir: default_dex_dir(),
             fail_closed: true,
             workers: default_workers(),
+            gate_sends: false,
             rpc_calls_per_sec: default_sim_rpc_cps(),
         }
     }

@@ -87,6 +87,10 @@ pub struct ArbParams {
     /// Fraction of detected net profit paid to Jito as tip (0.20 = 20%).
     pub jito_tip_profit_fraction: f64,
     pub meteora_fee_bps: u64,
+    /// Whether the LiteSVM sim may BLOCK sends (drop on revert). Off by default:
+    /// a mis-simulating pool would otherwise halt all trading. Mirrors
+    /// `[simulation].gate_sends`.
+    pub sim_gate_sends: bool,
     /// KEY competitor wallets (base58) whose arb txs rarely revert. When one of
     /// these lands a Pump↔Meteora arb we run the two-scenario Meteora prediction.
     /// Empty = feature off.
@@ -226,6 +230,8 @@ pub struct ShredArbEngine {
     key_wallets: std::collections::HashSet<solana_sdk::pubkey::Pubkey>,
     /// Count of scenario-B (competitor-lands) speculative assessments launched.
     scenario_b_launched: AtomicU64,
+    /// Hot-reloadable tuning knobs (config.toml re-read every few minutes).
+    live: Arc<LiveTuning>,
     /// In-RAM whole-route instruction cache: one Metis swap-instructions
     /// response per (pair, direction), amount-patched on every reuse so hot
     /// opportunities skip the Metis round-trip entirely. RAM-only by design —
@@ -296,6 +302,9 @@ pub struct ShredArbEngine {
     /// Skipped at the last moment because the pool moved during our compute
     /// window (a competitor's trade landed) so the tx would now revert.
     nosend_preempted: AtomicU64,
+    /// Dropped by the LiteSVM pre-send sim (would revert on live state). Only
+    /// non-zero when `[simulation].gate_sends = true`.
+    nosend_sim: AtomicU64,
     /// Multi-hop arbitrage txs observed on a Pump pool that we IGNORED for state
     /// prediction (assume-first model — they mostly revert on the Meteora side).
     arb_ignored: AtomicU64,
@@ -332,6 +341,12 @@ struct Recheck {
     min_out: u64,
     /// Token-2022 transfer-fee bps of the intermediate token (0 for classic SPL).
     tfee_bps: u16,
+    /// The Meteora pool's gRPC `last_update_slot` at the moment we computed. The
+    /// preempt gate compares it to the current slot: if the pool account has NOT
+    /// advanced (state unchanged) the tx is sent as-is; only a genuine on-chain
+    /// state change triggers a re-check. This is exactly what the operator asked
+    /// for — "don't call it preempted unless the gRPC pool state actually moved."
+    met_slot_at_calc: u64,
 }
 
 /// On-chain fate of the direct-sent transactions (checked a few seconds after
@@ -347,6 +362,65 @@ struct SentStats {
     /// Fate check could not be resolved (RPC error every retry) — accounted so
     /// sent == landed_ok + reverted + dropped + unknown always holds.
     unknown: AtomicU64,
+}
+
+/// Hot-reloadable tuning knobs. Held behind atomics so a background task can
+/// re-read config.toml every few minutes and apply changes WITHOUT a restart.
+/// Only the fields the operator actually tweaks live here; everything else in
+/// `ArbParams` is fixed at startup.
+struct LiveTuning {
+    disable_preempt: std::sync::atomic::AtomicBool,
+    force_send_profitable: std::sync::atomic::AtomicBool,
+    /// Whether the LiteSVM sim is allowed to BLOCK a send (drop on revert).
+    /// Off by default so a mis-simulating pool never silently halts trading.
+    sim_gate_sends: std::sync::atomic::AtomicBool,
+    min_amount_lamports: AtomicU64,
+    max_amount_lamports: AtomicU64,
+    min_trigger_lamports: AtomicU64,
+    meteora_fee_bps: AtomicU64,
+}
+
+impl LiveTuning {
+    fn from_params(p: &ArbParams, sim_gate_sends: bool) -> Self {
+        use std::sync::atomic::AtomicBool;
+        Self {
+            disable_preempt: AtomicBool::new(p.disable_preempt),
+            force_send_profitable: AtomicBool::new(p.force_send_profitable),
+            sim_gate_sends: AtomicBool::new(sim_gate_sends),
+            min_amount_lamports: AtomicU64::new(p.min_amount_lamports),
+            max_amount_lamports: AtomicU64::new(p.max_amount_lamports),
+            min_trigger_lamports: AtomicU64::new(p.min_trigger_lamports),
+            meteora_fee_bps: AtomicU64::new(p.meteora_fee_bps),
+        }
+    }
+    #[inline]
+    fn disable_preempt(&self) -> bool {
+        self.disable_preempt.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn force_send_profitable(&self) -> bool {
+        self.force_send_profitable.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn sim_gate_sends(&self) -> bool {
+        self.sim_gate_sends.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn min_amount_lamports(&self) -> u64 {
+        self.min_amount_lamports.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn max_amount_lamports(&self) -> u64 {
+        self.max_amount_lamports.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn min_trigger_lamports(&self) -> u64 {
+        self.min_trigger_lamports.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn meteora_fee_bps(&self) -> u64 {
+        self.meteora_fee_bps.load(Ordering::Relaxed)
+    }
 }
 
 impl ShredArbEngine {
@@ -379,6 +453,7 @@ impl ShredArbEngine {
             .iter()
             .filter_map(|s| solana_sdk::pubkey::Pubkey::try_from(s.as_str()).ok())
             .collect();
+        let live = Arc::new(LiveTuning::from_params(&params, params.sim_gate_sends));
         Self {
             metis,
             blockhash_cache,
@@ -405,6 +480,7 @@ impl ShredArbEngine {
             sim_ok: AtomicU64::new(0),
             key_wallets,
             scenario_b_launched: AtomicU64::new(0),
+            live,
             route_cache: dashmap::DashMap::new(),
             last_fired: dashmap::DashMap::new(),
             last_sent: dashmap::DashMap::new(),
@@ -437,6 +513,7 @@ impl ShredArbEngine {
             nosend_too_locks: AtomicU64::new(0),
             nosend_send_err: AtomicU64::new(0),
             nosend_preempted: AtomicU64::new(0),
+            nosend_sim: AtomicU64::new(0),
             arb_ignored: AtomicU64::new(0),
             route_cache_hits: AtomicU64::new(0),
             route_cache_misses: AtomicU64::new(0),
@@ -464,6 +541,98 @@ impl ShredArbEngine {
     /// trades) would otherwise be missed until the next Pump swap. This catches
     /// those. Cheap — the calc is microseconds and only profitable pairs hit
     /// Metis.
+    /// Re-read config.toml and mix.json every `interval_secs` so the operator
+    /// can retune the bot (or add pools) WITHOUT a restart. Only the tuning
+    /// knobs in `LiveTuning` are applied live; structural settings (endpoints,
+    /// worker counts) still need a restart. New mix.json pairs are wired via the
+    /// pool manager (idempotent — existing pairs are skipped with no Metis call).
+    pub fn spawn_hot_reload(
+        self: Arc<Self>,
+        config_path: String,
+        mix_path: String,
+        interval_secs: u64,
+    ) {
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(Duration::from_secs(interval_secs.max(30)));
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                ticker.tick().await;
+
+                // 1) config.toml → live tuning knobs.
+                match crate::config::Config::load(&config_path) {
+                    Ok(cfg) => {
+                        let sa = &cfg.shred_arb;
+                        let lamports = |sol: f64| (sol * 1_000_000_000.0) as u64;
+                        self.live
+                            .disable_preempt
+                            .store(sa.disable_preempt, Ordering::Relaxed);
+                        self.live
+                            .force_send_profitable
+                            .store(sa.force_send_profitable, Ordering::Relaxed);
+                        self.live
+                            .sim_gate_sends
+                            .store(cfg.simulation.gate_sends, Ordering::Relaxed);
+                        self.live
+                            .min_amount_lamports
+                            .store(lamports(sa.min_amount_sol).max(1), Ordering::Relaxed);
+                        self.live
+                            .max_amount_lamports
+                            .store(lamports(sa.max_amount_sol).max(1), Ordering::Relaxed);
+                        self.live
+                            .min_trigger_lamports
+                            .store(lamports(sa.min_trigger_sol), Ordering::Relaxed);
+                        self.live
+                            .meteora_fee_bps
+                            .store(sa.meteora_fee_bps, Ordering::Relaxed);
+                        eprintln!(
+                            "[shred-arb] config reloaded: disable_preempt={} force_send={} \
+                             gate_sends={} min={} max={} trigger={} met_fee_bps={}",
+                            sa.disable_preempt,
+                            sa.force_send_profitable,
+                            cfg.simulation.gate_sends,
+                            self.live.min_amount_lamports(),
+                            self.live.max_amount_lamports(),
+                            self.live.min_trigger_lamports(),
+                            sa.meteora_fee_bps,
+                        );
+                    }
+                    Err(e) => {
+                        warn!(path = %config_path, error = %e, "config hot-reload failed");
+                    }
+                }
+
+                // 2) mix.json → add any new pairs (idempotent).
+                if let Some(mgr) = &self.manager {
+                    match crate::pool_registry::load_pairs(&mix_path) {
+                        Ok(pairs) => {
+                            let mut added = 0usize;
+                            for p in pairs {
+                                let known = self
+                                    .registry
+                                    .get(&p.pump.pool)
+                                    .map(|e| e.iter().any(|q| q.meteora.pool == p.meteora.pool))
+                                    .unwrap_or(false);
+                                if known {
+                                    continue;
+                                }
+                                if mgr.add_pair(p).await.is_ok() {
+                                    added += 1;
+                                }
+                            }
+                            if added > 0 {
+                                eprintln!("[shred-arb] mix.json reloaded: {added} new pair(s) added");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(path = %mix_path, error = %e, "mix.json hot-reload failed");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     pub fn spawn_state_evaluator(self: Arc<Self>, interval_ms: u64) {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms.max(50)));
@@ -514,7 +683,7 @@ impl ShredArbEngine {
         self.signals_received.fetch_add(1, Ordering::Relaxed);
         // Record the observed tx signature for this pool (for the fee-audit log).
         self.last_shred_sig.insert(sig.pool, sig.sig);
-        if sig.quote_amount < self.params.min_trigger_lamports {
+        if sig.quote_amount < self.live.min_trigger_lamports() {
             self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -607,7 +776,7 @@ impl ShredArbEngine {
                     .iter()
                     .find(|p| p.meteora.pool == met_pool)
                     .and_then(|p| {
-                        let fee_num = self.params.meteora_fee_bps.saturating_mul(100_000);
+                        let fee_num = self.live.meteora_fee_bps().saturating_mul(100_000);
                         self.pool_state
                             .meteora_pool(&met_pool, fee_num, self.params.meteora_fee_worst_case)
                             .map(|base| {
@@ -691,7 +860,7 @@ impl ShredArbEngine {
 
         // 2) Meteora state.
         // config fallback fee is in bps; convert to the 1e9-denominated numerator.
-        let fallback_fee_numerator = self.params.meteora_fee_bps.saturating_mul(100_000);
+        let fallback_fee_numerator = self.live.meteora_fee_bps().saturating_mul(100_000);
         let meteora = match meteora_override {
             // Scenario B: competitor's Meteora leg already applied on top of the
             // confirmed decode. Base decode still gates staleness below.
@@ -835,14 +1004,14 @@ impl ShredArbEngine {
             return;
         }
         let liq_ceiling = ((buy_wsol_reserve as f64) * self.params.max_price_impact) as u64;
+        let min_amount = self.live.min_amount_lamports();
         let hi = self
-            .params
-            .max_amount_lamports
+            .live
+            .max_amount_lamports()
             .min(liq_ceiling)
-            .max(self.params.min_amount_lamports);
+            .max(min_amount);
 
-        let (opt_x, opt_net) =
-            optimize_size(self.params.min_amount_lamports, hi, required_extra, &eval);
+        let (opt_x, opt_net) = optimize_size(min_amount, hi, required_extra, &eval);
 
         // Track how close we get, even when nothing is profitable, for tuning.
         self.best_net_seen
@@ -880,7 +1049,7 @@ impl ShredArbEngine {
             // Diagnose: if even a tiny buy is infeasible, the Meteora side is
             // range-exhausted (a real gap we simply cannot cross) rather than
             // the gap being too small.
-            if eval(self.params.min_amount_lamports.max(1_000)).is_none() {
+            if eval(min_amount.max(1_000)).is_none() {
                 self.skip_uncrossable.fetch_add(1, Ordering::Relaxed);
             }
             self.not_profitable.fetch_add(1, Ordering::Relaxed);
@@ -889,7 +1058,7 @@ impl ShredArbEngine {
 
         // Enter slightly below the optimum for slippage headroom.
         let best_x = (((opt_x as f64) * (1.0 - self.params.size_safety_margin)) as u64)
-            .max(self.params.min_amount_lamports);
+            .max(min_amount);
         let best_out = match eval(best_x) {
             Some(o) => o,
             None => {
@@ -992,6 +1161,10 @@ impl ShredArbEngine {
             amount_in: best_x,
             min_out: onchain_floor,
             tfee_bps: tfee_bps as u16,
+            met_slot_at_calc: self
+                .pool_state
+                .last_update_slot(&pair.meteora.pool)
+                .unwrap_or(0),
         };
         self.execute(pair, key, buy_kind, sell_kind, best_x, onchain_floor, best_out, tip, recheck)
             .await;
@@ -1007,13 +1180,18 @@ impl ShredArbEngine {
     /// reproduces exactly that revert. Dropping such txs here is precisely the
     /// "don't send doomed txs" behaviour the operator asked for.
     ///
-    /// Returns `true` (allow send) when simulation is disabled, so the gate is a
-    /// no-op unless `[simulation].enabled = true`.
+    /// Returns `true` (allow send) unless the sim is BOTH built AND allowed to
+    /// gate (`[simulation].gate_sends = true`). When gating is off this returns
+    /// immediately — no LiteSVM run, no latency on the hot send path — so a
+    /// mis-simulating pool can never silently halt trading.
     async fn sim_check(
         &self,
         tx: &solana_sdk::transaction::VersionedTransaction,
         token: &str,
     ) -> bool {
+        if !self.live.sim_gate_sends() {
+            return true; // gating disabled → don't even run the sim
+        }
         let (pool, cache) = match (&self.sim_pool, &self.sim_cache) {
             (Some(p), Some(c)) => (p.clone(), c.clone()),
             _ => return true, // simulation off → allow
@@ -1114,7 +1292,7 @@ impl ShredArbEngine {
         // De-dupe: don't blast the same pool with identical txs while an earlier
         // one is still unconfirmed. Kept SMALL and configurable (send_dedup_ms,
         // 0 = off) so multiple distinct opportunities in one block can each send.
-        if self.params.send_dedup_ms > 0 && !self.params.force_send_profitable {
+        if self.params.send_dedup_ms > 0 && !self.live.force_send_profitable() {
             if let Some(prev) = self.last_sent.get(&key) {
                 if prev.elapsed() < Duration::from_millis(self.params.send_dedup_ms) {
                     self.nosend_dedup.fetch_add(1, Ordering::Relaxed);
@@ -1426,26 +1604,26 @@ impl ShredArbEngine {
                 return;
             }
 
-            // Last-moment freshness gate: if the pool moved against us while we
-            // fetched quotes/built the tx (a competitor's trade landed), this tx
-            // would revert — skip it instead of sending a doomed tx. Disabled by
-            // `disable_preempt` / `force_send_profitable`: we already model both
-            // the reverted- and landed-competitor states, so the recheck only
-            // suppresses good sends.
-            let preempt_on = !self.params.disable_preempt && !self.params.force_send_profitable;
+            // Last-moment freshness gate. `still_profitable` ONLY blocks when the
+            // Meteora pool's gRPC state has actually ADVANCED since we computed
+            // (and then only if the recomputed trade is no longer profitable) —
+            // an unchanged pool always sends. Disabled entirely by
+            // `disable_preempt` / `force_send_profitable`.
+            let preempt_on =
+                !self.live.disable_preempt() && !self.live.force_send_profitable();
             if preempt_on && !self.still_profitable(&recheck) {
                 self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
                 crate::errlog::log(
                     "not-sent",
-                    &format!("token={token} reason=preempted (pool moved before send)"),
+                    &format!("token={token} reason=preempted (meteora state moved and no longer profitable)"),
                 );
                 return;
             }
 
-            // LiteSVM pre-send gate: execute the EXACT tx locally against live
-            // pool state. Drop it if it would revert (no-op when sim disabled).
+            // LiteSVM pre-send gate: only BLOCKS when [simulation].gate_sends is
+            // on. Off by default so a mis-simulating pool never halts trading.
             if !self.sim_check(&tx, &token).await {
-                self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
+                self.nosend_sim.fetch_add(1, Ordering::Relaxed);
                 return;
             }
 
@@ -1579,24 +1757,22 @@ impl ShredArbEngine {
             return;
         }
 
-        // Last-moment freshness gate (same as the direct path): skip if the pool
-        // moved against us during the compute window (would revert). Disabled by
-        // `disable_preempt` / `force_send_profitable` — this is the JITO path the
-        // bundle sender actually uses, so it must honour the toggle too.
-        let preempt_on = !self.params.disable_preempt && !self.params.force_send_profitable;
+        // Last-moment freshness gate (same as the direct path): only blocks if
+        // the Meteora gRPC state advanced since calc AND the recomputed trade is
+        // no longer profitable. Disabled by disable_preempt / force_send_profitable.
+        let preempt_on = !self.live.disable_preempt() && !self.live.force_send_profitable();
         if preempt_on && !self.still_profitable(&recheck) {
             self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
             crate::errlog::log(
                 "not-sent",
-                &format!("token={token} reason=preempted (pool moved before send)"),
+                &format!("token={token} reason=preempted (meteora state moved and no longer profitable)"),
             );
             return;
         }
 
-        // LiteSVM pre-send gate (same as the direct path): execute the EXACT
-        // bundle tx locally against live pool state and drop it if it reverts.
+        // LiteSVM pre-send gate — only BLOCKS when [simulation].gate_sends is on.
         if !self.sim_check(&tx, &token).await {
-            self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
+            self.nosend_sim.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
@@ -1652,6 +1828,18 @@ impl ShredArbEngine {
     /// Meteora reading we do NOT block (return true) — better to try than to
     /// stall on a cache gap.
     fn still_profitable(&self, r: &Recheck) -> bool {
+        // Only the Meteora pool advancing on gRPC can invalidate the trade (the
+        // Pump side is held at our predicted post-trade reserves). If the pool
+        // account has NOT changed since we computed, nothing moved → send as-is.
+        let cur_slot = self
+            .pool_state
+            .last_update_slot(&r.met_pool)
+            .unwrap_or(0);
+        if cur_slot <= r.met_slot_at_calc {
+            return true;
+        }
+        // The pool moved — recompute against the fresh state and only block if
+        // the trade is genuinely no longer profitable.
         let met = match self.pool_state.meteora_pool(&r.met_pool, r.fallback_fee, self.params.meteora_fee_worst_case) {
             Some(m) => m,
             None => return true,
@@ -1854,7 +2042,7 @@ impl ShredArbEngine {
                     "\n[shred-arb 30s] watching_pools={}\n\
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
-                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
+                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={} sim_dropped={}\n\
                      SIM     : ok={} reverted={} | scenario_b={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
@@ -1882,6 +2070,7 @@ impl ShredArbEngine {
                     self.nosend_too_locks.load(Ordering::Relaxed),
                     self.nosend_send_err.load(Ordering::Relaxed),
                     self.nosend_preempted.load(Ordering::Relaxed),
+                    self.nosend_sim.load(Ordering::Relaxed),
                     self.sim_ok.load(Ordering::Relaxed),
                     self.sim_reverted.load(Ordering::Relaxed),
                     self.scenario_b_launched.load(Ordering::Relaxed),

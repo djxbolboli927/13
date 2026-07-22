@@ -335,6 +335,7 @@ fn spawn_shred_arb(
         jito_tip_min_lamports: sa.jito_tip_min_lamports,
         jito_tip_profit_fraction: sa.jito_tip_profit_fraction,
         meteora_fee_bps: sa.meteora_fee_bps,
+        sim_gate_sends: config.simulation.gate_sends,
         // Key competitor wallets for the two-scenario prediction; fall back to
         // the mining target wallets when a dedicated list isn't configured.
         key_wallets: if sa.key_wallets.is_empty() {
@@ -465,16 +466,25 @@ fn spawn_shred_arb(
                 Arc::new(pool_state.clone()),
                 simulation.rpc_calls_per_sec,
             );
-            // Seed owner/lamports for the wallet, its WSOL ATA and each pair's
-            // token ATA (the pool/vault/mint bases are seeded lazily on the
-            // first sim, then overlaid live). Rate-limited inside get_or_fetch.
+            // Seed owner/lamports for the wallet, its WSOL ATA, each pair's token
+            // ATA, AND the pool/vault/mint bases — so once gating is enabled the
+            // hot-path sim never does an RPC (data is overlaid live from the
+            // pool-state cache). Rate-limited (5/sec) inside get_or_fetch; this
+            // is a one-time startup cost.
             let mut warm = vec![trading_keypair.pubkey(), wsol_ata];
             for p in &pairs {
                 warm.push(spl_associated_token_account::get_associated_token_address(
                     &trading_keypair.pubkey(),
                     &p.token_mint,
                 ));
+                warm.push(p.meteora.pool);
+                warm.push(p.pump.pool);
+                warm.push(p.pump.token_vault());
+                warm.push(p.pump.wsol_vault());
+                warm.push(p.token_mint);
             }
+            warm.sort_unstable();
+            warm.dedup();
             cache.prefetch(&warm);
             match litesvm_sim::SimulatorPool::new(
                 simulation.workers,
@@ -801,6 +811,11 @@ fn spawn_shred_arb(
         // Second opportunity source: re-assess all pairs from current state
         // every 200ms, not only when a Pump shred fires.
         engine.clone().spawn_state_evaluator(200);
+        // Hot-reload config.toml (tuning knobs) + mix.json (new pools) every 5
+        // minutes so retuning/adding pools needs no restart.
+        engine
+            .clone()
+            .spawn_hot_reload("config.toml".to_string(), sa.mix_cache_path.clone(), 300);
         eprintln!("[shred-arb] strategy started");
         engine.run(rx).await;
     });
