@@ -171,8 +171,8 @@ proxy_extra_args = []
 # فرصت‌ها بود، چون هم محاسبه و هم شبیه‌ساز روی همین وضعیت کار می‌کنند. حالا
 # به gRPC پولیِ خودتان (shyft) تغییر کرد که تأخیرش نزدیک صفر است. اگر باز هم
 # behind زیاد دیدید، یعنی این endpoint هم کند است؛ endpoint سریع‌تری بگذارید.
-pool_state_endpoint = "https://grpc.fra.shyft.to"
-pool_state_x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
+pool_state_endpoint = "https://https://fra.grpc.solami.dev"
+pool_state_x_token = "f6ycmGAItFmy7IFm"
 # فایل کش مشترک با متیس — ربات و متیس دقیقاً از یک لیست استخر استفاده می‌کنند.
 mix_cache_path = "/root/g/metis/1/mix.json"
 # کیپر whitelist‌شده‌ی ShredStream (توسط پروکسی استفاده می‌شود؛ اینجا برای مرجع).
