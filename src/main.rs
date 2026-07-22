@@ -466,11 +466,11 @@ fn spawn_shred_arb(
                 Arc::new(pool_state.clone()),
                 simulation.rpc_calls_per_sec,
             );
-            // Seed owner/lamports for the wallet, its WSOL ATA, each pair's token
-            // ATA, AND the pool/vault/mint bases — so once gating is enabled the
-            // hot-path sim never does an RPC (data is overlaid live from the
-            // pool-state cache). Rate-limited (5/sec) inside get_or_fetch; this
-            // is a one-time startup cost.
+            // Seed base owner/lamports for the wallet, WSOL ATA, token ATAs, and
+            // each pair's pool/vault/mint — so once gating is enabled the hot-path
+            // sim never does an RPC (live data is overlaid from the pool-state
+            // cache). Done in the BACKGROUND (rate-limited 5/sec) so trading starts
+            // immediately; gating defaults off anyway.
             let mut warm = vec![trading_keypair.pubkey(), wsol_ata];
             for p in &pairs {
                 warm.push(spl_associated_token_account::get_associated_token_address(
@@ -485,7 +485,10 @@ fn spawn_shred_arb(
             }
             warm.sort_unstable();
             warm.dedup();
-            cache.prefetch(&warm);
+            {
+                let cache = cache.clone();
+                tokio::task::spawn_blocking(move || cache.prefetch(&warm));
+            }
             match litesvm_sim::SimulatorPool::new(
                 simulation.workers,
                 &simulation.so_dir,
