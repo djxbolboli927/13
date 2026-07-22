@@ -103,6 +103,12 @@ pub struct ShredConsumer {
     /// on a watched pool, fed to the AltRegistry so it can pick the best table.
     alt_candidate_tx: std::sync::RwLock<Option<mpsc::Sender<(Pubkey, Vec<Pubkey>)>>>,
     pub metrics: Arc<ShredMetrics>,
+    /// When false (default now), the Meteora leg of a competitor arb tx is NOT
+    /// extracted: every Pump instruction is treated as plain Pump activity and
+    /// accumulated. Meteora pools now trade almost only via Pump (3-market
+    /// restriction), so their state change on gRPC is enough — we don't need to
+    /// read Meteora legs off shreds.
+    fetch_meteora: bool,
 }
 
 impl ShredConsumer {
@@ -111,6 +117,7 @@ impl ShredConsumer {
         target_pools: HashSet<Pubkey>,
         alt_map: HashMap<Pubkey, Vec<Pubkey>>,
         rpc: Arc<solana_client::rpc_client::RpcClient>,
+        fetch_meteora: bool,
     ) -> Self {
         let metrics = Arc::new(ShredMetrics::default());
         metrics
@@ -127,6 +134,7 @@ impl ShredConsumer {
             pending_alts: std::sync::Mutex::new(HashSet::new()),
             alt_candidate_tx: std::sync::RwLock::new(None),
             metrics,
+            fetch_meteora,
         }
     }
 
@@ -296,7 +304,14 @@ impl ShredConsumer {
         // so we can advance our cached Meteora price from it — even though we never
         // receive standalone Meteora shreds. Extract (meteora_pool, amount_in);
         // direction is resolved by the engine as the opposite of the Pump leg.
-        let meteora = self.find_meteora_swap(msg, &full_keys);
+        // Meteora-leg extraction disabled by default: with the 3-market
+        // restriction every arb tx's Pump leg is real Pump flow we should
+        // accumulate, so we let it fall through as a plain Pump swap.
+        let meteora = if self.fetch_meteora {
+            self.find_meteora_swap(msg, &full_keys)
+        } else {
+            None
+        };
 
         // The ALT keys this tx used — candidates for whichever watched pool it
         // touches (fed to the AltRegistry, which picks the best-coverage table).

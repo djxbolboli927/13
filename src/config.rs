@@ -259,6 +259,11 @@ pub struct ShredArbConfig {
     /// alone. Default false.
     #[serde(default)]
     pub split_legs: bool,
+    /// Extract the Meteora leg of competitor arb txs off shreds. Default false:
+    /// with the 3-market restriction we accumulate every Pump instruction as
+    /// plain Pump flow and rely on Meteora's own gRPC state change.
+    #[serde(default)]
+    pub fetch_meteora_shreds: bool,
     /// Worst-case Meteora fee: price the volatility (dynamic) fee at the pool's
     /// `max_volatility_accumulator` ceiling so the fee is never understated
     /// (kills phantom profit on volatile new pools). Default false.
@@ -465,6 +470,7 @@ impl Default for ShredArbConfig {
             send_dedup_ms: default_send_dedup_ms(),
             instructions_pp: true,
             split_legs: false,
+            fetch_meteora_shreds: false,
             meteora_fee_worst_case: false,
             min_pool_wsol_lamports: default_min_pool_wsol_lamports(),
             fee_audit_log_secs: default_fee_audit_log_secs(),

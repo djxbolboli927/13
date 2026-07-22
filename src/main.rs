@@ -542,6 +542,7 @@ fn spawn_shred_arb(
             target_pools,
             alt_map,
             rpc_client.clone(),
+            sa.fetch_meteora_shreds,
         ));
         let shred_metrics = consumer.metrics.clone();
         consumer.clone().spawn(tx);
