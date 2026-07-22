@@ -381,12 +381,21 @@ error_log_dir = "/root/g"
 # این ولت‌ها را می‌کاویم و استخرهای مشترک Pump/Meteora آن‌ها را هم به ربات و هم به
 # متیس اضافه می‌کنیم. خالی = خاموش. می‌توانید چند ولت بگذارید.
 target_wallets = [
-  "7DxeUQ1TQ2wnYKc3vxPsvr6c93vGUBJSuRdP9R6WueGL",
-  "iGhZqmSdMBR8k4Ua3ViwsdXENAd8MTGqZKX9ARVbRkg",
   "HuTshmtwcQkWBLzgW3m4uwcmik7Lmz4YFpYcTqMJpXiP",
+  "7DxeUQ1TQ2wnYKc3vxPsvr6c93vGUBJSuRdP9R6WueGL",
+  "DcQNaByvstRZCERvb9UJHgHiQe8YX2FMdPptM86psQyz",
+  "iGhZqmSdMBR8k4Ua3ViwsdXENAd8MTGqZKX9ARVbRkg",
+  "29eV5LuZwwVaoufKr5ShBejYVP6N4JZ14U3M5rffXsjp",
 ]
 # پاس اول کامل است (آخرین ~۱۰۰۰ تراکنش هر ولت). هر پاس بعدی «افزایشی» است و فقط
 # تراکنش‌های جدیدتر از آخرین دیده‌شده را می‌گیرد، پس سربک بسیار کم است و می‌توان
 # هر ۵ دقیقه اجرا کرد تا استخرها همیشه تازه بمانند.
 wallet_mine_interval_secs = 300
 wallet_mine_tx_limit = 1000
+# اسکن رقبا روی این endpointها به‌صورت round-robin پخش می‌شود، هرکدام با گیت
+# نرخ جدا (۵ فراخوان در ثانیه) تا دیگر خطای 429 نگیریم. خالی = فقط secondary_url.
+wallet_mine_rpc_urls = [
+  "https://rpc.fra.shyft.to/?api_key=9ivFV0BIFM_lLrob",
+  "https://rpc.fra.shyft.to?api_key=UHuyEj8zU19wcFMk",
+]
+wallet_mine_rpc_calls_per_sec = 5

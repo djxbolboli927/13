@@ -285,6 +285,14 @@ pub struct ShredArbConfig {
     /// How many recent signatures per wallet to scan each pass. Default 1000.
     #[serde(default = "default_wallet_mine_tx_limit")]
     pub wallet_mine_tx_limit: usize,
+    /// Extra RPC endpoints the wallet miner + pool discovery round-robin across
+    /// (each with its own rate gate) so competitor scanning never trips a single
+    /// endpoint's 429. Empty = use only [rpc].secondary_url.
+    #[serde(default)]
+    pub wallet_mine_rpc_urls: Vec<String>,
+    /// Max RPC calls/sec PER endpoint for competitor scanning (shyft caps at 5).
+    #[serde(default = "default_wallet_mine_rps")]
+    pub wallet_mine_rpc_calls_per_sec: u32,
     /// File that persists our self-owned ALT pubkey(s) so a restart reuses the
     /// same on-chain table(s) instead of leaking rent. Default /root/g/our_alt.txt.
     #[serde(default = "default_alt_store_path")]
@@ -394,6 +402,9 @@ fn default_wallet_mine_interval_secs() -> u64 {
 fn default_wallet_mine_tx_limit() -> usize {
     1000
 }
+fn default_wallet_mine_rps() -> u32 {
+    5
+}
 
 impl Default for ShredArbConfig {
     fn default() -> Self {
@@ -450,6 +461,8 @@ impl Default for ShredArbConfig {
             target_wallets: Vec::new(),
             wallet_mine_interval_secs: default_wallet_mine_interval_secs(),
             wallet_mine_tx_limit: default_wallet_mine_tx_limit(),
+            wallet_mine_rpc_urls: Vec::new(),
+            wallet_mine_rpc_calls_per_sec: default_wallet_mine_rps(),
             alt_store_path: default_alt_store_path(),
             never_close_pools: true,
             idle_token_check_secs: default_idle_check_secs(),

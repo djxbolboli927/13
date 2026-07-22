@@ -704,10 +704,15 @@ fn spawn_shred_arb(
         // Wallet-transaction pool miner: mine competitors' recent txs for hot
         // shared Pump/Meteora pools and add them (bot + Metis) every 30 min.
         if !sa.target_wallets.is_empty() {
+            // High-volume competitor-tx scanning goes on the secondary RPC plus
+            // any extra endpoints, round-robined and rate-gated (5/sec each).
+            let mut miner_rpc_urls = sa.wallet_mine_rpc_urls.clone();
+            if miner_rpc_urls.is_empty() {
+                miner_rpc_urls.push(rpc_secondary.url());
+            }
             let miner = wallet_miner::WalletMiner::new(
                 wallet_miner::WalletMinerConfig {
-                    // High-volume competitor-tx scanning goes on the secondary RPC.
-                    rpc_url: rpc_secondary.url(),
+                    rpc_urls: miner_rpc_urls,
                     wallets: sa.target_wallets.clone(),
                     interval: std::time::Duration::from_secs(
                         sa.wallet_mine_interval_secs.max(60),
@@ -715,6 +720,7 @@ fn spawn_shred_arb(
                     tx_limit: sa.wallet_mine_tx_limit.max(1),
                     min_pump_wsol_lamports: sa.discovery_min_pump_wsol_lamports,
                     min_meteora_wsol_lamports: sa.discovery_min_meteora_wsol_lamports,
+                    rpc_calls_per_sec: sa.wallet_mine_rpc_calls_per_sec,
                 },
                 pool_manager.clone(),
                 rpc_secondary.clone(),

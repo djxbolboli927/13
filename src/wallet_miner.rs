@@ -42,12 +42,37 @@ use crate::pool_registry::{ArbPair, PoolInfo};
 use crate::transaction::deserialize_alt_addresses;
 
 pub struct WalletMinerConfig {
-    pub rpc_url: String,
+    /// One or more RPC endpoints to round-robin across (each rate-gated). The
+    /// miner never re-fetches pool state on the hot path — this is background
+    /// competitor discovery, kept entirely off the trading RPC.
+    pub rpc_urls: Vec<String>,
     pub wallets: Vec<String>,
     pub interval: Duration,
     pub tx_limit: usize,
     pub min_pump_wsol_lamports: u64,
     pub min_meteora_wsol_lamports: u64,
+    /// Max JSON-RPC calls/sec PER endpoint (shyft caps at 5).
+    pub rpc_calls_per_sec: u32,
+}
+
+/// One RPC endpoint plus its own rate gate (last-call timestamp). Round-robin
+/// across a Vec of these spreads load and keeps each under its 429 ceiling.
+struct RpcEndpoint {
+    url: String,
+    min_interval: Duration,
+    gate: tokio::sync::Mutex<std::time::Instant>,
+}
+
+impl RpcEndpoint {
+    /// Wait until this endpoint is allowed to make its next call, then stamp it.
+    async fn acquire(&self) {
+        let mut last = self.gate.lock().await;
+        let elapsed = last.elapsed();
+        if elapsed < self.min_interval {
+            tokio::time::sleep(self.min_interval - elapsed).await;
+        }
+        *last = std::time::Instant::now();
+    }
 }
 
 pub struct WalletMiner {
@@ -55,6 +80,9 @@ pub struct WalletMiner {
     manager: Arc<PoolManager>,
     rpc: Arc<RpcClient>,
     http: reqwest::Client,
+    /// Round-robin pool of rate-gated RPC endpoints for JSON-RPC scanning.
+    endpoints: Vec<Arc<RpcEndpoint>>,
+    next_endpoint: std::sync::atomic::AtomicUsize,
     /// Pools already fetched+decoded (added or ruled out) so repeat passes skip
     /// the on-chain read.
     seen_pools: HashSet<Pubkey>,
@@ -78,11 +106,30 @@ impl WalletMiner {
             .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_default();
+        let min_interval =
+            Duration::from_millis(1000 / cfg.rpc_calls_per_sec.max(1) as u64);
+        let endpoints: Vec<Arc<RpcEndpoint>> = cfg
+            .rpc_urls
+            .iter()
+            .filter(|u| !u.trim().is_empty())
+            .map(|u| {
+                Arc::new(RpcEndpoint {
+                    url: u.clone(),
+                    min_interval,
+                    // Stagger so the first calls don't all fire at once.
+                    gate: tokio::sync::Mutex::new(
+                        std::time::Instant::now() - Duration::from_secs(1),
+                    ),
+                })
+            })
+            .collect();
         Self {
             cfg,
             manager,
             rpc,
             http,
+            endpoints,
+            next_endpoint: std::sync::atomic::AtomicUsize::new(0),
             seen_pools: HashSet::new(),
             newest_sig: HashMap::new(),
             alt_members: HashMap::new(),
@@ -439,21 +486,44 @@ impl WalletMiner {
         Ok((out, alt_keys))
     }
 
-    /// One JSON-RPC POST to the configured RPC endpoint.
+    /// One JSON-RPC POST. Picks the next endpoint round-robin and waits on that
+    /// endpoint's rate gate first, so no single endpoint exceeds its 429 limit.
+    /// On a 429 it retries once on the NEXT endpoint (which has its own gate).
     async fn rpc_call(&self, method: &str, params: Value) -> Result<Value> {
+        use std::sync::atomic::Ordering;
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": method, "params": params
         });
-        let resp = self
-            .http
-            .post(&self.cfg.rpc_url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        Ok(resp)
+        let n = self.endpoints.len();
+        if n == 0 {
+            return Err(anyhow::anyhow!("wallet miner has no rpc endpoints configured"));
+        }
+        let start = self.next_endpoint.fetch_add(1, Ordering::Relaxed);
+        // Try each endpoint at most once (handles a transient 429 by rotating).
+        let attempts = n.max(1);
+        let mut last_err: Option<anyhow::Error> = None;
+        for i in 0..attempts {
+            let ep = &self.endpoints[(start + i) % n];
+            ep.acquire().await;
+            match self
+                .http
+                .post(&ep.url)
+                .json(&body)
+                .send()
+                .await
+                .and_then(|r| r.error_for_status())
+            {
+                Ok(resp) => match resp.json::<Value>().await {
+                    Ok(v) => return Ok(v),
+                    Err(e) => last_err = Some(e.into()),
+                },
+                Err(e) => {
+                    // 429 (or other) → rotate to the next endpoint and retry.
+                    last_err = Some(e.into());
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no rpc endpoints configured")))
     }
 }
 
