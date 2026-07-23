@@ -36,6 +36,19 @@ use tracing::{info, warn};
 use crate::dex_ids::{
     meteora_program, pumpfun_program, DexKind, METEORA_DAMM_V2_PROGRAM, PUMPFUN_AMM_PROGRAM,
 };
+
+/// Meteora Dynamic Bonding Curve program — the 3rd allowed market.
+const METEORA_DBC_PROGRAM: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
+
+/// The exactly-three market programs a token may trade on. Any pool owned by a
+/// different program disqualifies the whole token.
+fn allowed_market_programs() -> [Pubkey; 3] {
+    [
+        pumpfun_program(),                              // Pump.fun AMM (pAMMBay…)
+        meteora_program(),                              // Meteora DAMM v2 (cpamdp…)
+        Pubkey::from_str(METEORA_DBC_PROGRAM).unwrap(), // Meteora DBC (dbcij3…)
+    ]
+}
 use crate::discovery::decode_pool;
 use crate::pool_manager::PoolManager;
 use crate::pool_registry::{ArbPair, PoolInfo};
@@ -48,6 +61,9 @@ pub struct WalletMinerConfig {
     pub tx_limit: usize,
     pub min_pump_wsol_lamports: u64,
     pub min_meteora_wsol_lamports: u64,
+    /// DexScreener token-pairs URL (`{mint}` placeholder) used to enforce the
+    /// market screen (3 allowed programs + WSOL side). Empty = screen off.
+    pub token_pairs_url: String,
 }
 
 pub struct WalletMiner {
@@ -164,6 +180,12 @@ impl WalletMiner {
             let Some(meteora) = meteoras.get(&token).cloned() else {
                 continue; // one-sided this pass; a later pass may pair it
             };
+            // Market screen: only tokens whose EVERY market is on the 3 allowed
+            // programs AND WSOL-paired (multi-market tokens draw the CPI arb
+            // bots whose churn wrecks the Pump prediction).
+            if !self.only_allowed_markets(&token).await {
+                continue;
+            }
             if !self.passes_liquidity(&pump, &meteora).await {
                 continue;
             }
@@ -229,6 +251,76 @@ impl WalletMiner {
     }
 
     /// Liquidity / not-rugged gates (same thresholds as API discovery).
+
+    /// True ONLY if every on-chain market for `mint` passes the screen:
+    /// (a) WSOL on one side of EVERY pair, and (b) owner is one of the
+    /// exactly-three allowed programs (Pump.fun AMM, Meteora DAMM v2, Meteora
+    /// DBC). Checked by PROGRAM OWNER (authoritative), not DexScreener's dexId
+    /// string (which lumps all Meteora products together). FAIL OPEN on any
+    /// inability to check — reject only on POSITIVE evidence.
+    async fn only_allowed_markets(&self, mint: &Pubkey) -> bool {
+        if self.cfg.token_pairs_url.is_empty() {
+            return true; // screen explicitly disabled
+        }
+        let url = self.cfg.token_pairs_url.replace("{mint}", &mint.to_string());
+        let body: Value = match self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return true,
+            },
+            Err(_) => return true,
+        };
+        let mut pair_pks: Vec<Pubkey> = Vec::new();
+        let wsol = crate::dex_ids::wsol_mint().to_string();
+        if let Some(pairs) = body.get("pairs").and_then(|p| p.as_array()) {
+            for pair in pairs {
+                // WSOL-side requirement (positive evidence only).
+                let base = pair
+                    .get("baseToken")
+                    .and_then(|t| t.get("address"))
+                    .and_then(|a| a.as_str());
+                let quote = pair
+                    .get("quoteToken")
+                    .and_then(|t| t.get("address"))
+                    .and_then(|a| a.as_str());
+                if let (Some(b), Some(q)) = (base, quote) {
+                    if b != wsol && q != wsol {
+                        info!(%mint, base = b, quote = q, "token rejected: market without WSOL side");
+                        return false;
+                    }
+                }
+                if let Some(a) = pair.get("pairAddress").and_then(|a| a.as_str()) {
+                    if let Ok(pk) = Pubkey::from_str(a) {
+                        pair_pks.push(pk);
+                    }
+                }
+            }
+        }
+        if pair_pks.is_empty() {
+            return true; // no market data → allow (fail open)
+        }
+        let rpc = self.rpc.clone();
+        let owners = match tokio::task::spawn_blocking(move || rpc.get_multiple_accounts(&pair_pks))
+            .await
+        {
+            Ok(Ok(v)) => v,
+            _ => return true, // RPC failed → allow (fail open)
+        };
+        let allowed = allowed_market_programs();
+        for acct in owners.iter().flatten() {
+            if !allowed.contains(&acct.owner) {
+                info!(%mint, owner = %acct.owner, "token rejected: market outside the 3 allowed programs");
+                return false;
+            }
+        }
+        true
+    }
     async fn passes_liquidity(&self, pump: &PoolInfo, meteora: &PoolInfo) -> bool {
         let rpc = self.rpc.clone();
         let pump_wsol_vault = pump.wsol_vault();

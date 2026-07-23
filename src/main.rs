@@ -699,6 +699,9 @@ fn spawn_shred_arb(
                         sa.wallet_mine_interval_secs.max(60),
                     ),
                     tx_limit: sa.wallet_mine_tx_limit.max(1),
+                    // Market screen (3 allowed programs + WSOL side) reuses the
+                    // discovery DexScreener endpoint.
+                    token_pairs_url: sa.discovery_token_pairs_url.clone(),
                     min_pump_wsol_lamports: sa.discovery_min_pump_wsol_lamports,
                     min_meteora_wsol_lamports: sa.discovery_min_meteora_wsol_lamports,
                 },

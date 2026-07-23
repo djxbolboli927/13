@@ -30,7 +30,7 @@ urls = [
     "https://tokyo.mainnet.block-engine.jito.wtf",
 ]
 uuid = "b12fdfb6-f487-4de5-99d8-c601b1ab548a"
-trading_keypair = "/root/g/wallet/wallet.json"
+trading_keypair = "/root/a/wallet/wallet.json"
 tip_min_lamports = 1000
 tip_max_lamports = 1000000
 tip_profit_percent = 0.50
@@ -102,7 +102,7 @@ endpoints = [
 ]
 # این ولت توسط جیتو whitelist شده — هیچ دارایی‌ای نگه نمی‌دارد و هیچ
 # تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
-auth_keypair = "/root/g/wallet/grpc.json"
+auth_keypair = "/root/a/wallet/grpc.json"
 max_bundles_per_second = 5
 
 [scanner]
@@ -120,7 +120,7 @@ shredstream_endpoint = "http://127.0.0.1:9999"
 # استارت خودکار پروکسی ShredStream همراه با ربات (فقط متیس جدا استارت می‌شود).
 proxy_autostart = true
 # مسیر/نام باینری پروکسی (روی PATH یا مسیر کامل).
-proxy_bin = "/root/g/jito-tools/jito-shredstream-proxy"
+proxy_bin = "/root/a/jito-tools/jito-shredstream-proxy"
 # آدرس Block Engine جیتو که پروکسی با کیپر شما به آن auth می‌کند.
 block_engine_url = "https://mainnet.block-engine.jito.wtf"
 # ریجن‌های ShredStream (حداکثر ۲ تا).
@@ -135,7 +135,7 @@ proxy_extra_args = []
 pool_state_endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
 pool_state_x_token = "cba491e2cd18e339c6517a51d4d497737cb04edd08d8915fc872c8a30cd5656a"
 # فایل کش مشترک با متیس — ربات و متیس دقیقاً از یک لیست استخر استفاده می‌کنند.
-mix_cache_path = "/root/g/metis/1/mix.json"
+mix_cache_path = "/root/a/metis/1/mix.json"
 # کیپر whitelist‌شده‌ی ShredStream (توسط پروکسی استفاده می‌شود؛ اینجا برای مرجع).
 shred_keypair = "/root/g/wallet/shred.json"
 # سقف CU برای تراکنش دو-هاپ. تراکنش‌های آربیتراژ رقبا ~178k CU مصرف می‌کنند، پس

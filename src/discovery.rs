@@ -29,6 +29,18 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::dex_ids::{meteora_program, pumpfun_program, wsol_mint, DexKind};
+
+/// Meteora Dynamic Bonding Curve program — the 3rd allowed market.
+const METEORA_DBC_PROGRAM: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
+
+/// The exactly-three market programs a token may trade on (owner check).
+fn allowed_market_programs() -> [Pubkey; 3] {
+    [
+        pumpfun_program(),
+        meteora_program(),
+        Pubkey::from_str(METEORA_DBC_PROGRAM).unwrap(),
+    ]
+}
 use crate::pool_manager::PoolManager;
 use crate::pool_registry::{ArbPair, PoolInfo};
 
@@ -303,23 +315,59 @@ impl Discovery {
     async fn fetch_candidate_pools(&self, mint: &Pubkey) -> Result<Vec<Pubkey>> {
         let url = self.cfg.token_pairs_url.replace("{mint}", &mint.to_string());
         let body: Value = self.http.get(&url).send().await?.json().await?;
-        let mut out = Vec::new();
+        // ── Market screen ─────────────────────────────────────────────────────
+        // (a) EVERY market of the token must have WSOL on one side — a pair
+        //     against USDC/another token (or a native-SOL venue) is cross-venue
+        //     flow our model can't see → reject the WHOLE token.
+        // (b) 3-market restriction by PROGRAM OWNER (authoritative): every
+        //     market must be Pump.fun AMM, Meteora DAMM v2, or Meteora DBC —
+        //     DexScreener's dexId can't tell DAMM v2 from DLMM/Pools, so one
+        //     getMultipleAccounts verifies the owners. Multi-market tokens draw
+        //     the CPI arb bots whose churn wrecks the Pump prediction.
+        // FAIL OPEN on missing data / RPC errors: reject only on POSITIVE
+        // evidence of a foreign market.
+        let mut pair_pks: Vec<Pubkey> = Vec::new();
+        let wsol = wsol_mint().to_string();
         if let Some(pairs) = body.get("pairs").and_then(|p| p.as_array()) {
             for pair in pairs {
-                let dex = pair.get("dexId").and_then(|d| d.as_str()).unwrap_or("");
-                // Pre-filter to the two venues we support; on-chain owner is the
-                // authoritative check afterwards.
-                if !(dex.contains("pump") || dex.contains("meteora")) {
-                    continue;
+                let base = pair
+                    .get("baseToken")
+                    .and_then(|t| t.get("address"))
+                    .and_then(|a| a.as_str());
+                let quote = pair
+                    .get("quoteToken")
+                    .and_then(|t| t.get("address"))
+                    .and_then(|a| a.as_str());
+                if let (Some(b), Some(q)) = (base, quote) {
+                    if b != wsol && q != wsol {
+                        debug!(%mint, base = b, quote = q, "token rejected: market without WSOL side");
+                        return Ok(Vec::new());
+                    }
                 }
                 if let Some(addr) = pair.get("pairAddress").and_then(|a| a.as_str()) {
                     if let Ok(pk) = Pubkey::from_str(addr) {
-                        out.push(pk);
+                        pair_pks.push(pk);
                     }
                 }
             }
         }
-        Ok(out)
+        if pair_pks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owners = match self.rpc.get_multiple_accounts(&pair_pks) {
+            Ok(v) => v,
+            Err(_) => return Ok(pair_pks), // RPC failed → fail open
+        };
+        let allowed = allowed_market_programs();
+        if owners
+            .iter()
+            .flatten()
+            .any(|a| !allowed.contains(&a.owner))
+        {
+            debug!(%mint, "token rejected: a market outside the 3 allowed programs");
+            return Ok(Vec::new());
+        }
+        Ok(pair_pks)
     }
 
     /// Re-check every ALREADY-TRACKED token for freshly-created counter pools:
