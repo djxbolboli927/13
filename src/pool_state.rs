@@ -116,7 +116,11 @@ pub struct PoolStateCache {
     /// (shred_block_slot advances) discards the previous block's queued swaps and
     /// restarts from confirmed state — landed ones show up as a gRPC account
     /// update, unlanded ones are moot.
-    live_pump: Arc<DashMap<Pubkey, (u64, u64, PumpPool)>>,
+    /// `(built_on_grpc_slot, shred_block_slot, inflight_count, PumpPool)`. The
+    /// count = how many in-flight Pump swaps we've folded into THIS block's
+    /// overlay (the "behind" the operator wants to see). It resets to 0 when the
+    /// gRPC confirmed state advances (new block / new account update).
+    live_pump: Arc<DashMap<Pubkey, (u64, u64, u32, PumpPool)>>,
     /// LIVE overlay of Meteora pools, keyed by pool account (only `sqrt_price`
     /// advances on a swap; liquidity/fees stay from the decoded cache).
     live_meteora: Arc<DashMap<Pubkey, (u64, MeteoraPool)>>,
@@ -599,10 +603,10 @@ impl PoolStateCache {
         // the previous block's queue (start fresh). NOTE: the caller only feeds
         // SIMPLE (non-arb) Pump swaps here — multi-hop arb legs are ignored for
         // state prediction (they mostly revert on the Meteora side).
-        let base = match self.live_pump.get(token_vault) {
-            Some(e) if e.value().0 == cur && e.value().1 == shred_slot => e.value().2,
+        let (base, count) = match self.live_pump.get(token_vault) {
+            Some(e) if e.value().0 == cur && e.value().1 == shred_slot => (e.value().3, e.value().2),
             _ => match self.pump_pool(pool, token_vault, wsol_vault, token_mint) {
-                Some(p) => p,
+                Some(p) => (p, 0),
                 None => return,
             },
         };
@@ -613,7 +617,19 @@ impl PoolStateCache {
         } else {
             base.after_observed_sell(base_amount)
         };
-        self.live_pump.insert(*token_vault, (cur, shred_slot, advanced));
+        // Count this in-flight swap (the pump "behind"); resets when `cur` moves.
+        self.live_pump.insert(*token_vault, (cur, shred_slot, count.saturating_add(1), advanced));
+    }
+
+    /// Pump "behind": how many in-flight Pump swaps are accumulated in the
+    /// current block's overlay for this vault. 0 when the overlay is stale (the
+    /// confirmed gRPC state already caught up) or absent.
+    pub fn pump_behind(&self, token_vault: &Pubkey) -> u32 {
+        let cur = self.last_update_slot(token_vault).unwrap_or(0);
+        match self.live_pump.get(token_vault) {
+            Some(e) if e.value().0 == cur => e.value().2,
+            _ => 0,
+        }
     }
 
     /// Pump pool including any live (shred-advanced) state, valid only when it is
@@ -631,7 +647,7 @@ impl PoolStateCache {
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
         if let Some(e) = self.live_pump.get(token_vault) {
             if e.value().0 == cur && e.value().1 == shred_slot {
-                return Some(e.value().2);
+                return Some(e.value().3);
             }
         }
         self.pump_pool(pool, token_vault, wsol_vault, token_mint)

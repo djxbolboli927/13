@@ -53,6 +53,9 @@ pub struct WalletMinerConfig {
     pub min_meteora_wsol_lamports: u64,
     /// Max JSON-RPC calls/sec PER endpoint (shyft caps at 5).
     pub rpc_calls_per_sec: u32,
+    /// DexScreener token-pairs URL (with `{mint}` placeholder) used to enforce
+    /// the 3-market restriction. Empty = restriction off (allow all).
+    pub token_pairs_url: String,
 }
 
 /// One RPC endpoint plus its own rate gate (last-call timestamp). Round-robin
@@ -211,6 +214,11 @@ impl WalletMiner {
             let Some(meteora) = meteoras.get(&token).cloned() else {
                 continue; // one-sided this pass; a later pass may pair it
             };
+            // 3-market restriction: skip tokens that trade anywhere outside
+            // Pump.fun / Meteora (busy multi-market tokens wreck Pump prediction).
+            if !self.only_allowed_markets(&token).await {
+                continue;
+            }
             if !self.passes_liquidity(&pump, &meteora).await {
                 continue;
             }
@@ -229,6 +237,34 @@ impl WalletMiner {
         }
         info!(added, "wallet miner pass complete");
         Ok(())
+    }
+
+    /// True if the token trades ONLY on Pump.fun / Meteora (per DexScreener).
+    /// A token with any other venue is rejected — those multi-market tokens draw
+    /// the 30-buys-per-block arb bots that wreck our Pump state prediction.
+    /// Fails OPEN (allow) if the URL is empty or the API call fails, so a
+    /// transient error never silently starves the bot of pools.
+    async fn only_allowed_markets(&self, mint: &Pubkey) -> bool {
+        if self.cfg.token_pairs_url.is_empty() {
+            return true;
+        }
+        let url = self.cfg.token_pairs_url.replace("{mint}", &mint.to_string());
+        let body: Value = match self.http.get(&url).send().await.and_then(|r| r.error_for_status()) {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return true,
+            },
+            Err(_) => return true,
+        };
+        if let Some(pairs) = body.get("pairs").and_then(|p| p.as_array()) {
+            for pair in pairs {
+                let dex = pair.get("dexId").and_then(|d| d.as_str()).unwrap_or("");
+                if !dex.is_empty() && !(dex.contains("pump") || dex.contains("meteora")) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Pick the ALT to attach to this pool. Prefer the table that literally

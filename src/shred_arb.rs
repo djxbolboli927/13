@@ -1188,6 +1188,7 @@ impl ShredArbEngine {
             predicted_out = best_out,
             net_lamports = net,
             calc_slot = self.pool_state.slot(),
+            pump_behind = self.pool_state.pump_behind(&pair.pump.token_vault()),
             "shred-arb opportunity"
         );
 

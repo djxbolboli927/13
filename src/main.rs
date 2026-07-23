@@ -743,6 +743,7 @@ fn spawn_shred_arb(
                     min_pump_wsol_lamports: sa.discovery_min_pump_wsol_lamports,
                     min_meteora_wsol_lamports: sa.discovery_min_meteora_wsol_lamports,
                     rpc_calls_per_sec: sa.wallet_mine_rpc_calls_per_sec,
+                    token_pairs_url: sa.discovery_token_pairs_url.clone(),
                 },
                 pool_manager.clone(),
                 rpc_secondary.clone(),
