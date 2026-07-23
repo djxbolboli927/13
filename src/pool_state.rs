@@ -509,20 +509,34 @@ impl PoolStateCache {
         read_u64_le(entry.value(), SPL_AMOUNT_OFFSET)
     }
 
-    /// Build a Pump.fun pool from its two vaults (base = token, quote = WSOL).
-    /// `token_mint` is used to read the token's REAL supply for the market-cap
-    /// fee tier; if the mint account isn't cached yet, supply is passed as 0 and
-    /// `PumpPool::new` fails closed to the highest fee tier.
+    /// Build a Pump.fun pool from its two vaults, normalized to base = token,
+    /// quote = WSOL. `token_mint` is used to read the token's REAL supply for
+    /// the market-cap fee tier; if the mint account isn't cached yet, supply is
+    /// passed as 0 and `PumpPool::new` fails closed to the highest fee tier.
+    ///
+    /// `token_is_base`: whether the PROGRAM's base_mint is the token (normal
+    /// pool) or WSOL (inverted pool, e.g. "WSOL-HOOD Market"). Inverted pools
+    /// are always NON-CANONICAL, and the on-chain fee program charges those the
+    /// `FeeConfig.flat_fees` — not the market-cap tiers (`inverted_pool_fee()`).
     pub fn pump_pool(
         &self,
         token_vault: &Pubkey,
         wsol_vault: &Pubkey,
         token_mint: &Pubkey,
+        token_is_base: bool,
     ) -> Option<PumpPool> {
         let base = self.spl_amount(token_vault)?;
         let quote = self.spl_amount(wsol_vault)?;
-        let supply = self.spl_mint_supply(token_mint).unwrap_or(0) as u128;
-        Some(PumpPool::new(base, quote, supply))
+        if token_is_base {
+            let supply = self.spl_mint_supply(token_mint).unwrap_or(0) as u128;
+            Some(PumpPool::new(base, quote, supply))
+        } else {
+            Some(PumpPool::new_with_fee(
+                base,
+                quote,
+                crate::pumpfun_math::inverted_pool_fee(),
+            ))
+        }
     }
 
     // ── Live state: advance pool state by in-flight shred txs ─────────────────
@@ -535,31 +549,61 @@ impl PoolStateCache {
     /// Apply an observed Pump swap (from a shred) to the live pump overlay.
     /// `shred_slot` is the shred's slot; if it's not newer than the cached state
     /// the swap is already reflected on-chain and only the base is (re)seeded.
+    ///
+    /// `kind`, `base_amount` and `quote_amount` are the RAW instruction values
+    /// (base/quote in PROGRAM terms; fees are levied on the QUOTE side). On a
+    /// normal pool base = token and the stored orientation matches; on an
+    /// INVERTED pool (base = WSOL) the same raw math is applied on the flipped
+    /// view and flipped back — the base amount is then WSOL lamports and the
+    /// fee lands on the token side, exactly like on-chain.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_pump_swap(
         &self,
         token_vault: &Pubkey,
         wsol_vault: &Pubkey,
         token_mint: &Pubkey,
-        is_buy: bool,
+        token_is_base: bool,
+        kind: crate::shred_stream::PumpIxKind,
         base_amount: u64,
+        quote_amount: u64,
         shred_slot: u64,
     ) {
+        use crate::shred_stream::PumpIxKind as K;
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
         let base = match self.live_pump.get(token_vault) {
             Some(e) if e.value().0 == cur => e.value().1,
-            _ => match self.pump_pool(token_vault, wsol_vault, token_mint) {
+            _ => match self.pump_pool(token_vault, wsol_vault, token_mint, token_is_base) {
                 Some(p) => p,
                 None => return,
             },
         };
         let advanced = if shred_slot <= cur {
             base // already on-chain / in the cache
-        } else if is_buy {
-            base.after_observed_buy(base_amount)
         } else {
-            base.after_observed_sell(base_amount)
+            let raw = if token_is_base { base } else { base.flipped() };
+            let adv = match kind {
+                K::Buy => raw.after_observed_buy(base_amount),
+                K::Sell => raw.after_observed_sell(base_amount),
+                K::BuyQuoteIn => raw.after_observed_buy_quote_in(quote_amount),
+                K::BoostBuyBurn => raw.after_observed_boost(quote_amount),
+                K::Opaque => return, // handled via invalidate_pump, never here
+            };
+            if token_is_base {
+                adv
+            } else {
+                adv.flipped()
+            }
         };
         self.live_pump.insert(*token_vault, (cur, advanced));
+    }
+
+    /// Drop the live overlay for a Pump pool — used when a shred tx touched the
+    /// pool through an instruction we can NOT decode (router / private bot CPI):
+    /// the pool is about to change by an unknown amount, so the overlay is no
+    /// longer trustworthy. Pricing falls back to the gRPC cache and the engine
+    /// gates trading until a fresh account update arrives.
+    pub fn invalidate_pump(&self, token_vault: &Pubkey) {
+        self.live_pump.remove(token_vault);
     }
 
     /// Pump pool including any live (shred-advanced) state, if it is still based
@@ -569,6 +613,7 @@ impl PoolStateCache {
         token_vault: &Pubkey,
         wsol_vault: &Pubkey,
         token_mint: &Pubkey,
+        token_is_base: bool,
     ) -> Option<PumpPool> {
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
         if let Some(e) = self.live_pump.get(token_vault) {
@@ -576,7 +621,7 @@ impl PoolStateCache {
                 return Some(e.value().1);
             }
         }
-        self.pump_pool(token_vault, wsol_vault, token_mint)
+        self.pump_pool(token_vault, wsol_vault, token_mint, token_is_base)
     }
 
     /// Apply an observed Meteora swap (from a shred) to the live meteora overlay.

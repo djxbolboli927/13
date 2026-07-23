@@ -201,6 +201,10 @@ pub struct ShredArbEngine {
     /// Last shred tx signature observed on each Pump pool — printed by the
     /// fee-audit so the operator can pull that exact tx and hand-check the fee.
     last_shred_sig: dashmap::DashMap<solana_sdk::pubkey::Pubkey, solana_sdk::signature::Signature>,
+    /// Pump pools touched by an UNDECODABLE in-flight tx (router / private-bot
+    /// CPI) → the newest such slot. Until the gRPC cache reaches that slot the
+    /// pool's true reserves are unknown, so `assess` holds trading on it.
+    dirty_pump: dashmap::DashMap<solana_sdk::pubkey::Pubkey, u64>,
     /// On-chain fate of sent txs.
     sent_stats: Arc<SentStats>,
     /// Consecutive forced-quote route failures per pair. A pair that can't be
@@ -224,6 +228,11 @@ pub struct ShredArbEngine {
     /// `meteora_max_stale_slots` — pricing off a stale sqrt_price is exactly what
     /// caused the over-prediction reverts (proven: math + decode are exact).
     skip_stale_meteora: AtomicU64,
+    /// Opaque markers received (router/private-bot tx touched a watched pool).
+    opaque_signals: AtomicU64,
+    /// Assessments skipped because the pool was dirty (undecodable in-flight tx
+    /// seen, gRPC cache not yet caught up past its slot).
+    skip_dirty_pump: AtomicU64,
     skip_bad_price: AtomicU64,
     /// Skipped because one side's WSOL depth was below min_pool_wsol_lamports
     /// (the both-sides liquidity guard). Split out of `bad_price` so the operator
@@ -284,6 +293,9 @@ enum BuyOn {
 struct Recheck {
     buy_on_pump: bool,
     token_is_a: bool,
+    /// Pump-side orientation: is the program's base mint the token? (false =
+    /// inverted pool → the pump legs run on the flipped view.)
+    pump_token_is_base: bool,
     pump_after: PumpPool,
     met_pool: solana_sdk::pubkey::Pubkey,
     fallback_fee: u64,
@@ -354,6 +366,7 @@ impl ShredArbEngine {
             last_fired: dashmap::DashMap::new(),
             last_sent: dashmap::DashMap::new(),
             last_shred_sig: dashmap::DashMap::new(),
+            dirty_pump: dashmap::DashMap::new(),
             sent_stats: Arc::new(SentStats::default()),
             route_fail: dashmap::DashMap::new(),
             load_fail: dashmap::DashMap::new(),
@@ -365,6 +378,8 @@ impl ShredArbEngine {
             skip_no_pump_state: AtomicU64::new(0),
             skip_no_meteora_state: AtomicU64::new(0),
             skip_stale_meteora: AtomicU64::new(0),
+            opaque_signals: AtomicU64::new(0),
+            skip_dirty_pump: AtomicU64::new(0),
             skip_bad_price: AtomicU64::new(0),
             skip_thin_pool: AtomicU64::new(0),
             skip_implausible: AtomicU64::new(0),
@@ -388,17 +403,24 @@ impl ShredArbEngine {
         }
     }
 
-    /// Consume signals forever. Every signal is handled on its OWN spawned task
-    /// (and inside `handle` every pair of that pool gets its own task too), so
-    /// nothing queues: signals are processed fully in parallel and a slow Metis
-    /// round-trip on one pool never delays another.
+    /// Consume signals forever. The LIVE-STATE ADVANCE runs sequentially on
+    /// THIS task, in arrival order: a tx carrying sell+buy on the same pool
+    /// emits two signals, and applying them on parallel tasks raced on the
+    /// overlay's non-atomic read-modify-write — the losing write dropped one
+    /// swap's effect. The advance is pure math (microseconds, no await), so
+    /// sequential costs nothing. Only the assessment (Metis round-trips, sends)
+    /// fans out to parallel tasks, exactly as before.
     pub async fn run(self: Arc<Self>, mut rx: mpsc::Receiver<PumpSwapSignal>) {
         info!(pools = self.registry.len(), "shred-arb engine running");
         while let Some(sig) = rx.recv().await {
-            let me = self.clone();
-            tokio::spawn(async move {
-                me.handle(sig).await;
-            });
+            if let Some((pairs, pump_after)) = self.apply_signal(&sig) {
+                for pair in pairs {
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        me.assess(&pair, pump_after).await;
+                    });
+                }
+            }
         }
     }
 
@@ -435,10 +457,12 @@ impl ShredArbEngine {
                     if !recent {
                         continue; // nothing changed → no new opportunity
                     }
-                    let pump_now = match self
-                        .pool_state
-                        .pump_pool(&pair.pump.token_vault(), &pair.pump.wsol_vault(), &pair.token_mint)
-                    {
+                    let pump_now = match self.pool_state.pump_pool(
+                        &pair.pump.token_vault(),
+                        &pair.pump.wsol_vault(),
+                        &pair.token_mint,
+                        pair.pump.token_is_a,
+                    ) {
                         Some(p) => p,
                         None => continue,
                     };
@@ -454,68 +478,110 @@ impl ShredArbEngine {
         });
     }
 
-    async fn handle(self: Arc<Self>, sig: PumpSwapSignal) {
+    /// Synchronous per-signal state advance — called SEQUENTIALLY from `run` so
+    /// multiple swaps of one tx (e.g. HOOD-style sell+buy on the same pool)
+    /// apply in instruction order with no race. Pure math, no await. Returns
+    /// the pairs to assess and the post-trade Pump state, or `None` when there
+    /// is nothing to assess (unknown pool, opaque marker, below trigger, …).
+    fn apply_signal(&self, sig: &PumpSwapSignal) -> Option<(Vec<ArbPair>, PumpPool)> {
         self.signals_received.fetch_add(1, Ordering::Relaxed);
-        // Record the observed tx signature for this pool (for the fee-audit log).
-        self.last_shred_sig.insert(sig.pool, sig.sig);
-        if sig.quote_amount < self.params.min_trigger_lamports {
-            self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
         let pairs = match self.registry.get(&sig.pool) {
             Some(p) => p.clone(),
             None => {
                 self.skip_no_pair.fetch_add(1, Ordering::Relaxed);
-                return;
+                return None;
             }
         };
         let Some(first) = pairs.first() else {
             self.skip_no_pair.fetch_add(1, Ordering::Relaxed);
-            return;
+            return None;
         };
+        // Record the observed tx signature for this pool (for the fee-audit log).
+        // AFTER the registry hit, so unknown pools can't grow the map unbounded.
+        self.last_shred_sig.insert(sig.pool, sig.sig);
 
-        // 1) Current Pump reserves (live overlay: includes any earlier shred txs
-        // on this pool not yet delivered by gRPC). The Pump vaults are identical
-        // across every pair of this pool.
+        // The Pump vaults are identical across every pair of this pool.
         let token_vault = first.pump.token_vault();
         let wsol_vault = first.pump.wsol_vault();
-        let pump_now = match self
-            .pool_state
-            .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint)
-        {
+
+        // ── Opaque marker: a router / private-bot tx touches OUR pool ────────
+        // The swap rides in a CPI we cannot decode statically, so the pool is
+        // about to change by an UNKNOWN amount. Drop the live overlay and hold
+        // trading (see the dirty gate in `assess`) until the gRPC cache has
+        // caught up past this slot. Our own in-flight arb txs also look opaque
+        // (they swap through the Metis route program) — never self-gate.
+        if sig.kind == crate::shred_stream::PumpIxKind::Opaque {
+            if sig.fee_payer == self.trading_keypair.pubkey() {
+                return None;
+            }
+            self.opaque_signals.fetch_add(1, Ordering::Relaxed);
+            self.pool_state.invalidate_pump(&token_vault);
+            self.dirty_pump
+                .entry(sig.pool)
+                .and_modify(|s| *s = (*s).max(sig.slot))
+                .or_insert(sig.slot);
+            return None;
+        }
+
+        // ── Orientation (THE inverted-pool fix) ──────────────────────────────
+        // `token_is_a` on the Pump side == "the program's BASE mint is the
+        // token". On an INVERTED pool (base = WSOL, e.g. WSOL-HOOD) the raw
+        // instructions flip economic meaning: `sell` = WSOL in = token BUY,
+        // `buy` = WSOL out = token SELL — and `base_amount` is WSOL lamports.
+        let token_is_base = first.pump.token_is_a;
+        // Economic direction: did this trade BUY the token (WSOL into pool)?
+        // Buy / BuyQuoteIn / BoostBuyBurn all push QUOTE in and take BASE out.
+        let quote_to_base = sig.kind != crate::shred_stream::PumpIxKind::Sell;
+        let econ_buy = if token_is_base {
+            quote_to_base
+        } else {
+            !quote_to_base
+        };
+        // SOL-side size for the triggers: normal pools → the quote limit arg (a
+        // proxy, may be u64::MAX on unlimited-slippage buys); inverted pools →
+        // `base_amount` IS the exact WSOL leg.
+        let sol_side = if token_is_base {
+            sig.quote_amount
+        } else {
+            sig.base_amount
+        };
+
+        // Current Pump reserves (live overlay: includes any earlier shred txs
+        // on this pool not yet delivered by gRPC).
+        let pump_now = match self.pool_state.pump_pool_live(
+            &token_vault,
+            &wsol_vault,
+            &first.token_mint,
+            token_is_base,
+        ) {
             Some(p) => p,
             None => {
                 self.skip_no_pump_state.fetch_add(1, Ordering::Relaxed);
                 debug!(pool = %sig.pool, "pump reserves not cached yet");
-                return;
+                return None;
             }
         };
-        // Liquidity-relative trigger: skip trades too small to move THIS pool's
-        // price meaningfully (more precise than a flat lamport threshold — a
-        // "big" trade on a thin pool is tiny on a deep one).
-        if self.params.min_trigger_reserve_frac > 0.0 {
-            let thresh =
-                (pump_now.quote_reserve as f64 * self.params.min_trigger_reserve_frac) as u64;
-            if sig.quote_amount < thresh {
-                self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        }
-        // ── Keep the LIVE state in sync with this shred ─────────────────────
-        // Persist this observed Pump swap into the live pump overlay so the NEXT
-        // shred in the same block prices against a pool that already reflects it.
+
+        // ── ALWAYS advance live state — even for trades below the trigger
+        // (small trades still move the pool; skipping them drifts the overlay).
+        // RAW values in; orientation resolved inside.
         self.pool_state.apply_pump_swap(
-            &token_vault, &wsol_vault, &first.token_mint, sig.is_buy, sig.base_amount, sig.slot,
+            &token_vault,
+            &wsol_vault,
+            &first.token_mint,
+            token_is_base,
+            sig.kind,
+            sig.base_amount,
+            sig.quote_amount,
+            sig.slot,
         );
         // If this tx also carried a Meteora leg on one of our pools (a circular
-        // arb), advance that Meteora pool's live sqrt_price too — this is the ONLY
-        // way we see Meteora activity (we get no standalone Meteora shreds), and
-        // it fixes the thin-pool staleness that caused the over-prediction.
-        // Direction: competitor Pump BUY ⇒ they SELL token into Meteora (token in
-        // ⇒ a_to_b = token_is_a); Pump SELL ⇒ they BUY token (a_to_b = !token_is_a).
+        // arb), advance that Meteora pool's live sqrt_price too. Direction from
+        // the ECONOMIC Pump side: competitor token-BUY on Pump ⇒ they SELL the
+        // token into Meteora (token in ⇒ a_to_b = token_is_a) and vice versa.
         if let (Some(mpool), Some(amt)) = (sig.meteora_pool, sig.meteora_amount_in) {
             if let Some(pair) = pairs.iter().find(|p| p.meteora.pool == mpool) {
-                let a_to_b = if sig.is_buy {
+                let a_to_b = if econ_buy {
                     pair.meteora.token_is_a
                 } else {
                     !pair.meteora.token_is_a
@@ -526,26 +592,28 @@ impl ShredArbEngine {
                 );
             }
         }
-        // Predicted post-trade Pump reserves — the live overlay now includes this
-        // shred, so read it back for pricing.
-        let pump_after = match self
-            .pool_state
-            .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint)
-        {
-            Some(p) => p,
-            None => pump_now,
-        };
-        // Assess every Meteora counter-pool of this token IN PARALLEL — each on
-        // its own task, sends go straight out with no shared queue.
-        let mut rest = pairs.into_iter();
-        let first_pair = rest.next().unwrap();
-        for pair in rest {
-            let me = self.clone();
-            tokio::spawn(async move {
-                me.assess(&pair, pump_after).await;
-            });
+
+        // ── Triggers gate ONLY the assessment, never the state advance ───────
+        if sol_side < self.params.min_trigger_lamports {
+            self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
-        self.assess(&first_pair, pump_after).await;
+        if self.params.min_trigger_reserve_frac > 0.0 {
+            let thresh =
+                (pump_now.quote_reserve as f64 * self.params.min_trigger_reserve_frac) as u64;
+            if sol_side < thresh {
+                self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+
+        // Predicted post-trade Pump reserves — the live overlay now includes
+        // this shred, so read it back for pricing.
+        let pump_after = self
+            .pool_state
+            .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint, token_is_base)
+            .unwrap_or(pump_now);
+        Some((pairs, pump_after))
     }
 
     /// Shared assessment core: read Meteora, choose direction, size the trade,
@@ -564,6 +632,27 @@ impl ShredArbEngine {
         if let Some(prev) = self.last_fired.get(&key) {
             if prev.elapsed() < Duration::from_millis(self.params.cooldown_ms) {
                 self.skip_cooldown.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        // ── Dirty-pool gate ──────────────────────────────────────────────────
+        // An in-flight tx we could NOT decode (router / private-bot CPI) touched
+        // this Pump pool in slot `d` — its reserves are about to change by an
+        // unknown amount. Pricing now risks a doomed send; hold until the gRPC
+        // cache reaches that slot, then clear the mark.
+        if let Some(d) = self.dirty_pump.get(&pair.pump.pool) {
+            let seen = *d.value();
+            drop(d);
+            let caught_up = self
+                .pool_state
+                .last_update_slot(&pair.pump.wsol_vault())
+                .unwrap_or(0)
+                >= seen;
+            if caught_up {
+                self.dirty_pump
+                    .remove_if(&pair.pump.pool, |_, s| *s <= seen);
+            } else {
+                self.skip_dirty_pump.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
@@ -653,11 +742,32 @@ impl ShredArbEngine {
             (amt as u128).saturating_sub(fee) as u64
         };
 
+        // Pump legs, orientation-exact. On an INVERTED pool (program base =
+        // WSOL) our WSOL-in buy is the program's `sell` (fee on the token OUT
+        // side) and our token-in sell is the program's `buy` (fee added on the
+        // token IN side) — run the raw math on the flipped view so the fee
+        // lands on the same side as on-chain, to the lamport.
+        let pump_token_is_base = pair.pump.token_is_a;
+        let pump_buy_leg = |p: &PumpPool, wsol_in: u64| -> u64 {
+            if pump_token_is_base {
+                p.quote_buy(wsol_in)
+            } else {
+                p.flipped().quote_sell(wsol_in)
+            }
+        };
+        let pump_sell_leg = |p: &PumpPool, token_in: u64| -> u64 {
+            if pump_token_is_base {
+                p.quote_sell(token_in)
+            } else {
+                p.flipped().quote_buy(token_in)
+            }
+        };
+
         // 4) Optimal size.
         let eval = |x: u64| -> Option<u64> {
             match buy_on {
                 BuyOn::Pump => {
-                    let base_out = pump_after.quote_buy(x);
+                    let base_out = pump_buy_leg(&pump_after, x);
                     if base_out == 0 {
                         return None;
                     }
@@ -676,7 +786,7 @@ impl ShredArbEngine {
                     if tok == 0 {
                         return None;
                     }
-                    Some(PumpPool::quote_sell(&pump_after, tok))
+                    Some(pump_sell_leg(&pump_after, tok))
                 }
             }
         };
@@ -844,6 +954,7 @@ impl ShredArbEngine {
         let recheck = Recheck {
             buy_on_pump: buy_on == BuyOn::Pump,
             token_is_a,
+            pump_token_is_base,
             pump_after,
             met_pool: pair.meteora.pool,
             fallback_fee: fallback_fee_numerator,
@@ -1393,7 +1504,12 @@ impl ShredArbEngine {
             (amt as u128).saturating_sub(fee) as u64
         };
         let out = if r.buy_on_pump {
-            let base = r.pump_after.quote_buy(r.amount_in);
+            // Orientation-exact pump buy leg (inverted pool = raw sell, flipped).
+            let base = if r.pump_token_is_base {
+                r.pump_after.quote_buy(r.amount_in)
+            } else {
+                r.pump_after.flipped().quote_sell(r.amount_in)
+            };
             if base == 0 {
                 return false;
             }
@@ -1403,7 +1519,12 @@ impl ShredArbEngine {
             match met.buy_token_with_wsol(r.amount_in, r.token_is_a) {
                 Some(base) if base > 0 => {
                     let tok = apply_tfee(apply_tfee(base));
-                    Some(PumpPool::quote_sell(&r.pump_after, tok))
+                    let o = if r.pump_token_is_base {
+                        r.pump_after.quote_sell(tok)
+                    } else {
+                        r.pump_after.flipped().quote_buy(tok)
+                    };
+                    Some(o)
                 }
                 _ => None,
             }
@@ -1523,6 +1644,7 @@ impl ShredArbEngine {
                         &pair.pump.token_vault(),
                         &pair.pump.wsol_vault(),
                         &pair.token_mint,
+                        pair.pump.token_is_a,
                     );
                     let pump_fee_bps = pump.map(|p| p.total_fee_bps).unwrap_or(0);
                     let supply = self.pool_state.spl_mint_supply(&pair.token_mint).unwrap_or(0);
@@ -1577,7 +1699,7 @@ impl ShredArbEngine {
                 let unknown = ss.unknown.load(Ordering::Relaxed);
                 eprintln!(
                     "\n[shred-arb 30s] watching_pools={}\n\
-                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}]\n\
+                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}] | opaque[seen={} dirty_skip={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
@@ -1592,6 +1714,8 @@ impl ShredArbEngine {
                     self.skip_bad_price.load(Ordering::Relaxed),
                     self.skip_thin_pool.load(Ordering::Relaxed),
                     self.skip_implausible.load(Ordering::Relaxed),
+                    self.opaque_signals.load(Ordering::Relaxed),
+                    self.skip_dirty_pump.load(Ordering::Relaxed),
                     self.sent.load(Ordering::Relaxed),
                     landed_ok,
                     reverted,

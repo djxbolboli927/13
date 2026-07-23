@@ -95,6 +95,23 @@ const FEE_TIERS: &[(u64, u64, u64)] = &[
     (0, 125, 2),
 ];
 
+/// `FeeConfig.flat_fees` read from chain at startup: `(total_bps, lp_bps)`.
+/// NON-CANONICAL pools (any pool not created by pump's migration authority —
+/// which includes EVERY inverted pool, since canonical pools always have
+/// base = token) are charged these flat fees, NOT the market-cap tier schedule.
+static FLAT_FEES: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+
+/// Fee for an INVERTED pool (base_mint = WSOL, quote = token). Inverted pools
+/// are necessarily non-canonical → the on-chain fee program applies
+/// `FeeConfig.flat_fees` to them. Fallback matches the observed real event on
+/// such a pool (WSOL-HOOD sell: lpFee 25 + protocolFee 5 = 30 bps).
+pub fn inverted_pool_fee() -> (u64, u64) {
+    if let Some(&f) = FLAT_FEES.get() {
+        return f;
+    }
+    (30, 25)
+}
+
 /// `(total_fee_bps, lp_fee_bps)` for a PumpSwap pool given its reserves and the
 /// base token's ACTUAL mint supply (base units), per the official market-cap
 /// tier schedule: `market_cap = quote_reserve * base_mint_supply / base_reserve`
@@ -152,6 +169,20 @@ pub fn load_onchain_fee_tiers(
         Pubkey::find_program_address(&[b"fee_config", pamm.as_ref()], &fee_program);
     let acct = rpc.get_account(&fee_config).ok()?;
     let d = &acct.data;
+    // flat_fees (Fees = lp/protocol/creator u64 bps) sits at [41..65] — the fee
+    // charged to NON-CANONICAL pools (all inverted pools among them). Install it
+    // for `inverted_pool_fee()`; sanity-capped like the tiers below.
+    {
+        let rd = |o: usize| -> Option<u64> {
+            d.get(o..o + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+        };
+        if let (Some(lp), Some(protocol), Some(creator)) = (rd(41), rd(49), rd(57)) {
+            let total = lp.saturating_add(protocol).saturating_add(creator);
+            if total <= 1_000 && lp <= 1_000 && protocol <= 1_000 && creator <= 1_000 {
+                let _ = FLAT_FEES.set((total, lp));
+            }
+        }
+    }
     // 8 disc + 1 bump + 32 admin + 24 flat_fees = 65, then the fee_tiers Vec.
     let mut off = 65usize;
     let len = u32::from_le_bytes(d.get(off..off + 4)?.try_into().ok()?) as usize;
@@ -211,6 +242,29 @@ impl PumpPool {
             quote_reserve,
             total_fee_bps,
             lp_fee_bps,
+        }
+    }
+
+    /// Construct with an explicitly chosen fee tier (used for INVERTED pools,
+    /// whose raw-orientation market cap always lands in the top tier).
+    pub fn new_with_fee(base_reserve: u64, quote_reserve: u64, fee: (u64, u64)) -> Self {
+        Self {
+            base_reserve,
+            quote_reserve,
+            total_fee_bps: fee.0,
+            lp_fee_bps: fee.1,
+        }
+    }
+
+    /// RAW-orientation view for INVERTED pools (program base_mint = WSOL):
+    /// swaps the reserve roles so the raw on-chain buy/sell math — base-side
+    /// exact amounts, fees levied on the QUOTE side — applies verbatim. Flip,
+    /// run the raw math, flip back. Fees carry over unchanged.
+    pub fn flipped(&self) -> PumpPool {
+        PumpPool {
+            base_reserve: self.quote_reserve,
+            quote_reserve: self.base_reserve,
+            ..*self
         }
     }
 
@@ -275,6 +329,46 @@ impl PumpPool {
         PumpPool {
             base_reserve: new_base,
             quote_reserve: new_quote,
+            ..*self
+        }
+    }
+
+    /// Apply an observed `buy_exact_quote_in` (exact-IN on the QUOTE side:
+    /// the user spends `spendable_quote_in` total, fees included, and receives
+    /// whatever base that buys). Pool: quote vault gains the pool-bound input
+    /// plus the LP fee; base vault pays out the curve amount.
+    pub fn after_observed_buy_quote_in(&self, spendable_quote_in: u64) -> PumpPool {
+        let pool_quote_in = (spendable_quote_in as u128) * BPS_DENOM as u128
+            / (BPS_DENOM + self.total_fee_bps) as u128;
+        if pool_quote_in == 0 {
+            return *self;
+        }
+        let b = self.base_reserve as u128;
+        let q = self.quote_reserve as u128;
+        let out = (b * pool_quote_in / (q + pool_quote_in)).min(b.saturating_sub(1));
+        let lp_fee = ceil_div(pool_quote_in * self.lp_fee_bps as u128, BPS_DENOM as u128);
+        PumpPool {
+            base_reserve: (b - out) as u64,
+            quote_reserve: (q + pool_quote_in + lp_fee).min(u64::MAX as u128) as u64,
+            ..*self
+        }
+    }
+
+    /// Apply an observed `boost_buy_and_burn` (pump's buyback bot): exact
+    /// `quote_amount_in` enters the quote vault from the boost vault and the
+    /// bought base is BURNED out of the base vault. No user-side fees — the
+    /// full quote lands in the pool and the curve output leaves it.
+    pub fn after_observed_boost(&self, quote_amount_in: u64) -> PumpPool {
+        let qin = quote_amount_in as u128;
+        if qin == 0 {
+            return *self;
+        }
+        let b = self.base_reserve as u128;
+        let q = self.quote_reserve as u128;
+        let out = (b * qin / (q + qin)).min(b.saturating_sub(1));
+        PumpPool {
+            base_reserve: (b - out) as u64,
+            quote_reserve: (q + qin).min(u64::MAX as u128) as u64,
             ..*self
         }
     }

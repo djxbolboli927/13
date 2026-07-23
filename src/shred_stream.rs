@@ -25,24 +25,58 @@ mod pb {
 }
 use pb::{shredstream_proxy_client::ShredstreamProxyClient, SubscribeEntriesRequest};
 
-// Anchor 8-byte discriminators for PumpSwap instructions.
+// Anchor 8-byte discriminators for EVERY PumpSwap instruction that moves value
+// through the pool vaults (missing one = mispricing the pool).
 const DISC_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 const DISC_SELL: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+/// `buy_exact_quote_in(spendable_quote_in, min_base_amount_out, …)` — exact-IN
+/// on the QUOTE side (u64 at [8..16] is QUOTE, unlike `buy` where it's base).
+const DISC_BUY_EXACT_QUOTE_IN: [u8; 8] = [198, 46, 21, 82, 180, 217, 232, 112];
+/// `boost_buy_and_burn(quote_amount_in, min_base_amount_burned)` — pump's
+/// buyback bot: quote enters the pool vault, bought base is burned out of it.
+const DISC_BOOST_BUY_AND_BURN: [u8; 8] = [105, 68, 6, 175, 0, 7, 35, 162];
 /// `withdraw` (remove liquidity) — the direct rug signal.
 const DISC_WITHDRAW: [u8; 8] = [183, 18, 70, 156, 148, 109, 161, 34];
 /// Meteora DAMM v2 `swap` anchor discriminator (sha256("global:swap")[..8]).
 const DISC_METEORA_SWAP: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
 
+/// Which PumpSwap instruction was observed — RAW program semantics, NOT the
+/// economic token direction. On a normal pool base = token, quote = WSOL; on an
+/// INVERTED pool (base_mint = WSOL, e.g. "WSOL-HOOD Market") a raw `Sell` is
+/// economically a token BUY. The ENGINE resolves the economic direction via the
+/// pool's decoded orientation (PoolInfo.token_is_a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpIxKind {
+    /// `buy`: exact `base_amount` OUT of the base vault; quote in + fees on top.
+    Buy,
+    /// `sell`: exact `base_amount` INTO the base vault; quote out − fees.
+    Sell,
+    /// `buy_exact_quote_in`: exact `quote_amount` IN (fees included); base out.
+    BuyQuoteIn,
+    /// `boost_buy_and_burn`: exact `quote_amount` into the quote vault (no user
+    /// fees); the bought base is burned out of the base vault.
+    BoostBuyBurn,
+    /// This tx references a WATCHED pool but carries NO decodable top-level
+    /// pump swap (router / private-bot CPI — Jupiter, Axiom, unknown programs).
+    /// Amounts are meaningless (zero); the pool is about to change by an
+    /// UNKNOWN amount.
+    Opaque,
+}
+
 /// A Pump.fun swap observed on ShredStream, before it reaches Metis/chain.
+/// Amounts are RAW base-mint / quote-mint side (see [`PumpIxKind`]).
 #[derive(Debug, Clone, Copy)]
 pub struct PumpSwapSignal {
     pub pool: Pubkey,
-    pub is_buy: bool,
-    /// `base_amount_out` (buy) or `base_amount_in` (sell) — the token leg.
+    pub kind: PumpIxKind,
+    /// BASE-mint-side arg: `base_amount_out` (Buy), `base_amount_in` (Sell),
+    /// `min_base_amount_out` (BuyQuoteIn), `min_base_amount_burned` (Boost).
     pub base_amount: u64,
-    /// The SOL-side limit arg (`max_quote_amount_in` / `min_quote_amount_out`),
-    /// a cheap proxy for trade size before we price it exactly.
+    /// QUOTE-mint-side arg: limit (Buy/Sell) or EXACT in (BuyQuoteIn/Boost).
     pub quote_amount: u64,
+    /// Fee payer (static key 0) — lets the engine ignore opaque markers caused
+    /// by OUR OWN in-flight transactions.
+    pub fee_payer: Pubkey,
     /// Signature of the observed on-chain tx this shred carried — recorded so the
     /// fee-audit log can print the exact tx whose fee the bot computed.
     pub sig: solana_sdk::signature::Signature,
@@ -67,6 +101,9 @@ pub struct ShredMetrics {
     pub unresolved_pool: AtomicU64,
     pub signals_sent: AtomicU64,
     pub signals_dropped: AtomicU64,
+    /// Pump txs that touched a WATCHED pool with NO decodable top-level swap
+    /// (router / private-bot CPI) — sent to the engine as opaque markers.
+    pub opaque_matched: AtomicU64,
     /// Number of target Pump pools being watched (set once at startup).
     pub watched_pools: AtomicU64,
 }
@@ -301,6 +338,12 @@ impl ShredConsumer {
             .map(|ls| ls.iter().map(|l| l.account_key).collect())
             .unwrap_or_default();
 
+        let tx_sig = vtx.signatures.first().copied().unwrap_or_default();
+        let fee_payer = static_keys.first().copied().unwrap_or_default();
+        // Pools we DECODED a top-level swap for in this tx — used below to spot
+        // watched pools this tx touches through an UNDECODABLE path instead.
+        let mut decoded_pools: Vec<Pubkey> = Vec::new();
+
         for ix in msg.instructions() {
             let program = match full_keys.get(ix.program_id_index as usize) {
                 Some(p) => *p,
@@ -313,10 +356,15 @@ impl ShredConsumer {
                 continue;
             }
             let disc: [u8; 8] = ix.data[0..8].try_into().unwrap();
-            let is_buy = disc == DISC_BUY;
-            let is_sell = disc == DISC_SELL;
+            let kind = match disc {
+                DISC_BUY => Some(PumpIxKind::Buy),
+                DISC_SELL => Some(PumpIxKind::Sell),
+                DISC_BUY_EXACT_QUOTE_IN => Some(PumpIxKind::BuyQuoteIn),
+                DISC_BOOST_BUY_AND_BURN => Some(PumpIxKind::BoostBuyBurn),
+                _ => None,
+            };
             let is_withdraw = disc == DISC_WITHDRAW;
-            if !is_buy && !is_sell && !is_withdraw {
+            if kind.is_none() && !is_withdraw {
                 continue;
             }
             // Account index 0 = pool.
@@ -328,13 +376,15 @@ impl ShredConsumer {
                 self.metrics.unresolved_pool.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if !self.target_pools.read().unwrap().contains(&pool) {
-                continue;
-            }
+            // NO target filter here: EVERY decodable Pump swap on the cluster is
+            // forwarded so the engine can advance live state for any pool it
+            // knows. Watched-only side effects (ALT harvest, rug close) stay
+            // gated on the watched set below.
+            let watched = self.target_pools.read().unwrap().contains(&pool);
 
             // Feed this tx's ALTs as candidates for the pool (the AltRegistry
             // picks the best-coverage one and stops once it's good enough).
-            if !tx_alts.is_empty() {
+            if watched && !tx_alts.is_empty() {
                 if let Some(s) = self.alt_candidate_tx.read().unwrap().as_ref() {
                     let _ = s.try_send((pool, tx_alts.clone()));
                 }
@@ -342,8 +392,10 @@ impl ShredConsumer {
 
             // Remove-liquidity on a watched pool → signal the manager to close it.
             if is_withdraw {
-                if let Some(sender) = self.remove_tx.read().unwrap().as_ref() {
-                    let _ = sender.try_send(pool);
+                if watched {
+                    if let Some(sender) = self.remove_tx.read().unwrap().as_ref() {
+                        let _ = sender.try_send(pool);
+                    }
                 }
                 continue;
             }
@@ -351,20 +403,30 @@ impl ShredConsumer {
             if ix.data.len() < 24 {
                 continue;
             }
-            let base_amount = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());
-            let quote_amount = u64::from_le_bytes(ix.data[16..24].try_into().unwrap());
+            let kind = kind.unwrap(); // withdraw handled above
+            let arg0 = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());
+            let arg1 = u64::from_le_bytes(ix.data[16..24].try_into().unwrap());
+            // Arg order differs per instruction: buy/sell carry (base, quote);
+            // buy_exact_quote_in and boost_buy_and_burn carry (quote, base).
+            let (base_amount, quote_amount) = match kind {
+                PumpIxKind::Buy | PumpIxKind::Sell => (arg0, arg1),
+                PumpIxKind::BuyQuoteIn | PumpIxKind::BoostBuyBurn => (arg1, arg0),
+                PumpIxKind::Opaque => unreachable!(),
+            };
 
             self.metrics.matched.fetch_add(1, Ordering::Relaxed);
+            decoded_pools.push(pool);
             let (meteora_pool, meteora_amount_in) = match meteora {
                 Some((p, a)) => (Some(p), Some(a)),
                 None => (None, None),
             };
             let signal = PumpSwapSignal {
                 pool,
-                is_buy,
+                kind,
                 base_amount,
                 quote_amount,
-                sig: vtx.signatures.first().copied().unwrap_or_default(),
+                fee_payer,
+                sig: tx_sig,
                 slot,
                 meteora_pool,
                 meteora_amount_in,
@@ -375,6 +437,41 @@ impl ShredConsumer {
                 Ok(()) => self.metrics.signals_sent.fetch_add(1, Ordering::Relaxed),
                 Err(_) => self.metrics.signals_dropped.fetch_add(1, Ordering::Relaxed),
             };
+        }
+
+        // ── Opaque path: watched pool touched via a router / private bot ──────
+        // The tx invokes the Pump program (it's in the static keys) and one of
+        // OUR pools appears in its account list, but we decoded NO top-level
+        // swap for that pool — the swap rides inside a CPI (Jupiter route,
+        // Axiom, unknown on-chain bots) whose data we cannot decode statically.
+        // The pool WILL change by an unknown amount, so tell the engine to
+        // invalidate its live overlay and hold trading until fresh gRPC state.
+        {
+            let targets = self.target_pools.read().unwrap();
+            for key in &full_keys {
+                if *key == Pubkey::default() || !targets.contains(key) {
+                    continue;
+                }
+                if decoded_pools.contains(key) {
+                    continue; // this pool's swap was decoded above
+                }
+                self.metrics.opaque_matched.fetch_add(1, Ordering::Relaxed);
+                let signal = PumpSwapSignal {
+                    pool: *key,
+                    kind: PumpIxKind::Opaque,
+                    base_amount: 0,
+                    quote_amount: 0,
+                    fee_payer,
+                    sig: tx_sig,
+                    slot,
+                    meteora_pool: None,
+                    meteora_amount_in: None,
+                };
+                match tx.try_send(signal) {
+                    Ok(()) => self.metrics.signals_sent.fetch_add(1, Ordering::Relaxed),
+                    Err(_) => self.metrics.signals_dropped.fetch_add(1, Ordering::Relaxed),
+                };
+            }
         }
     }
 
