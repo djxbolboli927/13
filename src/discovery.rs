@@ -335,18 +335,23 @@ impl Discovery {
         if pair_pks.is_empty() {
             return Ok(Vec::new());
         }
-        let owners = self.rpc.get_multiple_accounts(&pair_pks)?;
+        // Best-effort owner check. On RPC failure FAIL OPEN: return every pair
+        // and let decode_pool keep only the Pump/Meteora ones — we only REJECT
+        // the whole token when we POSITIVELY see a foreign-owned market.
+        let owners = match self.rpc.get_multiple_accounts(&pair_pks) {
+            Ok(v) => v,
+            Err(_) => return Ok(pair_pks),
+        };
         let allowed = allowed_market_programs();
-        let mut out = Vec::new();
-        for (pk, acct) in pair_pks.iter().zip(owners.iter()) {
-            let Some(acct) = acct else { continue };
-            if !allowed.contains(&acct.owner) {
-                debug!(%mint, owner = %acct.owner, "token rejected: market outside the 3 allowed programs");
-                return Ok(Vec::new());
-            }
-            out.push(*pk);
+        if owners
+            .iter()
+            .flatten()
+            .any(|a| !allowed.contains(&a.owner))
+        {
+            debug!(%mint, "token rejected: a market outside the 3 allowed programs");
+            return Ok(Vec::new());
         }
-        Ok(out)
+        Ok(pair_pks)
     }
 
     /// Re-check every ALREADY-TRACKED token for freshly-created counter pools:

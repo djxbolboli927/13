@@ -1739,7 +1739,13 @@ impl ShredArbEngine {
 
         // ── Direct-to-RPC send (default): no Jito, no tip, no rate limit ──
         if self.live.direct_send() {
-            let prio = self.params.direct_priority_fee_microlamports;
+            // Priority fee (adds a SetComputeUnitPrice instruction when > 0).
+            // Honour EITHER config knob so it doesn't matter which one you set:
+            // direct_priority_fee_microlamports OR compute_unit_price_microlamports.
+            let prio = self
+                .params
+                .direct_priority_fee_microlamports
+                .max(self.params.compute_unit_price_microlamports);
             let data_limit = self.params.loaded_accounts_data_limit;
             // Build the tx. If it's over the 1232-byte cap AND we included the
             // optional SetLoadedAccountsDataSizeLimit instruction, rebuild WITHOUT

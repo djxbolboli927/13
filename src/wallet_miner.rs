@@ -268,14 +268,18 @@ impl WalletMiner {
             return true; // restriction explicitly disabled
         }
         let url = self.cfg.token_pairs_url.replace("{mint}", &mint.to_string());
+        // FAIL OPEN on any inability to check (empty URL, API/RPC error, no
+        // data): we only REJECT when we POSITIVELY see a market owned by a
+        // program outside the allowed three. This keeps competitor-wallet
+        // mining working like before while still filtering the multi-market
+        // tokens we CAN identify.
         let body: Value = match self.http.get(&url).send().await.and_then(|r| r.error_for_status()) {
             Ok(r) => match r.json().await {
                 Ok(v) => v,
-                Err(_) => return false,
+                Err(_) => return true,
             },
-            Err(_) => return false,
+            Err(_) => return true,
         };
-        // Every pair's on-chain pool address.
         let mut pair_pks: Vec<Pubkey> = Vec::new();
         if let Some(pairs) = body.get("pairs").and_then(|p| p.as_array()) {
             for pair in pairs {
@@ -287,19 +291,18 @@ impl WalletMiner {
             }
         }
         if pair_pks.is_empty() {
-            return false; // no market data → don't risk it
+            return true; // no market data → allow (fail open)
         }
-        // Authoritative owner check via one getMultipleAccounts.
         let rpc = self.rpc.clone();
         let owners = match tokio::task::spawn_blocking(move || rpc.get_multiple_accounts(&pair_pks)).await {
             Ok(Ok(v)) => v,
-            _ => return false, // RPC failed → don't risk it
+            _ => return true, // RPC failed → allow (fail open)
         };
         let allowed = allowed_market_programs();
         for acct in owners.iter().flatten() {
             if !allowed.contains(&acct.owner) {
                 info!(%mint, owner = %acct.owner, "token rejected: market outside the 3 allowed programs");
-                return false;
+                return false; // POSITIVELY identified a foreign market → reject
             }
         }
         true
