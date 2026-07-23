@@ -26,7 +26,19 @@ mod pb {
 use pb::{shredstream_proxy_client::ShredstreamProxyClient, SubscribeEntriesRequest};
 
 // Anchor 8-byte discriminators for PumpSwap instructions.
+// (Verified against the current pump_amm IDL and by recomputing
+//  sha256("global:<ix_name>")[..8].)
+/// `buy` — args: base_amount_out u64 @8, max_quote_amount_in u64 @16.
+/// WSOL→token, so the TOKEN (base) leg is the FIRST u64.
 const DISC_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+/// `buy_exact_quote_in` — args: spendable_quote_in u64 @8, min_base_amount_out
+/// u64 @16. Also WSOL→token (a BUY), but the arg order is REVERSED vs `buy`:
+/// the WSOL (quote) leg is FIRST, the TOKEN (base) leg SECOND. Competitors use
+/// this heavily; skipping it under-counts pump buys and fabricates phantom
+/// "buy cheap on pump" opportunities.
+const DISC_BUY_EXACT_QUOTE_IN: [u8; 8] = [198, 46, 21, 82, 180, 217, 232, 112];
+/// `sell` — args: base_amount_in u64 @8, min_quote_amount_out u64 @16.
+/// token→WSOL, so the TOKEN (base) leg is the FIRST u64.
 const DISC_SELL: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 /// `withdraw` (remove liquidity) — the direct rug signal.
 const DISC_WITHDRAW: [u8; 8] = [183, 18, 70, 156, 148, 109, 161, 34];
@@ -332,8 +344,16 @@ impl ShredConsumer {
                 continue;
             }
             let disc: [u8; 8] = ix.data[0..8].try_into().unwrap();
-            let is_buy = disc == DISC_BUY;
-            let is_sell = disc == DISC_SELL;
+            // Classify the variant. `is_buy` means WSOL→token (raises price);
+            // `is_sell` means token→WSOL. `quote_first` records that this
+            // variant's arg order is REVERSED (WSOL/quote u64 first, token/base
+            // u64 second) vs the plain `buy`/`sell` layout.
+            let (is_buy, is_sell, quote_first) = match disc {
+                DISC_BUY => (true, false, false),
+                DISC_BUY_EXACT_QUOTE_IN => (true, false, true),
+                DISC_SELL => (false, true, false),
+                _ => (false, false, false),
+            };
             let is_withdraw = disc == DISC_WITHDRAW;
             if !is_buy && !is_sell && !is_withdraw {
                 continue;
@@ -370,8 +390,21 @@ impl ShredConsumer {
             if ix.data.len() < 24 {
                 continue;
             }
-            let base_amount = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());
-            let quote_amount = u64::from_le_bytes(ix.data[16..24].try_into().unwrap());
+            let arg0 = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());
+            let arg1 = u64::from_le_bytes(ix.data[16..24].try_into().unwrap());
+            // Normalize to (token-leg, WSOL-leg) regardless of arg order so
+            // `base_amount` always carries the TOKEN amount that
+            // `after_observed_buy`/`after_observed_sell` expect, and
+            // `quote_amount` always carries the WSOL trigger size.
+            //   plain buy/sell : base(token) @8, quote(WSOL) @16
+            //   buy_exact_quote_in : quote(WSOL) @8, base(token) @16  (reversed)
+            // For `_exact_quote_in` the token figure is a min-out estimate — the
+            // best available token number — and the WSOL figure is exact.
+            let (base_amount, quote_amount) = if quote_first {
+                (arg1, arg0)
+            } else {
+                (arg0, arg1)
+            };
 
             self.metrics.matched.fetch_add(1, Ordering::Relaxed);
             let (meteora_pool, meteora_amount_in) = match meteora {
