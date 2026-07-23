@@ -387,6 +387,9 @@ struct LiveTuning {
     /// is hot-reloaded, so setting `enabled = false` stops the sim within one
     /// reload cycle WITHOUT a restart (the pool stays built but is never used).
     sim_enabled: std::sync::atomic::AtomicBool,
+    /// Send path: true = direct sendTransaction to RPC, false = Jito bundle.
+    /// Hot-reloadable so the operator can flip send modes without a restart.
+    direct_send: std::sync::atomic::AtomicBool,
     min_amount_lamports: AtomicU64,
     max_amount_lamports: AtomicU64,
     min_trigger_lamports: AtomicU64,
@@ -407,6 +410,7 @@ impl LiveTuning {
             force_send_profitable: AtomicBool::new(p.force_send_profitable),
             sim_gate_sends: AtomicBool::new(sim_gate_sends),
             sim_enabled: AtomicBool::new(sim_enabled),
+            direct_send: AtomicBool::new(p.direct_send),
             min_amount_lamports: AtomicU64::new(p.min_amount_lamports),
             max_amount_lamports: AtomicU64::new(p.max_amount_lamports),
             min_trigger_lamports: AtomicU64::new(p.min_trigger_lamports),
@@ -422,6 +426,10 @@ impl LiveTuning {
     #[inline]
     fn sim_enabled(&self) -> bool {
         self.sim_enabled.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn direct_send(&self) -> bool {
+        self.direct_send.load(Ordering::Relaxed)
     }
     #[inline]
     fn disable_preempt(&self) -> bool {
@@ -653,6 +661,9 @@ impl ShredArbEngine {
                             .sim_enabled
                             .store(cfg.simulation.enabled, Ordering::Relaxed);
                         self.live
+                            .direct_send
+                            .store(sa.direct_send, Ordering::Relaxed);
+                        self.live
                             .min_amount_lamports
                             .store(lamports(sa.min_amount_sol).max(1), Ordering::Relaxed);
                         self.live
@@ -769,10 +780,6 @@ impl ShredArbEngine {
         self.signals_received.fetch_add(1, Ordering::Relaxed);
         // Record the observed tx signature for this pool (for the fee-audit log).
         self.last_shred_sig.insert(sig.pool, sig.sig);
-        if sig.quote_amount < self.live.min_trigger_lamports() {
-            self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
         let pairs = match self.registry.get(&sig.pool) {
             Some(p) => p.clone(),
             None => {
@@ -784,13 +791,33 @@ impl ShredArbEngine {
             self.skip_no_pair.fetch_add(1, Ordering::Relaxed);
             return;
         };
-
-        // 1) Current Pump reserves (live overlay: includes any earlier shred txs
-        // on this pool not yet delivered by gRPC). The Pump vaults are identical
-        // across every pair of this pool.
         let token_vault = first.pump.token_vault();
         let wsol_vault = first.pump.wsol_vault();
-        let pump_now = match self
+
+        // ── Accumulate EVERY Pump swap FIRST (before any trigger gate) ────────
+        // With Meteora-leg extraction off, every observed Pump instruction is
+        // real Pump flow and must fold into this block's overlay — even the
+        // small ones — so the busy-pool prediction reflects ALL of it. Only the
+        // (rare, now-disabled) arb-classified tx is left out.
+        let is_arb = sig.meteora_pool.is_some();
+        if is_arb {
+            self.arb_ignored.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.pool_state.apply_pump_swap(
+                &first.pump.pool, &token_vault, &wsol_vault, &first.token_mint, sig.is_buy, sig.base_amount, sig.slot,
+            );
+        }
+
+        // ── Trigger gate: only ASSESS (price + maybe send) when the observed
+        // trade is big enough. Accumulation above already happened, so a small
+        // trade still moves our state — it just doesn't trigger a send itself.
+        if sig.quote_amount < self.live.min_trigger_lamports() {
+            self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // Current Pump reserves including everything accumulated this block.
+        let pump_after = match self
             .pool_state
             .pump_pool_live(&first.pump.pool, &token_vault, &wsol_vault, &first.token_mint, sig.slot)
         {
@@ -802,46 +829,15 @@ impl ShredArbEngine {
             }
         };
         // Liquidity-relative trigger: skip trades too small to move THIS pool's
-        // price meaningfully (more precise than a flat lamport threshold — a
-        // "big" trade on a thin pool is tiny on a deep one).
+        // price meaningfully (more precise than a flat lamport threshold).
         if self.params.min_trigger_reserve_frac > 0.0 {
             let thresh =
-                (pump_now.quote_reserve as f64 * self.params.min_trigger_reserve_frac) as u64;
+                (pump_after.quote_reserve as f64 * self.params.min_trigger_reserve_frac) as u64;
             if sig.quote_amount < thresh {
                 self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
-        // ── Classify the observed tx: holder/sniper swap vs multi-hop arb ────
-        // A tx that ALSO carries a Meteora leg on one of our pools is a circular
-        // ARBITRAGE tx (competitor bot). Thousands of these fire per opportunity
-        // and all but ONE revert on the thin Meteora side, so treating them as
-        // real pool movement is exactly what over-predicted the state and caused
-        // our reverts. We therefore IGNORE arb txs for state prediction — on BOTH
-        // pools — and assess as if we are first to see the gap. Only SIMPLE Pump
-        // buys/sells (holders/snipers, no Meteora leg) actually land reliably, so
-        // only THOSE are accumulated into the live Pump overlay.
-        let is_arb = sig.meteora_pool.is_some();
-        let pump_after = if is_arb {
-            self.arb_ignored.fetch_add(1, Ordering::Relaxed);
-            // Assume we are first: price against the current (confirmed + prior
-            // holder-flow) Pump state, without advancing from this arb tx. Meteora
-            // is likewise left at its confirmed state (no advance from arb legs).
-            pump_now
-        } else {
-            // Holder/sniper simple swap — accumulate it into the live overlay so
-            // the next shred in this block prices against a pool that reflects it.
-            self.pool_state.apply_pump_swap(
-                &first.pump.pool, &token_vault, &wsol_vault, &first.token_mint, sig.is_buy, sig.base_amount, sig.slot,
-            );
-            match self
-                .pool_state
-                .pump_pool_live(&first.pump.pool, &token_vault, &wsol_vault, &first.token_mint, sig.slot)
-            {
-                Some(p) => p,
-                None => pump_now,
-            }
-        };
         // ── Two-scenario prediction for KEY competitor wallets ───────────────
         // Arb txs are ignored for state (assume-first) EXCEPT when they come from
         // one of the key wallets that rarely revert. For those, additionally
@@ -1741,7 +1737,7 @@ impl ShredArbEngine {
         }
 
         // ── Direct-to-RPC send (default): no Jito, no tip, no rate limit ──
-        if self.params.direct_send {
+        if self.live.direct_send() {
             let prio = self.params.direct_priority_fee_microlamports;
             let data_limit = self.params.loaded_accounts_data_limit;
             // Build the tx. If it's over the 1232-byte cap AND we included the
@@ -1828,7 +1824,7 @@ impl ShredArbEngine {
             // an unchanged pool always sends. Disabled entirely by
             // `disable_preempt` / `force_send_profitable`.
             let preempt_on =
-                !self.live.disable_preempt() && !self.live.force_send_profitable();
+                self.live.disable_preempt() && !self.live.force_send_profitable();
             if preempt_on && !self.still_profitable(&recheck) {
                 self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
                 crate::errlog::log(
@@ -1978,7 +1974,10 @@ impl ShredArbEngine {
         // Last-moment freshness gate (same as the direct path): only blocks if
         // the Meteora gRPC state advanced since calc AND the recomputed trade is
         // no longer profitable. Disabled by disable_preempt / force_send_profitable.
-        let preempt_on = !self.live.disable_preempt() && !self.live.force_send_profitable();
+        // Preempt is ACTIVE when disable_preempt=true (operator's semantics: true
+        // = "don't send if a competitor moved the pool ahead of us"), UNLESS
+        // force_send_profitable overrides it to always send.
+        let preempt_on = self.live.disable_preempt() && !self.live.force_send_profitable();
         if preempt_on && !self.still_profitable(&recheck) {
             self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
             crate::errlog::log(

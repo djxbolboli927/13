@@ -77,25 +77,15 @@ impl JitoClient {
     /// the bundle genuinely reaches all 8 regions (previously the early return
     /// dropped the pending futures and only the fastest region ever received it).
     pub async fn send_bundle(&self, tx: &VersionedTransaction) -> Result<String> {
-        self.send_bundle_txs(std::slice::from_ref(tx)).await
-    }
-
-    /// Send a bundle of one OR MORE transactions (executed atomically, in order,
-    /// in the same block). Used by the split-leg mode: tx0 = Pump buy, tx1 =
-    /// Meteora sell — so each leg's on-chain result is visible separately.
-    pub async fn send_bundle_txs(&self, txs: &[VersionedTransaction]) -> Result<String> {
-        let mut b64s: Vec<String> = Vec::with_capacity(txs.len());
-        for tx in txs {
-            let bytes = bincode::serialize(tx).context("failed to serialize transaction")?;
-            b64s.push(base64::engine::general_purpose::STANDARD.encode(&bytes));
-        }
+        let tx_bytes = bincode::serialize(tx).context("failed to serialize transaction")?;
+        let tx_base64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
 
         let (res_tx, mut res_rx) =
             tokio::sync::mpsc::channel::<Result<String>>(self.bundle_urls.len().max(1));
         for url in &self.bundle_urls {
             let http = self.http.clone();
             let url = url.clone();
-            let b64 = b64s.clone();
+            let b64 = tx_base64.clone();
             let res_tx = res_tx.clone();
             tokio::spawn(async move {
                 let r = Self::send_to_endpoint(http, &url, &b64).await;
@@ -118,13 +108,13 @@ impl JitoClient {
     }
 
     /// Send bundle to a single endpoint.
-    async fn send_to_endpoint(http: Client, url: &str, txs_base64: &[String]) -> Result<String> {
+    async fn send_to_endpoint(http: Client, url: &str, tx_base64: &str) -> Result<String> {
         let request = SendBundleRpcRequest {
             jsonrpc: "2.0",
             id: 1,
             method: "sendBundle",
             params: (
-                txs_base64.to_vec(),
+                vec![tx_base64.to_string()],
                 SendBundleConfig { encoding: "base64" },
             ),
         };
