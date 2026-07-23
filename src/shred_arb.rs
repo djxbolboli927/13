@@ -794,19 +794,20 @@ impl ShredArbEngine {
         let token_vault = first.pump.token_vault();
         let wsol_vault = first.pump.wsol_vault();
 
-        // ── Accumulate EVERY Pump swap FIRST (before any trigger gate) ────────
-        // With Meteora-leg extraction off, every observed Pump instruction is
-        // real Pump flow and must fold into this block's overlay — even the
-        // small ones — so the busy-pool prediction reflects ALL of it. Only the
-        // (rare, now-disabled) arb-classified tx is left out.
+        // ── Accumulate the Pump leg of EVERY tx (before any trigger gate) ─────
+        // Every observed Pump instruction — whether a plain holder/sniper swap
+        // or the Pump leg of a competitor ARB tx — is real Pump flow that moves
+        // the pool, so we fold ALL of it (even small trades) into this block's
+        // overlay. Meteora legs are still read (below) for the key-wallet
+        // two-scenario, but only Pump is accumulated; Meteora relies on its own
+        // gRPC state change.
         let is_arb = sig.meteora_pool.is_some();
         if is_arb {
             self.arb_ignored.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.pool_state.apply_pump_swap(
-                &first.pump.pool, &token_vault, &wsol_vault, &first.token_mint, sig.is_buy, sig.base_amount, sig.slot,
-            );
         }
+        self.pool_state.apply_pump_swap(
+            &first.pump.pool, &token_vault, &wsol_vault, &first.token_mint, sig.is_buy, sig.base_amount, sig.slot,
+        );
 
         // ── Trigger gate: only ASSESS (price + maybe send) when the observed
         // trade is big enough. Accumulation above already happened, so a small
