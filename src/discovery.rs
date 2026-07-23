@@ -32,6 +32,18 @@ use crate::dex_ids::{meteora_program, pumpfun_program, wsol_mint, DexKind};
 use crate::pool_manager::PoolManager;
 use crate::pool_registry::{ArbPair, PoolInfo};
 
+/// Meteora Dynamic Bonding Curve program — the 3rd allowed market.
+const METEORA_DBC_PROGRAM: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
+
+/// The exactly-three market programs a token may trade on (owner check).
+fn allowed_market_programs() -> [Pubkey; 3] {
+    [
+        pumpfun_program(),
+        meteora_program(),
+        Pubkey::from_str(METEORA_DBC_PROGRAM).unwrap(),
+    ]
+}
+
 // ── Pump.fun AMM (PumpSwap) Pool account offsets ─────────────────────────────
 // 8 disc | 1 pool_bump | 2 index | 32 creator | 32 base_mint | 32 quote_mint |
 // 32 lp_mint | 32 pool_base_token_account | 32 pool_quote_token_account | ...
@@ -303,29 +315,36 @@ impl Discovery {
     async fn fetch_candidate_pools(&self, mint: &Pubkey) -> Result<Vec<Pubkey>> {
         let url = self.cfg.token_pairs_url.replace("{mint}", &mint.to_string());
         let body: Value = self.http.get(&url).send().await?.json().await?;
-        let mut out = Vec::new();
+        // ── 3-market restriction (authoritative, by PROGRAM OWNER) ────────────
+        // Collect EVERY pair's on-chain address, then one getMultipleAccounts
+        // verifies each owner. If ANY market is outside the exactly-three allowed
+        // programs (Pump.fun AMM, Meteora DAMM v2, Meteora DBC), reject the WHOLE
+        // token — DexScreener's dexId string can't tell Meteora DAMM v2 from
+        // DLMM/Pools, so the owner is the only reliable check. Multi-market
+        // tokens draw the 30-buys-per-block arb bots whose churn reverts us.
+        let mut pair_pks: Vec<Pubkey> = Vec::new();
         if let Some(pairs) = body.get("pairs").and_then(|p| p.as_array()) {
             for pair in pairs {
-                let dex = pair.get("dexId").and_then(|d| d.as_str()).unwrap_or("");
-                // ── 3-market restriction ──────────────────────────────────────
-                // Reject the WHOLE token if it trades on ANY venue outside
-                // Pump.fun / Meteora (DAMM v2 + Dynamic Bonding Curve — both
-                // report dexId "meteora"). Multi-market tokens attract the
-                // high-frequency arb bots that fire 20-30 buys per block, and
-                // that per-block churn is exactly what wrecks our Pump state
-                // prediction. Keeping to the 3 markets keeps the block sparse.
-                if !dex.is_empty() && !(dex.contains("pump") || dex.contains("meteora")) {
-                    debug!(%mint, dex, "token rejected: trades outside the 3 allowed markets");
-                    return Ok(Vec::new());
-                }
-                if dex.contains("pump") || dex.contains("meteora") {
-                    if let Some(addr) = pair.get("pairAddress").and_then(|a| a.as_str()) {
-                        if let Ok(pk) = Pubkey::from_str(addr) {
-                            out.push(pk);
-                        }
+                if let Some(addr) = pair.get("pairAddress").and_then(|a| a.as_str()) {
+                    if let Ok(pk) = Pubkey::from_str(addr) {
+                        pair_pks.push(pk);
                     }
                 }
             }
+        }
+        if pair_pks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owners = self.rpc.get_multiple_accounts(&pair_pks)?;
+        let allowed = allowed_market_programs();
+        let mut out = Vec::new();
+        for (pk, acct) in pair_pks.iter().zip(owners.iter()) {
+            let Some(acct) = acct else { continue };
+            if !allowed.contains(&acct.owner) {
+                debug!(%mint, owner = %acct.owner, "token rejected: market outside the 3 allowed programs");
+                return Ok(Vec::new());
+            }
+            out.push(*pk);
         }
         Ok(out)
     }

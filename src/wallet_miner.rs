@@ -41,6 +41,19 @@ use crate::pool_manager::PoolManager;
 use crate::pool_registry::{ArbPair, PoolInfo};
 use crate::transaction::deserialize_alt_addresses;
 
+/// Meteora Dynamic Bonding Curve program — the 3rd allowed market.
+const METEORA_DBC_PROGRAM: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
+
+/// The exactly-three market programs a token may trade on. Any pool owned by a
+/// different program disqualifies the whole token.
+fn allowed_market_programs() -> [Pubkey; 3] {
+    [
+        pumpfun_program(),                              // Pump.fun AMM (pAMMBay…)
+        meteora_program(),                              // Meteora DAMM v2 (cpamdp…)
+        Pubkey::from_str(METEORA_DBC_PROGRAM).unwrap(), // Meteora DBC (dbcij3…)
+    ]
+}
+
 pub struct WalletMinerConfig {
     /// One or more RPC endpoints to round-robin across (each rate-gated). The
     /// miner never re-fetches pool state on the hot path — this is background
@@ -239,29 +252,54 @@ impl WalletMiner {
         Ok(())
     }
 
-    /// True if the token trades ONLY on Pump.fun / Meteora (per DexScreener).
-    /// A token with any other venue is rejected — those multi-market tokens draw
-    /// the 30-buys-per-block arb bots that wreck our Pump state prediction.
-    /// Fails OPEN (allow) if the URL is empty or the API call fails, so a
-    /// transient error never silently starves the bot of pools.
+    /// True ONLY if EVERY on-chain market for `mint` is one of the exactly-three
+    /// allowed programs: Pump.fun AMM, Meteora DAMM v2, Meteora DBC. Any other
+    /// venue (Meteora DLMM, Meteora Pools, Orca, Raydium, …) rejects the whole
+    /// token — those multi-market tokens draw the 30-buys-per-block arb bots
+    /// whose churn wrecks our Pump state prediction and reverts us.
+    ///
+    /// The check is by PROGRAM OWNER (authoritative), not the DexScreener
+    /// `dexId` string (which lumps all four Meteora products under "meteora").
+    /// One `getMultipleAccounts` RPC verifies every pair at once. Rejects HARD
+    /// on any doubt (empty/failed lookup returns false) so a foreign market is
+    /// never let through — correctness beats coverage here.
     async fn only_allowed_markets(&self, mint: &Pubkey) -> bool {
         if self.cfg.token_pairs_url.is_empty() {
-            return true;
+            return true; // restriction explicitly disabled
         }
         let url = self.cfg.token_pairs_url.replace("{mint}", &mint.to_string());
         let body: Value = match self.http.get(&url).send().await.and_then(|r| r.error_for_status()) {
             Ok(r) => match r.json().await {
                 Ok(v) => v,
-                Err(_) => return true,
+                Err(_) => return false,
             },
-            Err(_) => return true,
+            Err(_) => return false,
         };
+        // Every pair's on-chain pool address.
+        let mut pair_pks: Vec<Pubkey> = Vec::new();
         if let Some(pairs) = body.get("pairs").and_then(|p| p.as_array()) {
             for pair in pairs {
-                let dex = pair.get("dexId").and_then(|d| d.as_str()).unwrap_or("");
-                if !dex.is_empty() && !(dex.contains("pump") || dex.contains("meteora")) {
-                    return false;
+                if let Some(a) = pair.get("pairAddress").and_then(|a| a.as_str()) {
+                    if let Ok(pk) = Pubkey::from_str(a) {
+                        pair_pks.push(pk);
+                    }
                 }
+            }
+        }
+        if pair_pks.is_empty() {
+            return false; // no market data → don't risk it
+        }
+        // Authoritative owner check via one getMultipleAccounts.
+        let rpc = self.rpc.clone();
+        let owners = match tokio::task::spawn_blocking(move || rpc.get_multiple_accounts(&pair_pks)).await {
+            Ok(Ok(v)) => v,
+            _ => return false, // RPC failed → don't risk it
+        };
+        let allowed = allowed_market_programs();
+        for acct in owners.iter().flatten() {
+            if !allowed.contains(&acct.owner) {
+                info!(%mint, owner = %acct.owner, "token rejected: market outside the 3 allowed programs");
+                return false;
             }
         }
         true
