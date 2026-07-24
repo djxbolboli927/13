@@ -809,13 +809,31 @@ impl ShredArbEngine {
             .pump_base_is_wsol(&first.pump.pool, &wsol_vault)
             .unwrap_or(false);
         // Token-perspective direction + the TOKEN-leg amount for the state advance.
-        let (is_token_buy, token_amount) = if flipped {
-            (!sig.is_buy, sig.quote_amount) // on-chain quote leg == token
+        let (is_token_buy, mut token_amount) = if flipped {
+            (!sig.is_buy, sig.quote_amount) // on-chain quote leg == token (exact for exact-quote)
         } else {
             (sig.is_buy, sig.base_amount) // on-chain base leg == token
         };
         // WSOL-leg amount — the trigger-size proxy (base leg on a flipped pool).
         let wsol_amount = if flipped { sig.base_amount } else { sig.quote_amount };
+
+        // Exact-quote variants (`buy_exact_quote_in` / `boost_buy_and_burn`) on a
+        // CANONICAL pool carry the EXACT WSOL input in `quote_amount` and only a
+        // min-out BOUND in `base_amount` — using the bound as the token out
+        // UNDER-counts the token removed and under-moves our predicted price.
+        // Advance from the exact WSOL input instead: compute the real token out
+        // from the current pool. (On a FLIPPED pool the exact leg is already the
+        // token — `quote_amount` — so nothing to refine there.)
+        if sig.exact_quote_in && !flipped && is_token_buy {
+            if let Some(p) = self.pool_state.pump_pool_live(
+                &first.pump.pool, &token_vault, &wsol_vault, &first.token_mint, sig.slot,
+            ) {
+                let exact = p.quote_buy(sig.quote_amount);
+                if exact > 0 {
+                    token_amount = exact;
+                }
+            }
+        }
 
         // ── Accumulate the Pump leg of EVERY tx (before any trigger gate) ─────
         // Every observed Pump instruction — whether a plain holder/sniper swap

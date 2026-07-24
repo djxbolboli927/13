@@ -37,6 +37,12 @@ const DISC_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 /// this heavily; skipping it under-counts pump buys and fabricates phantom
 /// "buy cheap on pump" opportunities.
 const DISC_BUY_EXACT_QUOTE_IN: [u8; 8] = [198, 46, 21, 82, 180, 217, 232, 112];
+/// `boost_buy_and_burn` — the Pump buyback bot. Args: quote_amount_in u64 @8,
+/// min_base_amount_burned u64 @16 (verified vs pump_amm IDL). It is a real pump
+/// BUY (spends quote/WSOL, receives base/token, then burns it) with the SAME
+/// reversed layout as `buy_exact_quote_in` (exact quote first, min-base bound
+/// second). Ignoring it under-counts pump buys and fabricates "cheap on pump".
+const DISC_BOOST_BUY_AND_BURN: [u8; 8] = [105, 68, 6, 175, 0, 7, 35, 162];
 /// `sell` — args: base_amount_in u64 @8, min_quote_amount_out u64 @16.
 /// token→WSOL, so the TOKEN (base) leg is the FIRST u64.
 const DISC_SELL: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
@@ -49,12 +55,24 @@ const DISC_METEORA_SWAP: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
 #[derive(Debug, Clone, Copy)]
 pub struct PumpSwapSignal {
     pub pool: Pubkey,
+    /// ON-CHAIN direction: `true` for a pump `buy`/`buy_exact_quote_in`/
+    /// `boost_buy_and_burn` (base mint OUT, quote mint IN); `false` for `sell`.
+    /// NOT the token-vs-WSOL direction — on a FLIPPED pool (base = WSOL) a `buy`
+    /// is a token SELL. The engine resolves that from pool orientation.
     pub is_buy: bool,
-    /// `base_amount_out` (buy) or `base_amount_in` (sell) — the token leg.
+    /// The on-chain BASE-mint leg amount (base_amount_out/in, or the
+    /// min_base bound for the exact-quote variants). TOKEN leg on a canonical
+    /// pool, WSOL leg on a flipped pool — the engine disambiguates.
     pub base_amount: u64,
-    /// The SOL-side limit arg (`max_quote_amount_in` / `min_quote_amount_out`),
-    /// a cheap proxy for trade size before we price it exactly.
+    /// The on-chain QUOTE-mint leg amount (max/min_quote for plain buy/sell; the
+    /// EXACT `spendable_quote_in`/`quote_amount_in` for the exact-quote variants).
+    /// WSOL leg on a canonical pool, TOKEN leg on a flipped pool.
     pub quote_amount: u64,
+    /// True for the exact-quote-input variants (`buy_exact_quote_in`,
+    /// `boost_buy_and_burn`): the QUOTE leg (`quote_amount`) is the EXACT input
+    /// and the base leg is only a min-out bound. The engine advances state from
+    /// the exact quote input rather than the imprecise base bound.
+    pub exact_quote_in: bool,
     /// Signature of the observed on-chain tx this shred carried — recorded so the
     /// fee-audit log can print the exact tx whose fee the bot computed.
     pub sig: solana_sdk::signature::Signature,
@@ -348,9 +366,16 @@ impl ShredConsumer {
             // `is_sell` means token→WSOL. `quote_first` records that this
             // variant's arg order is REVERSED (WSOL/quote u64 first, token/base
             // u64 second) vs the plain `buy`/`sell` layout.
+            // `quote_first` = the variant's arg order is REVERSED (exact quote
+            // u64 first, base/token bound u64 second) vs the plain `buy`/`sell`
+            // layout. It is TRUE exactly for the exact-quote-input variants
+            // (`buy_exact_quote_in`, `boost_buy_and_burn`), where the QUOTE leg is
+            // the EXACT input and the base leg is only a min-out bound — so it
+            // doubles as the `exact_quote_in` flag downstream.
             let (is_buy, is_sell, quote_first) = match disc {
                 DISC_BUY => (true, false, false),
                 DISC_BUY_EXACT_QUOTE_IN => (true, false, true),
+                DISC_BOOST_BUY_AND_BURN => (true, false, true),
                 DISC_SELL => (false, true, false),
                 _ => (false, false, false),
             };
@@ -392,14 +417,13 @@ impl ShredConsumer {
             }
             let arg0 = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());
             let arg1 = u64::from_le_bytes(ix.data[16..24].try_into().unwrap());
-            // Normalize to (token-leg, WSOL-leg) regardless of arg order so
-            // `base_amount` always carries the TOKEN amount that
-            // `after_observed_buy`/`after_observed_sell` expect, and
-            // `quote_amount` always carries the WSOL trigger size.
-            //   plain buy/sell : base(token) @8, quote(WSOL) @16
-            //   buy_exact_quote_in : quote(WSOL) @8, base(token) @16  (reversed)
-            // For `_exact_quote_in` the token figure is a min-out estimate — the
-            // best available token number — and the WSOL figure is exact.
+            // Emit the ON-CHAIN (base, quote) legs regardless of arg order; the
+            // engine maps base/quote → token/WSOL from the pool's orientation
+            // (base may be the token OR WSOL on a flipped pool), so we do NOT
+            // pre-assume token/WSOL here.
+            //   plain buy/sell     : base @8, quote @16
+            //   buy_exact_quote_in : quote @8 (exact), base @16 (min bound)  (reversed)
+            //   boost_buy_and_burn : quote @8 (exact), base @16 (min bound)  (reversed)
             let (base_amount, quote_amount) = if quote_first {
                 (arg1, arg0)
             } else {
@@ -416,6 +440,7 @@ impl ShredConsumer {
                 is_buy,
                 base_amount,
                 quote_amount,
+                exact_quote_in: quote_first,
                 sig: vtx.signatures.first().copied().unwrap_or_default(),
                 slot,
                 meteora_pool,
