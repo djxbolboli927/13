@@ -230,6 +230,17 @@ fn ceil_div(a: u128, b: u128) -> u128 {
 }
 
 /// Reserves of a Pump.fun AMM pool. `base` = token, `quote` = WSOL (lamports).
+///
+/// NOTE on orientation: reserves are ALWAYS normalized so `base_reserve` is the
+/// meme token and `quote_reserve` is WSOL, regardless of the pool's on-chain
+/// `base_mint`/`quote_mint` naming — the caller keys them off the resolved
+/// token/WSOL vaults. The Pump.fun AMM levies its fee on the on-chain QUOTE
+/// mint. On a CANONICAL pool the quote mint IS WSOL, so the fee hits our
+/// `quote_reserve` (WSOL) — `fee_on_wsol_leg = true`. On a FLIPPED / non-canonical
+/// pool (`base_mint = WSOL`, `quote_mint = token`) the fee hits the TOKEN leg,
+/// i.e. our `base_reserve` — `fee_on_wsol_leg = false`. Getting this side right
+/// matters: on the real HOOD flipped tx the token-side fee reproduces the
+/// on-chain output to ~1 lamport, vs ~24 lamports if charged on WSOL.
 #[derive(Debug, Clone, Copy)]
 pub struct PumpPool {
     pub base_reserve: u64,
@@ -238,6 +249,11 @@ pub struct PumpPool {
     pub total_fee_bps: u64,
     /// LP portion of the fee that stays in the pool.
     pub lp_fee_bps: u64,
+    /// Which leg the on-chain fee is levied on. `true` = WSOL (`quote_reserve`),
+    /// the canonical case. `false` = token (`base_reserve`), the flipped /
+    /// non-canonical case. Defaults to `true`; the pool-state layer flips it
+    /// after reading the on-chain orientation (`pump_base_is_wsol`).
+    pub fee_on_wsol_leg: bool,
 }
 
 impl PumpPool {
@@ -245,6 +261,9 @@ impl PumpPool {
     /// highest fee tier, fail-closed). `is_canonical` = the pool is a canonical
     /// pump pool (`is_pump_pool == true`, i.e. its `coin_creator` is set); false
     /// selects the flat fee instead of the market-cap tier.
+    ///
+    /// `fee_on_wsol_leg` defaults to `true` (fee on WSOL). Callers that know the
+    /// pool is FLIPPED set the field to `false` after construction.
     pub fn new(
         base_reserve: u64,
         quote_reserve: u64,
@@ -258,6 +277,7 @@ impl PumpPool {
             quote_reserve,
             total_fee_bps,
             lp_fee_bps,
+            fee_on_wsol_leg: true,
         }
     }
 
@@ -275,17 +295,30 @@ impl PumpPool {
     /// BUY: spend `quote_in_budget` lamports of WSOL (fees included), receive
     /// token base. Returns `base_out`.
     pub fn quote_buy(&self, quote_in_budget: u64) -> u64 {
-        // Strip the fee that is added on top of the pool-bound input.
-        let pool_quote_in = (quote_in_budget as u128) * BPS_DENOM as u128
-            / (BPS_DENOM + self.total_fee_bps) as u128;
-        if pool_quote_in == 0 {
-            return 0;
-        }
-        // base_out = floor(B * qin / (Q + qin))
         let b = self.base_reserve as u128;
         let q = self.quote_reserve as u128;
-        let out = b * pool_quote_in / (q + pool_quote_in);
-        out.min(u64::MAX as u128) as u64
+        if quote_in_budget == 0 {
+            return 0;
+        }
+        if self.fee_on_wsol_leg {
+            // Canonical: fee is on the WSOL leg, added on top of the pool-bound
+            // input — strip it, then the whole net WSOL enters the pool.
+            let pool_quote_in = (quote_in_budget as u128) * BPS_DENOM as u128
+                / (BPS_DENOM + self.total_fee_bps) as u128;
+            if pool_quote_in == 0 {
+                return 0;
+            }
+            // base_out = floor(B * qin / (Q + qin))
+            let out = b * pool_quote_in / (q + pool_quote_in);
+            out.min(u64::MAX as u128) as u64
+        } else {
+            // Flipped: fee is on the TOKEN (base) output leg. The full WSOL
+            // enters the pool; the fee is deducted from the gross token out.
+            let qin = quote_in_budget as u128;
+            let gross = b * qin / (q + qin);
+            let fee = ceil_div(gross * self.total_fee_bps as u128, BPS_DENOM as u128);
+            gross.saturating_sub(fee).min(u64::MAX as u128) as u64
+        }
     }
 
     /// SELL: spend `base_in` token, receive WSOL. Returns net lamports out
@@ -297,9 +330,23 @@ impl PumpPool {
         if bi == 0 {
             return 0;
         }
-        let gross = q * bi / (b + bi); // floor
-        let fee = ceil_div(gross * self.total_fee_bps as u128, BPS_DENOM as u128);
-        gross.saturating_sub(fee).min(u64::MAX as u128) as u64
+        if self.fee_on_wsol_leg {
+            // Canonical: fee on the WSOL output leg.
+            let gross = q * bi / (b + bi); // floor
+            let fee = ceil_div(gross * self.total_fee_bps as u128, BPS_DENOM as u128);
+            gross.saturating_sub(fee).min(u64::MAX as u128) as u64
+        } else {
+            // Flipped: fee on the TOKEN input leg (on-chain buy: token is the
+            // quote, fee added on top of the pool-bound token). Strip the fee
+            // from the token input, then swap the net token for WSOL (no fee on
+            // the WSOL output). Matches the real HOOD tx to ~1 lamport.
+            let pool_bi = bi * BPS_DENOM as u128 / (BPS_DENOM + self.total_fee_bps) as u128;
+            if pool_bi == 0 {
+                return 0;
+            }
+            let out = q * pool_bi / (b + pool_bi);
+            out.min(u64::MAX as u128) as u64
+        }
     }
 
     // ── Prediction: apply a swap we OBSERVED on ShredStream ──────────────────
@@ -314,15 +361,39 @@ impl PumpPool {
         if out == 0 {
             return *self;
         }
-        // quote that must enter the pool for that base out: ceil(Q*out/(B-out))
-        let quote_in = ceil_div(q * out, b - out);
-        let lp_fee = ceil_div(quote_in * self.lp_fee_bps as u128, BPS_DENOM as u128);
-        let new_base = (b - out) as u64;
-        let new_quote = (q + quote_in + lp_fee).min(u64::MAX as u128) as u64;
-        PumpPool {
-            base_reserve: new_base,
-            quote_reserve: new_quote,
-            ..*self
+        if self.fee_on_wsol_leg {
+            // Canonical: WSOL enters, lp fee stays in the WSOL (quote) reserve.
+            // quote that must enter the pool for that base out: ceil(Q*out/(B-out))
+            let quote_in = ceil_div(q * out, b - out);
+            let lp_fee = ceil_div(quote_in * self.lp_fee_bps as u128, BPS_DENOM as u128);
+            let new_base = (b - out) as u64;
+            let new_quote = (q + quote_in + lp_fee).min(u64::MAX as u128) as u64;
+            PumpPool {
+                base_reserve: new_base,
+                quote_reserve: new_quote,
+                ..*self
+            }
+        } else {
+            // Flipped: on-chain SELL (WSOL in, token out); fee on the token
+            // output. `out` is what the buyer RECEIVED (gross − total fee), so
+            // the gross token leaving the curve is larger; the lp portion stays
+            // in the token reserve, the rest of the token leaves.
+            let denom = (BPS_DENOM as u128).saturating_sub(self.total_fee_bps as u128);
+            if denom == 0 {
+                return *self;
+            }
+            let gross = (ceil_div(out * BPS_DENOM as u128, denom)).min(b.saturating_sub(1));
+            let lp_fee = gross * self.lp_fee_bps as u128 / BPS_DENOM as u128; // stays in token
+            // WSOL that entered the pool for that gross token out.
+            let wsol_in = ceil_div(q * gross, b - gross);
+            let net_token_leaving = gross.saturating_sub(lp_fee);
+            let new_base = b.saturating_sub(net_token_leaving) as u64;
+            let new_quote = (q + wsol_in).min(u64::MAX as u128) as u64;
+            PumpPool {
+                base_reserve: new_base,
+                quote_reserve: new_quote,
+                ..*self
+            }
         }
     }
 
@@ -335,15 +406,36 @@ impl PumpPool {
         if bi == 0 {
             return *self;
         }
-        let gross = q * bi / (b + bi); // floor
-        let lp_fee = ceil_div(gross * self.lp_fee_bps as u128, BPS_DENOM as u128);
-        // LP fee stays in the pool, so quote only drops by (gross - lp_fee).
-        let new_base = (b + bi).min(u64::MAX as u128) as u64;
-        let new_quote = q.saturating_sub(gross - lp_fee) as u64;
-        PumpPool {
-            base_reserve: new_base,
-            quote_reserve: new_quote,
-            ..*self
+        if self.fee_on_wsol_leg {
+            // Canonical: token enters, WSOL leaves; fee (lp) on the WSOL leg —
+            // lp stays in the pool, so quote only drops by (gross − lp_fee).
+            let gross = q * bi / (b + bi); // floor
+            let lp_fee = ceil_div(gross * self.lp_fee_bps as u128, BPS_DENOM as u128);
+            let new_base = (b + bi).min(u64::MAX as u128) as u64;
+            let new_quote = q.saturating_sub(gross - lp_fee) as u64;
+            PumpPool {
+                base_reserve: new_base,
+                quote_reserve: new_quote,
+                ..*self
+            }
+        } else {
+            // Flipped: on-chain BUY (token in, WSOL out); fee on the token input
+            // (added on top). `bi` is the total token spent; strip the fee to
+            // get the pool-bound token, the lp portion of which stays in the
+            // token reserve. WSOL leaves for the pool-bound token.
+            let pool_bi = bi * BPS_DENOM as u128 / (BPS_DENOM + self.total_fee_bps) as u128;
+            if pool_bi == 0 {
+                return *self;
+            }
+            let lp_fee = pool_bi * self.lp_fee_bps as u128 / BPS_DENOM as u128; // stays in token
+            let wsol_out = q * pool_bi / (b + pool_bi);
+            let new_base = (b + pool_bi + lp_fee).min(u64::MAX as u128) as u64;
+            let new_quote = q.saturating_sub(wsol_out) as u64;
+            PumpPool {
+                base_reserve: new_base,
+                quote_reserve: new_quote,
+                ..*self
+            }
         }
     }
 }
@@ -368,5 +460,52 @@ mod tests {
         let before = p.spot_price(6, 9);
         let after = p.after_observed_buy(10_000_000).spot_price(6, 9);
         assert!(after > before);
+    }
+
+    #[test]
+    fn flipped_pool_fee_on_token_reproduces_real_tx() {
+        // Real FLIPPED pool tx (token HOOD, pump pool HZeyjnj8…): on-chain
+        // `buy_exact_quote_in` spending 874_763_863 HOOD (the on-chain QUOTE) to
+        // receive 269_778 WSOL (the on-chain BASE). From OUR token frame that is a
+        // token SELL. Reserves normalized to (base=token, quote=WSOL):
+        //   base_reserve  = HOOD vault = poolQuoteTokenReserves = 7_186_972_841_433_516
+        //   quote_reserve = WSOL vault = poolBaseTokenReserves  = 2_223_125_529_798
+        // Non-canonical → flat 30 bps (lp 25 + protocol 5). On a flipped pool the
+        // fee is on the TOKEN leg. The token-side fee must reproduce the on-chain
+        // 269_778 WSOL out to within a couple lamports (WSOL-side fee is ~24 off).
+        let mut p = PumpPool::new(7_186_972_841_433_516, 2_223_125_529_798, 0, false);
+        assert_eq!(p.total_fee_bps, 30, "non-canonical → flat 30 bps");
+        p.fee_on_wsol_leg = false; // flipped: fee on token
+        let wsol_out = p.quote_sell(874_763_863);
+        assert!(
+            (wsol_out as i64 - 269_778).abs() <= 3,
+            "flipped token-fee sell should reproduce ~269778 WSOL, got {wsol_out}"
+        );
+    }
+
+    #[test]
+    fn flipped_fee_side_beats_wsol_side_on_real_tx() {
+        // Same pool: the WSOL-side (canonical) fee model is measurably worse on a
+        // flipped pool, proving the fee side matters (the user's point).
+        let mut flip = PumpPool::new(7_186_972_841_433_516, 2_223_125_529_798, 0, false);
+        flip.fee_on_wsol_leg = false;
+        let wrong = PumpPool::new(7_186_972_841_433_516, 2_223_125_529_798, 0, false); // fee_on_wsol_leg = true
+        let flipped_err = (flip.quote_sell(874_763_863) as i64 - 269_778).abs();
+        let wsol_err = (wrong.quote_sell(874_763_863) as i64 - 269_778).abs();
+        assert!(flipped_err < wsol_err, "token-side fee ({flipped_err}) must beat WSOL-side ({wsol_err})");
+    }
+
+    #[test]
+    fn flipped_observed_swap_roundtrip_sane() {
+        // A flipped-pool observed buy then sell should move reserves in the right
+        // direction and not panic / overflow.
+        let mut p = PumpPool::new(7_186_972_841_433_516, 2_223_125_529_798, 0, false);
+        p.fee_on_wsol_leg = false;
+        let after_buy = p.after_observed_buy(1_000_000); // token leaves
+        assert!(after_buy.base_reserve < p.base_reserve);
+        assert!(after_buy.quote_reserve > p.quote_reserve);
+        let after_sell = p.after_observed_sell(1_000_000_000); // token enters
+        assert!(after_sell.base_reserve > p.base_reserve);
+        assert!(after_sell.quote_reserve < p.quote_reserve);
     }
 }

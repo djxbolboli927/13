@@ -794,6 +794,29 @@ impl ShredArbEngine {
         let token_vault = first.pump.token_vault();
         let wsol_vault = first.pump.wsol_vault();
 
+        // ── Orientation: on-chain (base/quote) → our (token/WSOL) frame ───────
+        // The shred carries the swap in ON-CHAIN terms: `sig.is_buy` is a pump
+        // `buy`/`buy_exact_quote_in` (base mint OUT, quote mint IN); `sig.base_amount`
+        // is the base-leg amount, `sig.quote_amount` the quote-leg amount. A pump
+        // `buy` spends the QUOTE mint to receive the BASE mint. On a CANONICAL pool
+        // (base = token, quote = WSOL) that is WSOL→token — a token BUY. On a
+        // FLIPPED pool (base = WSOL, quote = token) the SAME `buy` is token→WSOL —
+        // a token SELL, direction inverted, and the token leg is the QUOTE leg
+        // (the WSOL leg is the BASE leg). Read orientation authoritatively from the
+        // pool account; assume canonical if the pool isn't cached yet.
+        let flipped = self
+            .pool_state
+            .pump_base_is_wsol(&first.pump.pool, &wsol_vault)
+            .unwrap_or(false);
+        // Token-perspective direction + the TOKEN-leg amount for the state advance.
+        let (is_token_buy, token_amount) = if flipped {
+            (!sig.is_buy, sig.quote_amount) // on-chain quote leg == token
+        } else {
+            (sig.is_buy, sig.base_amount) // on-chain base leg == token
+        };
+        // WSOL-leg amount — the trigger-size proxy (base leg on a flipped pool).
+        let wsol_amount = if flipped { sig.base_amount } else { sig.quote_amount };
+
         // ── Accumulate the Pump leg of EVERY tx (before any trigger gate) ─────
         // Every observed Pump instruction — whether a plain holder/sniper swap
         // or the Pump leg of a competitor ARB tx — is real Pump flow that moves
@@ -806,13 +829,13 @@ impl ShredArbEngine {
             self.arb_ignored.fetch_add(1, Ordering::Relaxed);
         }
         self.pool_state.apply_pump_swap(
-            &first.pump.pool, &token_vault, &wsol_vault, &first.token_mint, sig.is_buy, sig.base_amount, sig.slot,
+            &first.pump.pool, &token_vault, &wsol_vault, &first.token_mint, is_token_buy, token_amount, sig.slot,
         );
 
         // ── Trigger gate: only ASSESS (price + maybe send) when the observed
         // trade is big enough. Accumulation above already happened, so a small
         // trade still moves our state — it just doesn't trigger a send itself.
-        if sig.quote_amount < self.live.min_trigger_lamports() {
+        if wsol_amount < self.live.min_trigger_lamports() {
             self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -834,7 +857,7 @@ impl ShredArbEngine {
         if self.params.min_trigger_reserve_frac > 0.0 {
             let thresh =
                 (pump_after.quote_reserve as f64 * self.params.min_trigger_reserve_frac) as u64;
-            if sig.quote_amount < thresh {
+            if wsol_amount < thresh {
                 self.skip_min_trigger.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -867,7 +890,7 @@ impl ShredArbEngine {
                                 // Pump leg (circular arb):
                                 //   pump buy  → meteora token→WSOL (a_to_b = token_is_a)
                                 //   pump sell → meteora WSOL→token (a_to_b = !token_is_a)
-                                let a_to_b = if sig.is_buy {
+                                let a_to_b = if is_token_buy {
                                     p.meteora.token_is_a
                                 } else {
                                     !p.meteora.token_is_a

@@ -571,7 +571,13 @@ impl PoolStateCache {
             .pump_coin_creator(pool)
             .map(|c| c != Pubkey::default())
             .unwrap_or(true);
-        Some(PumpPool::new(base, quote, supply, is_canonical))
+        let mut p = PumpPool::new(base, quote, supply, is_canonical);
+        // FLIPPED pool (on-chain base = WSOL) → the fee is levied on the token
+        // leg, not WSOL. Assume canonical (fee on WSOL) if the pool isn't cached.
+        if self.pump_base_is_wsol(pool, wsol_vault).unwrap_or(false) {
+            p.fee_on_wsol_leg = false;
+        }
+        Some(p)
     }
 
     // ── Live state: advance pool state by in-flight shred txs ─────────────────
@@ -709,6 +715,25 @@ impl PoolStateCache {
     pub fn spl_mint_supply(&self, mint: &Pubkey) -> Option<u64> {
         let entry = self.inner.get(mint)?;
         read_u64_le(entry.value(), 36)
+    }
+
+    /// Whether this Pump.fun AMM pool is FLIPPED: its on-chain `base_mint` is
+    /// WSOL and the meme token is the `quote_mint` (the OPPOSITE of a canonical
+    /// pump pool). Determined authoritatively by comparing the on-chain
+    /// `pool_base_token_account` (pubkey @ offset 139 of the Pool account) to the
+    /// WSOL vault the pair resolved: if the base vault IS the WSOL vault, the
+    /// base side is WSOL → flipped. `None` if the pool account isn't cached yet.
+    ///
+    /// Matters for BOTH the observed-swap interpretation (a pump `buy` is a token
+    /// SELL on a flipped pool) AND the fee side (the fee is levied on the on-chain
+    /// quote mint, which on a flipped pool is the TOKEN, not WSOL).
+    pub fn pump_base_is_wsol(&self, pool: &Pubkey, wsol_vault: &Pubkey) -> Option<bool> {
+        let entry = self.inner.get(pool)?;
+        let base_vault = entry
+            .value()
+            .get(139..139 + 32)
+            .map(|s| Pubkey::new_from_array(s.try_into().unwrap()))?;
+        Some(base_vault == *wsol_vault)
     }
 
     /// Token-2022 transfer-fee basis points for a token mint, or 0 if none.
