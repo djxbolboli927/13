@@ -405,6 +405,7 @@ fn spawn_shred_arb(
         min_pool_wsol_lamports: sa.min_pool_wsol_lamports,
         never_close: sa.never_close_pools,
         rpc_sim_compare: sa.rpc_sim_compare,
+        disable_preempt: sa.disable_preempt,
     };
 
     // Errors-only file log (errors + why-not-sent + why-lost) under /root/g.
@@ -462,6 +463,10 @@ fn spawn_shred_arb(
         let mut accounts: Vec<solana_sdk::pubkey::Pubkey> = Vec::new();
         for p in &pairs {
             accounts.push(p.meteora.pool);
+            // Pump POOL account: its `coin_creator` @211 drives the creator_vault
+            // accounts (re-derived live before each send) and the canonical-fee
+            // detection.
+            accounts.push(p.pump.pool);
             accounts.push(p.pump.token_vault());
             accounts.push(p.pump.wsol_vault());
             // Token mint too — its `supply` field drives the Pump market-cap fee tier.

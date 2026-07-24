@@ -332,6 +332,12 @@ pub struct ShredArbConfig {
     /// path (runs in a spawned task; adds zero send latency). Default false.
     #[serde(default)]
     pub rpc_sim_compare: bool,
+    /// Disable the pre-send preempt recheck. Default false = preempt ACTIVE:
+    /// if the Meteora pool's on-chain state ADVANCED (a tx touched it) after we
+    /// computed, the trade is re-priced on the fresh state and dropped when no
+    /// longer profitable. An unchanged pool always sends. true = always send.
+    #[serde(default)]
+    pub disable_preempt: bool,
 }
 
 fn default_alt_fetch_providers() -> Vec<String> {
@@ -460,6 +466,7 @@ impl Default for ShredArbConfig {
             metis_load_retry_limit: default_metis_load_retry_limit(),
             meteora_max_stale_slots: 0,
             rpc_sim_compare: false,
+            disable_preempt: false,
         }
     }
 }

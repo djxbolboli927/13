@@ -111,7 +111,13 @@ pub struct PoolStateCache {
     /// with the `built_on` slot (the account's last-update slot at rebuild time).
     /// When gRPC catches up (last_update_slot > built_on) the overlay is ignored
     /// and rebuilt from the fresh cache — so we never drift from ground truth.
-    live_pump: Arc<DashMap<Pubkey, (u64, PumpPool)>>,
+    /// Keyed by the pool's token vault → `(built_on_grpc_slot, shred_block_slot,
+    /// inflight_count, PumpPool)`. In-flight swaps accumulate only WITHIN one
+    /// block: a new block (shred_block_slot advances) discards the previous
+    /// block's queued swaps and restarts from confirmed state — landed ones show
+    /// up as a gRPC account update, unlanded ones are moot. The count = how many
+    /// in-flight Pump swaps are folded into THIS block's overlay.
+    live_pump: Arc<DashMap<Pubkey, (u64, u64, u32, PumpPool)>>,
     /// LIVE overlay of Meteora pools, keyed by pool account (only `sqrt_price`
     /// advances on a swap; liquidity/fees stay from the decoded cache).
     live_meteora: Arc<DashMap<Pubkey, (u64, MeteoraPool)>>,
@@ -414,6 +420,32 @@ impl PoolStateCache {
     pub fn meteora_pool(
         &self,
         pool: &Pubkey,
+        fallback_fee_numerator: u64,
+        worst_case_fee: bool,
+    ) -> Option<MeteoraPool> {
+        let p = self.meteora_pool_decoded(pool, fallback_fee_numerator, worst_case_fee)?;
+        // LIVE overlay: if a shred-advanced sqrt_price exists that is still based
+        // on the CURRENT cache slot, use it (keeps us in sync with in-flight txs
+        // the gRPC stream hasn't delivered yet). Only sqrt_price is overridden;
+        // liquidity/fees come from the fresh decode. Re-validate the range.
+        if let Some(e) = self.live_meteora.get(pool) {
+            if e.value().0 == self.last_update_slot(pool).unwrap_or(0) {
+                let sp = e.value().1.sqrt_price;
+                if sp >= p.sqrt_min_price && sp <= p.sqrt_max_price {
+                    return Some(MeteoraPool { sqrt_price: sp, ..p });
+                }
+            }
+        }
+        Some(p)
+    }
+
+    /// Raw decode of a Meteora pool WITHOUT the live shred overlay — the
+    /// gRPC-confirmed ground truth. Used as the base for the in-flight overlay
+    /// so we never advance a price that is itself already advanced (which would
+    /// stack in-flight swaps). Same validity gating as `meteora_pool`.
+    fn meteora_pool_decoded(
+        &self,
+        pool: &Pubkey,
         _fallback_fee_numerator: u64,
         worst_case_fee: bool,
     ) -> Option<MeteoraPool> {
@@ -451,18 +483,6 @@ impl PoolStateCache {
             || p.sqrt_price > p.sqrt_max_price
         {
             return None;
-        }
-        // LIVE overlay: if a shred-advanced sqrt_price exists that is still based
-        // on the CURRENT cache slot, use it (keeps us in sync with in-flight txs
-        // the gRPC stream hasn't delivered yet). Only sqrt_price is overridden;
-        // liquidity/fees come from the fresh decode. Re-validate the range.
-        if let Some(e) = self.live_meteora.get(pool) {
-            if e.value().0 == self.last_update_slot(pool).unwrap_or(0) {
-                let sp = e.value().1.sqrt_price;
-                if sp >= p.sqrt_min_price && sp <= p.sqrt_max_price {
-                    return Some(MeteoraPool { sqrt_price: sp, ..p });
-                }
-            }
         }
         Some(p)
     }
@@ -513,30 +533,39 @@ impl PoolStateCache {
     /// quote = WSOL. `token_mint` is used to read the token's REAL supply for
     /// the market-cap fee tier; if the mint account isn't cached yet, supply is
     /// passed as 0 and `PumpPool::new` fails closed to the highest fee tier.
-    ///
-    /// `token_is_base`: whether the PROGRAM's base_mint is the token (normal
-    /// pool) or WSOL (inverted pool, e.g. "WSOL-HOOD Market"). Inverted pools
-    /// are always NON-CANONICAL, and the on-chain fee program charges those the
-    /// `FeeConfig.flat_fees` — not the market-cap tiers (`inverted_pool_fee()`).
     pub fn pump_pool(
         &self,
+        pool: &Pubkey,
         token_vault: &Pubkey,
         wsol_vault: &Pubkey,
         token_mint: &Pubkey,
-        token_is_base: bool,
     ) -> Option<PumpPool> {
         let base = self.spl_amount(token_vault)?;
         let quote = self.spl_amount(wsol_vault)?;
-        if token_is_base {
-            let supply = self.spl_mint_supply(token_mint).unwrap_or(0) as u128;
-            Some(PumpPool::new(base, quote, supply))
-        } else {
-            Some(PumpPool::new_with_fee(
-                base,
-                quote,
-                crate::pumpfun_math::inverted_pool_fee(),
-            ))
-        }
+        let supply = self.spl_mint_supply(token_mint).unwrap_or(0) as u128;
+        // `is_pump_pool` (canonical, market-cap-tiered fee) iff the pool's
+        // `coin_creator` is SET (non-default). Non-canonical pools — every
+        // inverted pool among them — charge the flat fee. If the pool account
+        // isn't cached yet, assume canonical (the conservative higher-fee path).
+        let is_canonical = self
+            .pump_coin_creator(pool)
+            .map(|c| c != Pubkey::default())
+            .unwrap_or(true);
+        Some(PumpPool::new(base, quote, supply, is_canonical))
+    }
+
+    /// The Pump.fun AMM pool's `coin_creator` (pubkey @ offset 211 of the Pool
+    /// account, discriminator included). This drives the `creator_vault` PDA and
+    /// its ATA. Pump can SET/rotate `coin_creator` after pool creation (default
+    /// zero → the real creator, populated by pump's backend on first trades), so
+    /// it must be read LIVE — a snapshot taken at discovery can go stale and the
+    /// derived vault accounts then mismatch, reverting the swap. `None` if the
+    /// pool account isn't cached (it must be subscribed for this to work).
+    pub fn pump_coin_creator(&self, pool: &Pubkey) -> Option<Pubkey> {
+        let entry = self.inner.get(pool)?;
+        let d = entry.value();
+        d.get(211..211 + 32)
+            .map(|s| Pubkey::new_from_array(s.try_into().unwrap()))
     }
 
     // ── Live state: advance pool state by in-flight shred txs ─────────────────
@@ -559,6 +588,7 @@ impl PoolStateCache {
     #[allow(clippy::too_many_arguments)]
     pub fn apply_pump_swap(
         &self,
+        pool: &Pubkey,
         token_vault: &Pubkey,
         wsol_vault: &Pubkey,
         token_mint: &Pubkey,
@@ -570,10 +600,19 @@ impl PoolStateCache {
     ) {
         use crate::shred_stream::PumpIxKind as K;
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
-        let base = match self.live_pump.get(token_vault) {
-            Some(e) if e.value().0 == cur => e.value().1,
-            _ => match self.pump_pool(token_vault, wsol_vault, token_mint, token_is_base) {
-                Some(p) => p,
+        // ACCUMULATE in-flight Pump swaps, but only WITHIN THE SAME BLOCK: base
+        // is the existing overlay iff it was built on the same confirmed gRPC
+        // slot AND the same shred block slot, else the fresh confirmed decode.
+        // Successive swaps inside one block are summed so the NEXT shred prices
+        // against a pool reflecting them; a new block discards the previous
+        // block's queue (landed swaps arrive as a gRPC update, unlanded ones
+        // are moot — accumulating them across blocks over-moves the price).
+        let (base, count) = match self.live_pump.get(token_vault) {
+            Some(e) if e.value().0 == cur && e.value().1 == shred_slot => {
+                (e.value().3, e.value().2)
+            }
+            _ => match self.pump_pool(pool, token_vault, wsol_vault, token_mint) {
+                Some(p) => (p, 0),
                 None => return,
             },
         };
@@ -594,7 +633,19 @@ impl PoolStateCache {
                 adv.flipped()
             }
         };
-        self.live_pump.insert(*token_vault, (cur, advanced));
+        self.live_pump
+            .insert(*token_vault, (cur, shred_slot, count.saturating_add(1), advanced));
+    }
+
+    /// Pump "behind": how many in-flight Pump swaps are accumulated in the
+    /// current block's overlay for this vault. 0 when the overlay is stale (the
+    /// confirmed gRPC state already caught up) or absent.
+    pub fn pump_behind(&self, token_vault: &Pubkey) -> u32 {
+        let cur = self.last_update_slot(token_vault).unwrap_or(0);
+        match self.live_pump.get(token_vault) {
+            Some(e) if e.value().0 == cur => e.value().2,
+            _ => 0,
+        }
     }
 
     /// Drop the live overlay for a Pump pool — used when a shred tx touched the
@@ -606,22 +657,25 @@ impl PoolStateCache {
         self.live_pump.remove(token_vault);
     }
 
-    /// Pump pool including any live (shred-advanced) state, if it is still based
-    /// on the current cache slot; otherwise the fresh cache decode.
+    /// Pump pool including any live (shred-advanced) state, valid only when it
+    /// is still built on the current confirmed gRPC slot AND belongs to the
+    /// block `shred_slot` we are pricing for; otherwise the fresh cache decode.
+    /// Passing a NEW block slot therefore discards the previous block's queue.
     pub fn pump_pool_live(
         &self,
+        pool: &Pubkey,
         token_vault: &Pubkey,
         wsol_vault: &Pubkey,
         token_mint: &Pubkey,
-        token_is_base: bool,
+        shred_slot: u64,
     ) -> Option<PumpPool> {
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
         if let Some(e) = self.live_pump.get(token_vault) {
-            if e.value().0 == cur {
-                return Some(e.value().1);
+            if e.value().0 == cur && e.value().1 == shred_slot {
+                return Some(e.value().3);
             }
         }
-        self.pump_pool(token_vault, wsol_vault, token_mint, token_is_base)
+        self.pump_pool(pool, token_vault, wsol_vault, token_mint)
     }
 
     /// Apply an observed Meteora swap (from a shred) to the live meteora overlay.
@@ -637,12 +691,15 @@ impl PoolStateCache {
         shred_slot: u64,
     ) {
         let cur = self.last_update_slot(pool).unwrap_or(0);
-        let base = match self.live_meteora.get(pool) {
-            Some(e) if e.value().0 == cur => e.value().1,
-            _ => match self.meteora_pool(pool, fallback_fee_numerator, worst_case_fee) {
-                Some(p) => p,
-                None => return,
-            },
+        // Base is ALWAYS the gRPC-confirmed decode (never the overlay): the only
+        // Meteora activity visible in shreds rides on competitor ARB txs, which
+        // overwhelmingly revert. Stacking every observed in-flight swap over-
+        // moves sqrt_price — if more than one had actually executed, the account
+        // would have updated (cur would advance) and the overlay rebuilt. At
+        // most one swap is genuinely pending, so apply exactly one on confirmed.
+        let base = match self.meteora_pool_decoded(pool, fallback_fee_numerator, worst_case_fee) {
+            Some(p) => p,
+            None => return,
         };
         let advanced = if shred_slot <= cur {
             base
@@ -674,9 +731,17 @@ impl PoolStateCache {
     /// extension, so any transfer fee lives only in a Token-2022 mint whose data
     /// is longer and holds a TLV extension list after the 82-byte base + 1-byte
     /// account-type tag. We scan that TLV for `TransferFeeConfig` (type 1) and
-    /// return the LARGER of its two epoch fees (older/newer) — never understating
-    /// the fee, so profit is never overstated.
+    /// return the fee ACTUALLY IN EFFECT this epoch — exactly what the on-chain
+    /// program charges. A `TransferFeeConfig` stores TWO snapshots
+    /// (`older_transfer_fee`, `newer_transfer_fee`); SPL `get_epoch_fee` uses
+    /// `newer` once `current_epoch >= newer.epoch`, else `older`. Taking the
+    /// larger of the two (the old behaviour) invents a fee no real transfer pays
+    /// when a mint LOWERS its fee, mis-pricing every leg. Epoch is derived from
+    /// the live slot (mainnet: 432_000 slots/epoch); before the slot is seeded
+    /// we fall back to the conservative max().
     pub fn mint_transfer_fee_bps(&self, mint: &Pubkey) -> u16 {
+        const SLOTS_PER_EPOCH: u64 = 432_000;
+        let current_epoch = self.slot.load(Ordering::Relaxed) / SLOTS_PER_EPOCH;
         let entry = match self.inner.get(mint) {
             Some(e) => e,
             None => return 0,
@@ -701,9 +766,22 @@ impl PoolStateCache {
             // where TransferFee = epoch(8)+maximum_fee(8)+basis_points(u16,2),
             // so basis_points sits at data offset 88 (older) and 106 (newer).
             if ext_type == 1 && ext_len >= 108 {
-                let older = u16::from_le_bytes([d[data_start + 88], d[data_start + 89]]);
-                let newer = u16::from_le_bytes([d[data_start + 106], d[data_start + 107]]);
-                return older.max(newer);
+                // TransferFee = epoch(u64)@0 + maximum_fee(u64)@8 + bps(u16)@16.
+                // From data_start: older.bps@88; newer.epoch@90, newer.bps@106.
+                let older_bps = u16::from_le_bytes([d[data_start + 88], d[data_start + 89]]);
+                let newer_epoch = u64::from_le_bytes(
+                    d[data_start + 90..data_start + 98].try_into().unwrap(),
+                );
+                let newer_bps = u16::from_le_bytes([d[data_start + 106], d[data_start + 107]]);
+                if current_epoch == 0 {
+                    // Slot not seeded yet — stay conservative (never understate).
+                    return older_bps.max(newer_bps);
+                }
+                return if current_epoch >= newer_epoch {
+                    newer_bps
+                } else {
+                    older_bps
+                };
             }
             if ext_len == 0 {
                 break; // malformed / end-of-list guard

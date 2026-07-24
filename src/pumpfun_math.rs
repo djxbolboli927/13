@@ -95,21 +95,15 @@ const FEE_TIERS: &[(u64, u64, u64)] = &[
     (0, 125, 2),
 ];
 
-/// `FeeConfig.flat_fees` read from chain at startup: `(total_bps, lp_bps)`.
-/// NON-CANONICAL pools (any pool not created by pump's migration authority —
-/// which includes EVERY inverted pool, since canonical pools always have
-/// base = token) are charged these flat fees, NOT the market-cap tier schedule.
-static FLAT_FEES: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+/// The on-chain `flat_fees` (`(total_bps, lp_bps)`) that the Fee Program applies
+/// to NON-canonical pools (`is_pump_pool == false`) — those charge a flat fee
+/// and IGNORE market cap. Read from the FeeConfig at startup. Every INVERTED
+/// pool (base = WSOL) is non-canonical, so this covers those too.
+static ONCHAIN_FLAT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
 
-/// Fee for an INVERTED pool (base_mint = WSOL, quote = token). Inverted pools
-/// are necessarily non-canonical → the on-chain fee program applies
-/// `FeeConfig.flat_fees` to them. Fallback matches the observed real event on
-/// such a pool (WSOL-HOOD sell: lpFee 25 + protocolFee 5 = 30 bps).
-pub fn inverted_pool_fee() -> (u64, u64) {
-    if let Some(&f) = FLAT_FEES.get() {
-        return f;
-    }
-    (30, 25)
+/// Install the on-chain flat fee (total_bps, lp_bps) for non-canonical pools.
+pub fn set_onchain_flat_fee(total_bps: u64, lp_bps: u64) {
+    let _ = ONCHAIN_FLAT.set((total_bps, lp_bps));
 }
 
 /// `(total_fee_bps, lp_fee_bps)` for a PumpSwap pool given its reserves and the
@@ -126,7 +120,22 @@ pub fn fee_for_reserves(
     base_reserve: u64,
     quote_reserve: u64,
     supply_base_units: u128,
+    is_canonical: bool,
 ) -> (u64, u64) {
+    // NON-canonical pools (`is_pump_pool == false`) charge the on-chain FLAT fee
+    // and IGNORE market cap. Running them through the market-cap tier schedule
+    // over-states the fee (up to 125 bps vs the real ~30 bps), which mis-sizes
+    // the trade. Empirically (verified across observed sell/buy events)
+    // `is_pump_pool` is true iff the pool's `coin_creator` is set (non-default);
+    // the caller passes that as `is_canonical`.
+    if !is_canonical {
+        if let Some(&(total, lp)) = ONCHAIN_FLAT.get() {
+            return (total, lp);
+        }
+        // No on-chain flat fee read yet → the observed flat schedule: lp 25 +
+        // protocol 5 = 30 bps total (real WSOL-HOOD event).
+        return (30, 25);
+    }
     let highest = (
         FEE_TIERS[FEE_TIERS.len() - 1].1,
         FEE_TIERS[FEE_TIERS.len() - 1].2,
@@ -170,16 +179,15 @@ pub fn load_onchain_fee_tiers(
     let acct = rpc.get_account(&fee_config).ok()?;
     let d = &acct.data;
     // flat_fees (Fees = lp/protocol/creator u64 bps) sits at [41..65] — the fee
-    // charged to NON-CANONICAL pools (all inverted pools among them). Install it
-    // for `inverted_pool_fee()`; sanity-capped like the tiers below.
+    // charged to NON-CANONICAL pools (all inverted pools among them).
     {
         let rd = |o: usize| -> Option<u64> {
             d.get(o..o + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
         };
         if let (Some(lp), Some(protocol), Some(creator)) = (rd(41), rd(49), rd(57)) {
             let total = lp.saturating_add(protocol).saturating_add(creator);
-            if total <= 1_000 && lp <= 1_000 && protocol <= 1_000 && creator <= 1_000 {
-                let _ = FLAT_FEES.set((total, lp));
+            if total > 0 && total <= 1_000 && lp <= 1_000 && protocol <= 1_000 && creator <= 1_000 {
+                set_onchain_flat_fee(total, lp);
             }
         }
     }
@@ -233,26 +241,22 @@ pub struct PumpPool {
 
 impl PumpPool {
     /// `supply_base_units` is the base token's real mint supply (0 = unknown →
-    /// highest fee tier, fail-closed).
-    pub fn new(base_reserve: u64, quote_reserve: u64, supply_base_units: u128) -> Self {
+    /// highest fee tier, fail-closed). `is_canonical` = the pool is a canonical
+    /// pump pool (`is_pump_pool == true`, i.e. its `coin_creator` is set); false
+    /// selects the flat fee instead of the market-cap tier.
+    pub fn new(
+        base_reserve: u64,
+        quote_reserve: u64,
+        supply_base_units: u128,
+        is_canonical: bool,
+    ) -> Self {
         let (total_fee_bps, lp_fee_bps) =
-            fee_for_reserves(base_reserve, quote_reserve, supply_base_units);
+            fee_for_reserves(base_reserve, quote_reserve, supply_base_units, is_canonical);
         Self {
             base_reserve,
             quote_reserve,
             total_fee_bps,
             lp_fee_bps,
-        }
-    }
-
-    /// Construct with an explicitly chosen fee tier (used for INVERTED pools,
-    /// whose raw-orientation market cap always lands in the top tier).
-    pub fn new_with_fee(base_reserve: u64, quote_reserve: u64, fee: (u64, u64)) -> Self {
-        Self {
-            base_reserve,
-            quote_reserve,
-            total_fee_bps: fee.0,
-            lp_fee_bps: fee.1,
         }
     }
 
@@ -401,7 +405,7 @@ mod tests {
 
     #[test]
     fn buy_then_sell_loses_to_fees() {
-        let p = PumpPool::new(1_000_000_000, 200_000_000_000, 1_000_000_000_000_000);
+        let p = PumpPool::new(1_000_000_000, 200_000_000_000, 1_000_000_000_000_000, true);
         let base_out = p.quote_buy(1_000_000_000);
         assert!(base_out > 0);
         let back = p.quote_sell(base_out);
@@ -411,7 +415,7 @@ mod tests {
 
     #[test]
     fn observed_buy_raises_price() {
-        let p = PumpPool::new(1_000_000_000, 200_000_000_000, 1_000_000_000_000_000);
+        let p = PumpPool::new(1_000_000_000, 200_000_000_000, 1_000_000_000_000_000, true);
         let before = p.spot_price(6, 9);
         let after = p.after_observed_buy(10_000_000).spot_price(6, 9);
         assert!(after > before);

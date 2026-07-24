@@ -68,6 +68,10 @@ struct CachedRoute {
     /// swap_instruction data (discovered once at capture time).
     in_off: usize,
     out_off: usize,
+    /// The Pump pool's `coin_creator` at capture time. Pump can rotate it after
+    /// creation, which moves the creator_vault accounts baked into `swap_ixs`;
+    /// on reuse we re-derive from the LIVE creator and patch any stale vault.
+    coin_creator: Option<solana_sdk::pubkey::Pubkey>,
 }
 
 /// Tunables sourced from `[shred_arb]` config.
@@ -155,6 +159,11 @@ pub struct ArbParams {
     /// DIAGNOSTIC: after each send, re-simulate the exact tx via RPC and log our
     /// predicted output vs. the network's real output + raw swap logs.
     pub rpc_sim_compare: bool,
+    /// Disable the pre-send preempt recheck. Default false = preempt ACTIVE:
+    /// if the Meteora pool's gRPC state ADVANCED after we computed (someone's
+    /// tx touched it) the trade is re-priced on the fresh state and dropped if
+    /// no longer profitable. true = always send.
+    pub disable_preempt: bool,
 }
 
 pub struct ShredArbEngine {
@@ -230,6 +239,12 @@ pub struct ShredArbEngine {
     skip_stale_meteora: AtomicU64,
     /// Opaque markers received (router/private-bot tx touched a watched pool).
     opaque_signals: AtomicU64,
+    /// Competitor ARB txs whose Meteora leg was IGNORED for state prediction
+    /// (assume-first — they mostly revert on the Meteora side).
+    arb_ignored: AtomicU64,
+    /// Shred signals dropped as BURNED at a block boundary (an older-block
+    /// opportunity superseded by a fresher one while we were busy).
+    skip_stale_signal: AtomicU64,
     /// Assessments skipped because the pool was dirty (undecodable in-flight tx
     /// seen, gRPC cache not yet caught up past its slot).
     skip_dirty_pump: AtomicU64,
@@ -304,6 +319,31 @@ struct Recheck {
     min_out: u64,
     /// Token-2022 transfer-fee bps of the intermediate token (0 for classic SPL).
     tfee_bps: u16,
+    /// The Meteora pool's gRPC `last_update_slot` at the moment we computed.
+    /// The preempt gate compares it to the current value: if the pool account
+    /// has NOT advanced (no on-chain state change) the tx is sent as-is; only a
+    /// genuine change triggers the re-check.
+    met_slot_at_calc: u64,
+}
+
+/// Per-leg snapshot taken at DECISION time, logged on every send so the
+/// operator can compare each leg's input / predicted output / fee / the exact
+/// reserves the math used against the on-chain result — and localize a
+/// mis-calculation to the Pump leg or the Meteora leg.
+#[derive(Clone, Copy)]
+struct LegSnapshot {
+    /// Venue of this leg ("Pump" / "Meteora").
+    venue: &'static str,
+    /// Input amount (lamports WSOL for the buy leg, token base units after).
+    input: u64,
+    /// Predicted output of this leg alone.
+    predicted_out: u64,
+    /// Fee (bps) the math charged on this leg.
+    fee_bps: u64,
+    /// Token-side reserve the calc used.
+    reserve_token: u64,
+    /// WSOL-side reserve the calc used.
+    reserve_wsol: u64,
 }
 
 /// On-chain fate of the direct-sent transactions (checked a few seconds after
@@ -379,6 +419,8 @@ impl ShredArbEngine {
             skip_no_meteora_state: AtomicU64::new(0),
             skip_stale_meteora: AtomicU64::new(0),
             opaque_signals: AtomicU64::new(0),
+            arb_ignored: AtomicU64::new(0),
+            skip_stale_signal: AtomicU64::new(0),
             skip_dirty_pump: AtomicU64::new(0),
             skip_bad_price: AtomicU64::new(0),
             skip_thin_pool: AtomicU64::new(0),
@@ -412,8 +454,34 @@ impl ShredArbEngine {
     /// fans out to parallel tasks, exactly as before.
     pub async fn run(self: Arc<Self>, mut rx: mpsc::Receiver<PumpSwapSignal>) {
         info!(pools = self.registry.len(), "shred-arb engine running");
-        while let Some(sig) = rx.recv().await {
-            if let Some((pairs, pump_after)) = self.apply_signal(&sig) {
+        // Signals more than this many slots behind the freshest buffered one are
+        // BURNED (their opportunity already landed/reverted): drop them instead
+        // of plodding through a backlog. 1 = only the current block survives.
+        const STALE_SIGNAL_SLOTS: u64 = 1;
+        while let Some(first) = rx.recv().await {
+            let mut batch = vec![first];
+            while let Ok(s) = rx.try_recv() {
+                batch.push(s);
+            }
+            let newest = batch.iter().map(|s| s.slot).max().unwrap_or(0);
+            // Apply in arrival order (sequential — no overlay race); remember
+            // the LAST assessable outcome per pool: its pump_after already
+            // reflects every earlier swap of the batch, so ONE assessment per
+            // pool is enough.
+            let mut to_assess: std::collections::HashMap<
+                solana_sdk::pubkey::Pubkey,
+                (Vec<ArbPair>, PumpPool),
+            > = std::collections::HashMap::new();
+            for s in batch {
+                if newest.saturating_sub(s.slot) > STALE_SIGNAL_SLOTS {
+                    self.skip_stale_signal.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if let Some(out) = self.apply_signal(&s) {
+                    to_assess.insert(s.pool, out);
+                }
+            }
+            for (_, (pairs, pump_after)) in to_assess {
                 for pair in pairs {
                     let me = self.clone();
                     tokio::spawn(async move {
@@ -458,10 +526,10 @@ impl ShredArbEngine {
                         continue; // nothing changed → no new opportunity
                     }
                     let pump_now = match self.pool_state.pump_pool(
+                        &pair.pump.pool,
                         &pair.pump.token_vault(),
                         &pair.pump.wsol_vault(),
                         &pair.token_mint,
-                        pair.pump.token_is_a,
                     ) {
                         Some(p) => p,
                         None => continue,
@@ -549,10 +617,11 @@ impl ShredArbEngine {
         // Current Pump reserves (live overlay: includes any earlier shred txs
         // on this pool not yet delivered by gRPC).
         let pump_now = match self.pool_state.pump_pool_live(
+            &first.pump.pool,
             &token_vault,
             &wsol_vault,
             &first.token_mint,
-            token_is_base,
+            sig.slot,
         ) {
             Some(p) => p,
             None => {
@@ -566,6 +635,7 @@ impl ShredArbEngine {
         // (small trades still move the pool; skipping them drifts the overlay).
         // RAW values in; orientation resolved inside.
         self.pool_state.apply_pump_swap(
+            &first.pump.pool,
             &token_vault,
             &wsol_vault,
             &first.token_mint,
@@ -575,23 +645,18 @@ impl ShredArbEngine {
             sig.quote_amount,
             sig.slot,
         );
-        // If this tx also carried a Meteora leg on one of our pools (a circular
-        // arb), advance that Meteora pool's live sqrt_price too. Direction from
-        // the ECONOMIC Pump side: competitor token-BUY on Pump ⇒ they SELL the
-        // token into Meteora (token in ⇒ a_to_b = token_is_a) and vice versa.
-        if let (Some(mpool), Some(amt)) = (sig.meteora_pool, sig.meteora_amount_in) {
-            if let Some(pair) = pairs.iter().find(|p| p.meteora.pool == mpool) {
-                let a_to_b = if econ_buy {
-                    pair.meteora.token_is_a
-                } else {
-                    !pair.meteora.token_is_a
-                };
-                let fallback = self.params.meteora_fee_bps.saturating_mul(100_000);
-                self.pool_state.apply_meteora_swap(
-                    &mpool, fallback, self.params.meteora_fee_worst_case, amt, a_to_b, sig.slot,
-                );
-            }
+        // Meteora legs of competitor ARB txs are NOT applied to state
+        // (assume-first): they overwhelmingly REVERT on the Meteora side, so
+        // advancing our sqrt_price by them over-moves the price — that exact
+        // over-move was a proven source of over-sized entries. The Pump leg
+        // above IS real flow either way (it also reverts with the tx, but the
+        // gRPC update corrects us within a block; competitor Pump legs that
+        // LAND are exactly what we must reflect). Meteora relies on its own
+        // gRPC updates + the freshness gate + the pre-send preempt recheck.
+        if sig.meteora_pool.is_some() {
+            self.arb_ignored.fetch_add(1, Ordering::Relaxed);
         }
+        let _ = econ_buy; // economic direction retained for the trigger logic
 
         // ── Triggers gate ONLY the assessment, never the state advance ───────
         if sol_side < self.params.min_trigger_lamports {
@@ -611,7 +676,13 @@ impl ShredArbEngine {
         // this shred, so read it back for pricing.
         let pump_after = self
             .pool_state
-            .pump_pool_live(&token_vault, &wsol_vault, &first.token_mint, token_is_base)
+            .pump_pool_live(
+                &first.pump.pool,
+                &token_vault,
+                &wsol_vault,
+                &first.token_mint,
+                sig.slot,
+            )
             .unwrap_or(pump_now);
         Some((pairs, pump_after))
     }
@@ -905,6 +976,62 @@ impl ShredArbEngine {
             BuyOn::Pump => (DexKind::PumpFunAmm, DexKind::MeteoraDammV2),
             BuyOn::Meteora => (DexKind::MeteoraDammV2, DexKind::PumpFunAmm),
         };
+        // ── Per-leg snapshot (operator-requested diagnostics) ────────────────
+        // For EACH leg, at decision time: input, predicted output, the fee the
+        // math charged, and the exact token/WSOL reserves it used. Logged with
+        // every send so a per-leg over/under-prediction is directly visible
+        // against the on-chain result. Meteora token-side reserve is
+        // wsol_reserve with the flag inverted (it computes the other side).
+        let met_reserve_wsol = meteora.wsol_reserve(token_is_a);
+        let met_reserve_token = meteora.wsol_reserve(!token_is_a);
+        // Meteora effective fee (numerator over 1e9 → bps).
+        let met_fee_bps = meteora.fee_numerator / 100_000;
+        let (leg1, leg2) = match buy_on {
+            BuyOn::Pump => {
+                let t_out = pump_buy_leg(&pump_after, best_x);
+                let tok = apply_tfee(apply_tfee(t_out));
+                (
+                    LegSnapshot {
+                        venue: "Pump",
+                        input: best_x,
+                        predicted_out: t_out,
+                        fee_bps: pump_after.total_fee_bps,
+                        reserve_token: pump_after.base_reserve,
+                        reserve_wsol: pump_after.quote_reserve,
+                    },
+                    LegSnapshot {
+                        venue: "Meteora",
+                        input: tok,
+                        predicted_out: best_out,
+                        fee_bps: met_fee_bps,
+                        reserve_token: met_reserve_token,
+                        reserve_wsol: met_reserve_wsol,
+                    },
+                )
+            }
+            BuyOn::Meteora => {
+                let t_out = meteora.buy_token_with_wsol(best_x, token_is_a).unwrap_or(0);
+                let tok = apply_tfee(apply_tfee(t_out));
+                (
+                    LegSnapshot {
+                        venue: "Meteora",
+                        input: best_x,
+                        predicted_out: t_out,
+                        fee_bps: met_fee_bps,
+                        reserve_token: met_reserve_token,
+                        reserve_wsol: met_reserve_wsol,
+                    },
+                    LegSnapshot {
+                        venue: "Pump",
+                        input: tok,
+                        predicted_out: best_out,
+                        fee_bps: pump_after.total_fee_bps,
+                        reserve_token: pump_after.base_reserve,
+                        reserve_wsol: pump_after.quote_reserve,
+                    },
+                )
+            }
+        };
         // ── Staleness diagnostic (per DEX) ───────────────────────────────────
         // For each venue: the slot we last got fresh account data, how many slots
         // behind the newest slot we've seen that is, and the wall-clock age. On a
@@ -937,9 +1064,22 @@ impl ShredArbEngine {
             predicted_out = best_out,
             net_lamports = net,
             calc_slot = cur_slot,
+            pump_behind = self.pool_state.pump_behind(&pair.pump.token_vault()),
             meteora_state = %met_stale,
             pump_token_vault_state = %pump_base_stale,
             pump_wsol_vault_state = %pump_quote_stale,
+            leg1_venue = leg1.venue,
+            leg1_in = leg1.input,
+            leg1_predicted_out = leg1.predicted_out,
+            leg1_fee_bps = leg1.fee_bps,
+            leg1_reserve_token = leg1.reserve_token,
+            leg1_reserve_wsol = leg1.reserve_wsol,
+            leg2_venue = leg2.venue,
+            leg2_in = leg2.input,
+            leg2_predicted_out = leg2.predicted_out,
+            leg2_fee_bps = leg2.fee_bps,
+            leg2_reserve_token = leg2.reserve_token,
+            leg2_reserve_wsol = leg2.reserve_wsol,
             "shred-arb opportunity"
         );
 
@@ -961,9 +1101,16 @@ impl ShredArbEngine {
             amount_in: best_x,
             min_out: onchain_floor,
             tfee_bps: tfee_bps as u16,
+            met_slot_at_calc: self
+                .pool_state
+                .last_update_slot(&pair.meteora.pool)
+                .unwrap_or(0),
         };
-        self.execute(pair, key, buy_kind, sell_kind, best_x, onchain_floor, best_out, tip, recheck)
-            .await;
+        self.execute(
+            pair, key, buy_kind, sell_kind, best_x, onchain_floor, best_out, tip, recheck,
+            [leg1, leg2],
+        )
+        .await;
     }
 
     /// Spawn the off-hot-path RPC sim-compare for a just-sent tx (no-op unless
@@ -1000,6 +1147,7 @@ impl ShredArbEngine {
         predicted_out: u64,
         tip: u64,
         recheck: Recheck,
+        legs: [LegSnapshot; 2],
     ) {
         // De-dupe: don't blast the same pool with identical txs while an earlier
         // one is still unconfirmed. Kept SMALL and configurable (send_dedup_ms,
@@ -1043,7 +1191,7 @@ impl ShredArbEngine {
             })
         };
 
-        let swap_ixs = if let Some(ixs) = cached_ixs {
+        let mut swap_ixs = if let Some(ixs) = cached_ixs {
             from_cache = true;
             self.route_cache_hits.fetch_add(1, Ordering::Relaxed);
             ixs
@@ -1157,7 +1305,12 @@ impl ShredArbEngine {
                 {
                     self.route_cache.insert(
                         cache_key,
-                        CachedRoute { swap_ixs: swap_ixs.clone(), in_off, out_off },
+                        CachedRoute {
+                            swap_ixs: swap_ixs.clone(),
+                            in_off,
+                            out_off,
+                            coin_creator: self.pool_state.pump_coin_creator(&pair.pump.pool),
+                        },
                     );
                     debug!(token = %token, "route instructions cached in RAM");
                 }
@@ -1165,6 +1318,33 @@ impl ShredArbEngine {
             }
             swap_ixs
         };
+
+        // ── Pump coin_creator vault freshness ────────────────────────────────
+        // The Pump AMM `coin_creator_vault_ata` / `coin_creator_vault_authority`
+        // accounts are PDAs of the pool's `coin_creator`, which pump can set or
+        // rotate AFTER creation (default zero → real creator, populated by its
+        // backend). A cached route — or a Metis quote built off a stale pool
+        // snapshot — carries the OLD vault and the swap reverts. Re-derive from
+        // the LIVE `coin_creator` (read from the subscribed pool account) and
+        // rewrite any stale vault account in place. No-op when nothing is stale.
+        if let Some(current_creator) = self.pool_state.pump_coin_creator(&pair.pump.pool) {
+            let cached_creator = if from_cache {
+                self.route_cache.get(&cache_key).and_then(|c| c.coin_creator)
+            } else {
+                None
+            };
+            let patched = patch_pump_creator_vault(
+                &mut swap_ixs.swap_instruction,
+                &current_creator,
+                cached_creator.as_ref(),
+            );
+            if patched {
+                debug!(
+                    token = %token, pool = %pair.pump.pool, creator = %current_creator,
+                    "patched stale pump coin_creator vault accounts"
+                );
+            }
+        }
 
         // Teach our self-learning ALT every account in this route so subsequent
         // txs for this pool compress fully. Cheap: only unseen pubkeys enqueue.
@@ -1287,11 +1467,14 @@ impl ShredArbEngine {
             // Last-moment freshness gate: if the pool moved against us while we
             // fetched quotes/built the tx (a competitor's trade landed), this tx
             // would revert — skip it instead of sending a doomed tx.
-            if !self.still_profitable(&recheck) {
+            // Preempt: blocks ONLY when the Meteora gRPC state ADVANCED since
+            // we computed AND the re-priced trade is no longer profitable. An
+            // unchanged pool always sends. `disable_preempt = true` turns it off.
+            if !self.params.disable_preempt && !self.still_profitable(&recheck) {
                 self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
                 crate::errlog::log(
                     "not-sent",
-                    &format!("token={token} reason=preempted (pool moved before send)"),
+                    &format!("token={token} reason=preempted (meteora state moved, no longer profitable)"),
                 );
                 return;
             }
@@ -1320,7 +1503,40 @@ impl ShredArbEngine {
                 Ok(Ok(sig)) => {
                     self.sent.fetch_add(1, Ordering::Relaxed);
                     self.last_sent.insert(key, Instant::now());
-                    info!(signature = %sig, input = amount_in, "shred-arb tx sent (direct)");
+                    // Per-leg decision snapshot next to the tx hash — compare
+                    // each leg's predicted numbers (input/output/fee/reserves)
+                    // against the on-chain result to localize any calc error.
+                    info!(
+                        signature = %sig,
+                        sent_slot = self.pool_state.slot(),
+                        input = amount_in,
+                        leg1_venue = legs[0].venue,
+                        leg1_in = legs[0].input,
+                        leg1_predicted_out = legs[0].predicted_out,
+                        leg1_fee_bps = legs[0].fee_bps,
+                        leg1_reserve_token = legs[0].reserve_token,
+                        leg1_reserve_wsol = legs[0].reserve_wsol,
+                        leg2_venue = legs[1].venue,
+                        leg2_in = legs[1].input,
+                        leg2_predicted_out = legs[1].predicted_out,
+                        leg2_fee_bps = legs[1].fee_bps,
+                        leg2_reserve_token = legs[1].reserve_token,
+                        leg2_reserve_wsol = legs[1].reserve_wsol,
+                        "shred-arb tx sent (direct)"
+                    );
+                    crate::errlog::log(
+                        "sent",
+                        &format!(
+                            "token={token} sig={sig} sent_slot={} input={amount_in} \
+                             leg1[{} in={} out={} fee_bps={} reserve_token={} reserve_wsol={}] \
+                             leg2[{} in={} out={} fee_bps={} reserve_token={} reserve_wsol={}]",
+                            self.pool_state.slot(),
+                            legs[0].venue, legs[0].input, legs[0].predicted_out,
+                            legs[0].fee_bps, legs[0].reserve_token, legs[0].reserve_wsol,
+                            legs[1].venue, legs[1].input, legs[1].predicted_out,
+                            legs[1].fee_bps, legs[1].reserve_token, legs[1].reserve_wsol,
+                        ),
+                    );
                     if let Some(t) = sim_tx {
                         self.spawn_sim_compare(t, predicted_out, amount_in, token.clone());
                     }
@@ -1428,11 +1644,11 @@ impl ShredArbEngine {
 
         // Last-moment freshness gate (same as the direct path): skip if the pool
         // moved against us during the compute window (would revert).
-        if !self.still_profitable(&recheck) {
+        if !self.params.disable_preempt && !self.still_profitable(&recheck) {
             self.nosend_preempted.fetch_add(1, Ordering::Relaxed);
             crate::errlog::log(
                 "not-sent",
-                &format!("token={token} reason=preempted (pool moved before send)"),
+                &format!("token={token} reason=preempted (meteora state moved, no longer profitable)"),
             );
             return;
         }
@@ -1459,7 +1675,39 @@ impl ShredArbEngine {
             Ok(id) => {
                 self.sent.fetch_add(1, Ordering::Relaxed);
                 self.last_sent.insert(key, Instant::now());
-                info!(bundle = %id, input = amount_in, tip, via = if use_grpc { "grpc" } else { "rest" }, "shred-arb bundle sent");
+                info!(
+                    bundle = %id,
+                    input = amount_in,
+                    tip,
+                    sent_slot = self.pool_state.slot(),
+                    via = if use_grpc { "grpc" } else { "rest" },
+                    leg1_venue = legs[0].venue,
+                    leg1_in = legs[0].input,
+                    leg1_predicted_out = legs[0].predicted_out,
+                    leg1_fee_bps = legs[0].fee_bps,
+                    leg1_reserve_token = legs[0].reserve_token,
+                    leg1_reserve_wsol = legs[0].reserve_wsol,
+                    leg2_venue = legs[1].venue,
+                    leg2_in = legs[1].input,
+                    leg2_predicted_out = legs[1].predicted_out,
+                    leg2_fee_bps = legs[1].fee_bps,
+                    leg2_reserve_token = legs[1].reserve_token,
+                    leg2_reserve_wsol = legs[1].reserve_wsol,
+                    "shred-arb bundle sent"
+                );
+                crate::errlog::log(
+                    "sent",
+                    &format!(
+                        "token={token} bundle={id} sent_slot={} input={amount_in} \
+                         leg1[{} in={} out={} fee_bps={} reserve_token={} reserve_wsol={}] \
+                         leg2[{} in={} out={} fee_bps={} reserve_token={} reserve_wsol={}]",
+                        self.pool_state.slot(),
+                        legs[0].venue, legs[0].input, legs[0].predicted_out,
+                        legs[0].fee_bps, legs[0].reserve_token, legs[0].reserve_wsol,
+                        legs[1].venue, legs[1].input, legs[1].predicted_out,
+                        legs[1].fee_bps, legs[1].reserve_token, legs[1].reserve_wsol,
+                    ),
+                );
                 if let Some(t) = sim_tx {
                     self.spawn_sim_compare(t, predicted_out, amount_in, token.clone());
                 }
@@ -1489,6 +1737,15 @@ impl ShredArbEngine {
     /// Meteora reading we do NOT block (return true) — better to try than to
     /// stall on a cache gap.
     fn still_profitable(&self, r: &Recheck) -> bool {
+        // Only the Meteora pool advancing on gRPC can invalidate the trade (the
+        // Pump side is held at our predicted post-trade reserves). If the pool
+        // account has NOT changed since we computed, nothing moved → send as-is.
+        let cur_slot = self.pool_state.last_update_slot(&r.met_pool).unwrap_or(0);
+        if cur_slot <= r.met_slot_at_calc {
+            return true;
+        }
+        // The pool moved — recompute against the fresh state and only block if
+        // the trade is genuinely no longer profitable.
         let met = match self.pool_state.meteora_pool(&r.met_pool, r.fallback_fee, self.params.meteora_fee_worst_case) {
             Some(m) => m,
             None => return true,
@@ -1641,10 +1898,10 @@ impl ShredArbEngine {
                         continue;
                     };
                     let pump = self.pool_state.pump_pool(
+                        &pair.pump.pool,
                         &pair.pump.token_vault(),
                         &pair.pump.wsol_vault(),
                         &pair.token_mint,
-                        pair.pump.token_is_a,
                     );
                     let pump_fee_bps = pump.map(|p| p.total_fee_bps).unwrap_or(0);
                     let supply = self.pool_state.spl_mint_supply(&pair.token_mint).unwrap_or(0);
@@ -1699,7 +1956,7 @@ impl ShredArbEngine {
                 let unknown = ss.unknown.load(Ordering::Relaxed);
                 eprintln!(
                     "\n[shred-arb 30s] watching_pools={}\n\
-                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}] | opaque[seen={} dirty_skip={}]\n\
+                     ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} burned_signals={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}] | opaque[seen={} dirty_skip={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
@@ -1708,6 +1965,8 @@ impl ShredArbEngine {
                     self.profitable.load(Ordering::Relaxed),
                     self.not_profitable.load(Ordering::Relaxed),
                     self.skip_uncrossable.load(Ordering::Relaxed),
+                    self.arb_ignored.load(Ordering::Relaxed),
+                    self.skip_stale_signal.load(Ordering::Relaxed),
                     self.skip_min_trigger.load(Ordering::Relaxed),
                     self.skip_no_meteora_state.load(Ordering::Relaxed),
                     self.skip_stale_meteora.load(Ordering::Relaxed),
@@ -1871,6 +2130,26 @@ async fn sim_compare(
         ..Default::default()
     };
 
+    // PRE balance of the WSOL ATA (before the tx). The round-trip spends
+    // `amount_in` WSOL out of this ATA and returns the realized output to it, so
+    //   post = pre − amount_in + realized_out ⇒ realized_out = post − pre + amount_in.
+    // Without subtracting `pre` the "real_out" is just the absolute balance and
+    // the delta is meaningless.
+    let rpc_pre = rpc.clone();
+    let pre_ata = wsol_ata;
+    let pre_balance: Option<u64> = tokio::task::spawn_blocking(move || {
+        rpc_pre.get_account(&pre_ata).ok().and_then(|a| {
+            a.data.get(64..72).map(|s| {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(s);
+                u64::from_le_bytes(buf)
+            })
+        })
+    })
+    .await
+    .ok()
+    .flatten();
+
     let rpc2 = rpc.clone();
     let res =
         tokio::task::spawn_blocking(move || rpc2.simulate_transaction_with_config(&tx, cfg)).await;
@@ -1887,9 +2166,9 @@ async fn sim_compare(
         }
     };
 
-    // Real post-simulation WSOL balance (lamport-exact). The tx starts and ends
-    // in WSOL, so post − in-flight is the true realized output of the round-trip.
-    let real_out: Option<u64> = value
+    // Post-simulation WSOL balance (lamport-exact), then convert to the REALIZED
+    // round-trip output via realized_out = post − pre + amount_in.
+    let post_balance: Option<u64> = value
         .accounts
         .as_ref()
         .and_then(|v| v.first().cloned().flatten())
@@ -1906,6 +2185,13 @@ async fn sim_compare(
             buf.copy_from_slice(&d[64..72]);
             u64::from_le_bytes(buf)
         });
+    // realized_out = post − pre + amount_in (needs a known pre balance).
+    let real_out: Option<u64> = match (post_balance, pre_balance) {
+        (Some(post), Some(pre)) => {
+            Some((post as i128 - pre as i128 + amount_in as i128).max(0) as u64)
+        }
+        _ => None,
+    };
 
     let reverted = value.err.is_some();
     let logs = value
@@ -1996,6 +2282,76 @@ fn harvest_accounts(
     out
 }
 
+/// Derive the Pump.fun AMM `coin_creator_vault_authority` PDA and its WSOL ATA
+/// (`coin_creator_vault_ata`) for a given pool `coin_creator`, exactly as the
+/// on-chain program does (IDL `pump_amm.json`):
+///   authority = PDA([b"creator_vault", coin_creator], PUMP_AMM_PROGRAM)
+///   ata       = ATA(authority, quote_mint=WSOL, SPL Token program)
+fn pump_creator_vault(
+    coin_creator: &solana_sdk::pubkey::Pubkey,
+) -> (solana_sdk::pubkey::Pubkey, solana_sdk::pubkey::Pubkey) {
+    let program = crate::dex_ids::pumpfun_program();
+    let (authority, _) = solana_sdk::pubkey::Pubkey::find_program_address(
+        &[b"creator_vault", coin_creator.as_ref()],
+        &program,
+    );
+    // WSOL is a classic SPL token, so the vault ATA lives under the SPL Token
+    // program (Tokenkeg…), which is what the pool passes as `quote_token_program`.
+    let spl_token = solana_sdk::pubkey::Pubkey::from_str_const(
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    );
+    let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+        &authority,
+        &crate::dex_ids::wsol_mint(),
+        &spl_token,
+    );
+    (authority, ata)
+}
+
+/// Rewrite the Pump `coin_creator_vault_ata` / `coin_creator_vault_authority`
+/// accounts in a (possibly cached or Metis-stale) swap instruction so they match
+/// the pool's CURRENT `coin_creator`. Pump can rotate `coin_creator` after pool
+/// creation (default zero → real creator), which moves both PDAs; a frozen
+/// instruction then carries the OLD vault and the swap reverts. We re-derive the
+/// correct pair and swap out any account that equals a KNOWN-stale vault
+/// (derived from the default/zero creator and from whatever creator was current
+/// when the route was cached). A no-op when nothing is stale.
+fn patch_pump_creator_vault(
+    ix: &mut crate::metis::InstructionData,
+    current_creator: &solana_sdk::pubkey::Pubkey,
+    cached_creator: Option<&solana_sdk::pubkey::Pubkey>,
+) -> bool {
+    let (new_auth, new_ata) = pump_creator_vault(current_creator);
+    let new_auth_s = new_auth.to_string();
+    let new_ata_s = new_ata.to_string();
+    // Stale candidates: the zero/default creator (the pre-population value) and
+    // the creator captured when this route was cached, if different.
+    let mut stale: Vec<solana_sdk::pubkey::Pubkey> =
+        vec![solana_sdk::pubkey::Pubkey::default()];
+    if let Some(c) = cached_creator {
+        stale.push(*c);
+    }
+    let mut patched = false;
+    for old in stale {
+        if old == *current_creator {
+            continue;
+        }
+        let (old_auth, old_ata) = pump_creator_vault(&old);
+        let old_auth_s = old_auth.to_string();
+        let old_ata_s = old_ata.to_string();
+        for a in ix.accounts.iter_mut() {
+            if a.pubkey == old_auth_s {
+                a.pubkey = new_auth_s.clone();
+                patched = true;
+            } else if a.pubkey == old_ata_s {
+                a.pubkey = new_ata_s.clone();
+                patched = true;
+            }
+        }
+    }
+    patched
+}
+
 fn buy_kind_label(k: DexKind) -> &'static str {
     match k {
         DexKind::PumpFunAmm => "PumpFun",
@@ -2044,11 +2400,23 @@ fn optimize_size<F: Fn(u64) -> Option<u64>>(
         xf *= ratio;
     }
 
-    // Linear refinement around the best grid point.
-    let span = (best_x / 10).max(1);
-    let a = best_x.saturating_sub(span).max(lo);
-    let b = best_x.saturating_add(span).min(hi);
-    let step = ((b - a) / 50).max(1);
+    // EXACT integer ternary search inside the bracket around the best grid
+    // point. The basin around a valid maximum is unimodal (oversized trades
+    // read as i128::MIN and push the bracket back toward the valid side), so
+    // this converges to the single best lamport — no snapping to a coarse grid.
+    let span = (best_x / 10).max(2);
+    let mut a = best_x.saturating_sub(span).max(lo);
+    let mut b = best_x.saturating_add(span).min(hi);
+    while b - a > 2 {
+        let m1 = a + (b - a) / 3;
+        let m2 = b - (b - a) / 3;
+        if net(m1) < net(m2) {
+            a = m1 + 1;
+        } else {
+            b = m2;
+        }
+    }
+    // Final exact scan of the tiny residual window (≤3 points).
     let mut x = a;
     while x <= b {
         let n = net(x);
@@ -2056,7 +2424,7 @@ fn optimize_size<F: Fn(u64) -> Option<u64>>(
             best_net = n;
             best_x = x;
         }
-        x = x.saturating_add(step);
+        x += 1;
     }
     (best_x, best_net)
 }

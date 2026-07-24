@@ -88,6 +88,9 @@ pub struct PumpSwapSignal {
     /// Direction is the OPPOSITE of the Pump leg (a circular arb), resolved by
     /// the engine which knows each pool's token side.
     pub meteora_pool: Option<Pubkey>,
+    /// Retained for detection/diagnostics; the engine no longer applies Meteora
+    /// legs to state (assume-first — competitor arb legs mostly revert).
+    #[allow(dead_code)]
     pub meteora_amount_in: Option<u64>,
 }
 
