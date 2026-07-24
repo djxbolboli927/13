@@ -593,28 +593,41 @@ impl ShredArbEngine {
                 tokio::spawn(async move { me.handle(sig).await; });
                 continue;
             }
-            // Backlog: keep only the NEWEST signal per Pump pool and drop any
-            // whose block is already stale (burned) relative to the freshest.
+            // Backlog: apply EVERY swap, but group by Pump pool and process each
+            // pool's signals SEQUENTIALLY in slot order. This fixes two bugs:
+            //   1) the old "keep only the newest signal per pool" collapse dropped
+            //      the rest, so a sell+buy (or several buys) in one block lost all
+            //      but one — under-moving our predicted state.
+            //   2) spawning a task per signal let concurrent `apply_pump_swap`
+            //      calls RACE on the same vault's overlay (read-modify-write on a
+            //      DashMap entry is not atomic), losing accumulated effects.
+            // Different pools run on their own task → evaluation stays parallel
+            // ACROSS pools; only same-pool state advances are serialized (which
+            // is exactly what correctness requires). Truly stale older-block
+            // signals are still dropped as burned.
             let newest = batch.iter().map(|s| s.slot).max().unwrap_or(0);
-            let mut best: std::collections::HashMap<
+            let mut by_pool: std::collections::HashMap<
                 solana_sdk::pubkey::Pubkey,
-                PumpSwapSignal,
+                Vec<PumpSwapSignal>,
             > = std::collections::HashMap::new();
             for s in batch {
                 if newest.saturating_sub(s.slot) > STALE_SIGNAL_SLOTS {
                     self.skip_stale_signal.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                match best.get(&s.pool) {
-                    Some(prev) if prev.slot >= s.slot => {}
-                    _ => {
-                        best.insert(s.pool, s);
-                    }
-                }
+                by_pool.entry(s.pool).or_default().push(s);
             }
-            for (_, sig) in best {
+            for (_, mut sigs) in by_pool {
+                // Chronological order so the pool state advances in the order the
+                // swaps actually executed (stable sort preserves shred order
+                // within a slot).
+                sigs.sort_by_key(|s| s.slot);
                 let me = self.clone();
-                tokio::spawn(async move { me.handle(sig).await; });
+                tokio::spawn(async move {
+                    for sig in sigs {
+                        me.clone().handle(sig).await;
+                    }
+                });
             }
         }
     }
