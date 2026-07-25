@@ -251,6 +251,9 @@ pub struct ShredArbEngine {
     /// Assessments skipped because the pool was dirty (undecodable in-flight tx
     /// seen, gRPC cache not yet caught up past its slot).
     skip_dirty_pump: AtomicU64,
+    /// Phase-1 sim verdicts SKIPPED because a dark tx preceded them on the pool
+    /// and gRPC had not resynced — kept the ordering honest (no wrong verdict).
+    sim_paused_dark: AtomicU64,
     skip_bad_price: AtomicU64,
     /// Skipped because one side's WSOL depth was below min_pool_wsol_lamports
     /// (the both-sides liquidity guard). Split out of `bad_price` so the operator
@@ -426,6 +429,7 @@ impl ShredArbEngine {
             arb_ignored: AtomicU64::new(0),
             skip_stale_signal: AtomicU64::new(0),
             skip_dirty_pump: AtomicU64::new(0),
+            sim_paused_dark: AtomicU64::new(0),
             skip_bad_price: AtomicU64::new(0),
             skip_thin_pool: AtomicU64::new(0),
             skip_implausible: AtomicU64::new(0),
@@ -568,6 +572,26 @@ impl ShredArbEngine {
         econ_buy: bool,
     ) {
         use crate::shred_stream::PumpIxKind as K;
+        // ── Order guard: WAIT after a dark (undecodable) tx ──────────────────
+        // If a router/aggregator/private-bot tx touched this pool and gRPC has
+        // NOT yet delivered the post-dark state, our pre-state is missing that
+        // tx's effect — so simulating the NEXT tx here would give a wrong verdict
+        // and a spurious mismatch. Per the ordering rule, PAUSE this pool's sim
+        // until the account-update (checkpoint) arrives; then resume. (The dark
+        // marker was set and is cleared on catch-up by the dirty gate.)
+        if let Some(d) = self.dirty_pump.get(&sig.pool) {
+            let dark_slot = *d.value();
+            drop(d);
+            let vault = pairs.first().map(|p| p.pump.wsol_vault());
+            let caught_up = vault
+                .and_then(|v| self.pool_state.last_update_slot(&v))
+                .unwrap_or(0)
+                >= dark_slot;
+            if !caught_up {
+                self.sim_paused_dark.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
         // Pump leg on the RAW-orientation view (flip for inverted pools so the
         // raw base/quote amounts and fee side match on-chain).
         let raw = if token_is_base {
@@ -2072,7 +2096,7 @@ impl ShredArbEngine {
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} burned_signals={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}] | opaque[seen={} dirty_skip={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
-                     SIM     : recorded={} reconcile_checks={} matched={} mismatched={} unsimulated={} pending={}\n\
+                     SIM     : recorded={} reconcile_checks={} matched={} mismatched={} unsimulated={} paused_dark={} pending={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
@@ -2107,6 +2131,7 @@ impl ShredArbEngine {
                     sim_matched,
                     sim_mismatched,
                     sim_unsimulated,
+                    self.sim_paused_dark.load(Ordering::Relaxed),
                     sim_pending,
                     self.route_cache_hits.load(Ordering::Relaxed),
                     self.route_cache_misses.load(Ordering::Relaxed),
