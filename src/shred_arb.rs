@@ -254,6 +254,9 @@ pub struct ShredArbEngine {
     /// Phase-1 sim verdicts SKIPPED because a dark tx preceded them on the pool
     /// and gRPC had not resynced — kept the ordering honest (no wrong verdict).
     sim_paused_dark: AtomicU64,
+    /// Competitor txs NOT applied to the overlay because OUR sim said they
+    /// revert (a reverting tx moves nothing — applying it corrupts the state).
+    sim_skipped_revert: AtomicU64,
     skip_bad_price: AtomicU64,
     /// Skipped because one side's WSOL depth was below min_pool_wsol_lamports
     /// (the both-sides liquidity guard). Split out of `bad_price` so the operator
@@ -430,6 +433,7 @@ impl ShredArbEngine {
             skip_stale_signal: AtomicU64::new(0),
             skip_dirty_pump: AtomicU64::new(0),
             sim_paused_dark: AtomicU64::new(0),
+            sim_skipped_revert: AtomicU64::new(0),
             skip_bad_price: AtomicU64::new(0),
             skip_thin_pool: AtomicU64::new(0),
             skip_implausible: AtomicU64::new(0),
@@ -563,6 +567,10 @@ impl ShredArbEngine {
     /// revert verdict on the PRE-swap state, then record it in the sim ledger
     /// (which reconciles against the gRPC transaction-update). `pump_pre` is the
     /// Pump state the tx executes against (normalized base=token/quote=WSOL).
+    /// Returns `Some(tx_revert)` — whether OUR sim says this tx reverts — or
+    /// `None` when we could not produce a verdict (dark-paused). The caller uses
+    /// it to decide whether to advance the pool overlay: a reverting tx moves
+    /// NOTHING, so it must NOT be applied (that was corrupting our state).
     fn record_sim_verdict(
         &self,
         sig: &PumpSwapSignal,
@@ -570,7 +578,7 @@ impl ShredArbEngine {
         pump_pre: &PumpPool,
         token_is_base: bool,
         econ_buy: bool,
-    ) {
+    ) -> Option<bool> {
         use crate::shred_stream::PumpIxKind as K;
         // ── Order guard: WAIT after a dark (undecodable) tx ──────────────────
         // If a router/aggregator/private-bot tx touched this pool and gRPC has
@@ -589,7 +597,7 @@ impl ShredArbEngine {
                 >= dark_slot;
             if !caught_up {
                 self.sim_paused_dark.fetch_add(1, Ordering::Relaxed);
-                return;
+                return None;
             }
         }
         // Pump leg on the RAW-orientation view (flip for inverted pools so the
@@ -617,7 +625,7 @@ impl ShredArbEngine {
                 let base_out = raw.sim_boost_base_out(sig.quote_amount);
                 ("boost", sig.quote_amount, base_out, sig.pump_slippage, base_out < sig.pump_slippage)
             }
-            K::Opaque => return,
+            K::Opaque => return None,
         };
 
         // Meteora leg (2-hop arb), on its PRE-swap state. Direction = OPPOSITE of
@@ -679,6 +687,7 @@ impl ShredArbEngine {
                 tx_revert,
             },
         );
+        Some(tx_revert)
     }
 
     fn apply_signal(&self, sig: &PumpSwapSignal) -> Option<(Vec<ArbPair>, PumpPool)> {
@@ -761,26 +770,39 @@ impl ShredArbEngine {
             }
         };
 
-        // ── Phase-1 sim: compute THIS competitor tx's own output + revert
-        // verdict on the PRE-swap state, and record it for reconcile against the
-        // gRPC transaction-update. Uses `pump_now` (the state the tx executes
-        // against). Diagnostic only — changes no trading decision.
-        self.record_sim_verdict(sig, &pairs, &pump_now, token_is_base, econ_buy);
-
-        // ── ALWAYS advance live state — even for trades below the trigger
-        // (small trades still move the pool; skipping them drifts the overlay).
-        // RAW values in; orientation resolved inside.
-        self.pool_state.apply_pump_swap(
-            &first.pump.pool,
-            &token_vault,
-            &wsol_vault,
-            &first.token_mint,
-            token_is_base,
-            sig.kind,
-            sig.base_amount,
-            sig.quote_amount,
-            sig.slot,
-        );
+        // ── Simulate THIS tx on the PRE-swap state: compute its own output +
+        // revert verdict, record it for reconcile, and — crucially — decide
+        // whether it moves the pool. A tx our sim says REVERTS moves NOTHING, so
+        // applying it would corrupt the state the NEXT tx prices against (exactly
+        // the "we didn't write the pool state correctly" problem). Only advance
+        // the overlay for a tx we believe SUCCEEDS. Dark-paused (None) → hold.
+        let verdict = self.record_sim_verdict(sig, &pairs, &pump_now, token_is_base, econ_buy);
+        match verdict {
+            Some(false) => {
+                // Believed to SUCCEED → advance the live overlay (RAW values in;
+                // orientation resolved inside). This runs for trades below the
+                // trigger too — small ones still move the pool.
+                self.pool_state.apply_pump_swap(
+                    &first.pump.pool,
+                    &token_vault,
+                    &wsol_vault,
+                    &first.token_mint,
+                    token_is_base,
+                    sig.kind,
+                    sig.base_amount,
+                    sig.quote_amount,
+                    sig.slot,
+                );
+            }
+            Some(true) => {
+                // Believed to REVERT → do NOT touch the overlay.
+                self.sim_skipped_revert.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                // Dark-paused → we are waiting for the gRPC checkpoint; do not
+                // advance (the overlay was already invalidated for the dark tx).
+            }
+        }
         // Meteora legs of competitor ARB txs are NOT applied to state
         // (assume-first): they overwhelmingly REVERT on the Meteora side, so
         // advancing our sqrt_price by them over-moves the price — that exact
@@ -2096,7 +2118,7 @@ impl ShredArbEngine {
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} burned_signals={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}] | opaque[seen={} dirty_skip={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
-                     SIM     : recorded={} reconcile_checks={} matched={} mismatched={} unsimulated={} paused_dark={} pending={}\n\
+                     SIM     : recorded={} reconcile_checks={} matched={} mismatched={} unsimulated={} paused_dark={} skipped_revert={} pending={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
@@ -2132,6 +2154,7 @@ impl ShredArbEngine {
                     sim_mismatched,
                     sim_unsimulated,
                     self.sim_paused_dark.load(Ordering::Relaxed),
+                    self.sim_skipped_revert.load(Ordering::Relaxed),
                     sim_pending,
                     self.route_cache_hits.load(Ordering::Relaxed),
                     self.route_cache_misses.load(Ordering::Relaxed),
