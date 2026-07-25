@@ -36,6 +36,7 @@ mod program_registry;
 mod pumpfun_math;
 mod rate_limiter;
 mod shred_arb;
+mod sim_ledger;
 #[allow(dead_code)]
 mod shred_proxy;
 mod shred_stream;

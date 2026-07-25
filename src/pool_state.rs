@@ -23,8 +23,10 @@ use tracing::{info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-    SubscribeRequestFilterAccounts, SubscribeRequestPing,
+    SubscribeRequestFilterAccounts, SubscribeRequestFilterTransactions, SubscribeRequestPing,
 };
+
+use crate::sim_ledger::SimLedger;
 
 use crate::meteora_math::{MeteoraPool, MAX_SQRT_PRICE, MIN_SQRT_PRICE};
 use crate::pumpfun_math::PumpPool;
@@ -121,6 +123,9 @@ pub struct PoolStateCache {
     /// LIVE overlay of Meteora pools, keyed by pool account (only `sqrt_price`
     /// advances on a swap; liquidity/fees stay from the decoded cache).
     live_meteora: Arc<DashMap<Pubkey, (u64, MeteoraPool)>>,
+    /// Phase-1 diagnostic: our per-tx simulation verdicts, reconciled here
+    /// against the gRPC transaction-update stream (fed on the same subscription).
+    sim_ledger: Arc<SimLedger>,
 }
 
 fn read_u128_le(data: &[u8], off: usize) -> Option<u128> {
@@ -328,7 +333,14 @@ impl PoolStateCache {
             change: Arc::new(tokio::sync::Notify::new()),
             live_pump: Arc::new(DashMap::with_capacity(256)),
             live_meteora: Arc::new(DashMap::with_capacity(256)),
+            sim_ledger: Arc::new(SimLedger::default()),
         }
+    }
+
+    /// Shared handle to the Phase-1 simulation ledger — the engine records its
+    /// per-tx verdicts here; the gRPC transaction-update stream reconciles them.
+    pub fn sim_ledger(&self) -> Arc<SimLedger> {
+        self.sim_ledger.clone()
     }
 
     /// Add accounts to the live subscription at runtime. Extends the tracked
@@ -812,12 +824,13 @@ impl PoolStateCache {
         let updates = self.updates.clone();
         let acct_set = self.accounts.clone();
         let change = self.change.clone();
+        let sim_ledger = self.sim_ledger.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
             loop {
                 match run_stream(
                     &endpoint, &x_token, &acct_set, &change, &inner, &last_update,
-                    &last_update_slot, &slot, &updates,
+                    &last_update_slot, &slot, &updates, &sim_ledger,
                 )
                 .await
                 {
@@ -832,18 +845,36 @@ impl PoolStateCache {
 }
 
 fn build_request(accounts: &[Pubkey]) -> SubscribeRequest {
+    let acct_strs: Vec<String> = accounts.iter().map(|p| p.to_string()).collect();
     let mut accounts_filter: HashMap<String, SubscribeRequestFilterAccounts> = HashMap::new();
     accounts_filter.insert(
         "arb_pools".to_string(),
         SubscribeRequestFilterAccounts {
-            account: accounts.iter().map(|p| p.to_string()).collect(),
+            account: acct_strs.clone(),
             owner: vec![],
             filters: vec![],
             nonempty_txn_signature: None,
         },
     );
+    // Transaction filter on the SAME accounts: this is the ground truth for the
+    // Phase-1 reconcile — every transaction that touches one of our pool/vault
+    // accounts, WITH its real `err` (revert or not). Both `failed=None` and
+    // `vote=Some(false)` so we get succeeded AND reverted non-vote txs.
+    let mut tx_filter: HashMap<String, SubscribeRequestFilterTransactions> = HashMap::new();
+    tx_filter.insert(
+        "arb_pool_txs".to_string(),
+        SubscribeRequestFilterTransactions {
+            vote: Some(false),
+            failed: None,
+            signature: None,
+            account_include: acct_strs,
+            account_exclude: vec![],
+            account_required: vec![],
+        },
+    );
     SubscribeRequest {
         accounts: accounts_filter,
+        transactions: tx_filter,
         commitment: Some(CommitmentLevel::Processed as i32),
         ..Default::default()
     }
@@ -859,6 +890,7 @@ async fn run_stream(
     last_update_slot: &Arc<DashMap<Pubkey, u64>>,
     slot: &Arc<AtomicU64>,
     updates: &Arc<AtomicU64>,
+    sim_ledger: &Arc<SimLedger>,
 ) -> Result<()> {
     let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
         .x_token(Some(x_token.to_string()))?
@@ -904,6 +936,21 @@ async fn run_stream(
                         last_update.insert(pk, std::time::Instant::now());
                         last_update_slot.insert(pk, a.slot);
                         updates.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            Some(UpdateOneof::Transaction(t)) => {
+                // Ground truth for the Phase-1 reconcile: this tx touched one of
+                // our pools; `meta.err` says whether it reverted. Match it to our
+                // earlier simulation verdict (keyed by signature).
+                if let Some(info) = t.transaction {
+                    if !info.is_vote {
+                        if let Ok(sig) =
+                            solana_sdk::signature::Signature::try_from(info.signature.as_slice())
+                        {
+                            let real_revert = info.meta.map(|m| m.err.is_some()).unwrap_or(false);
+                            sim_ledger.reconcile(&sig, t.slot, real_revert);
+                        }
                     }
                 }
             }

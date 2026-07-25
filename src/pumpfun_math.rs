@@ -337,6 +337,54 @@ impl PumpPool {
         }
     }
 
+    // ── Phase-1 sim: a competitor tx's OWN leg output, for the revert verdict ─
+
+    /// SIM `buy` (exact base out): the quote lamports the user must pay for
+    /// `base_amount_out`, all fees added on top. Revert iff this exceeds the
+    /// tx's `max_quote_amount_in`.
+    pub fn sim_buy_quote_in(&self, base_amount_out: u64) -> u64 {
+        let b = self.base_reserve as u128;
+        let q = self.quote_reserve as u128;
+        let out = (base_amount_out as u128).min(b.saturating_sub(1));
+        if out == 0 {
+            return 0;
+        }
+        let quote_raw = ceil_div(q * out, b - out);
+        ceil_div(
+            quote_raw * (BPS_DENOM as u128 + self.total_fee_bps as u128),
+            BPS_DENOM as u128,
+        )
+        .min(u64::MAX as u128) as u64
+    }
+
+    /// SIM `sell` (exact base in): net quote out. Revert iff below the tx's
+    /// `min_quote_amount_out`. (Same as our own quote_sell.)
+    pub fn sim_sell_quote_out(&self, base_amount_in: u64) -> u64 {
+        self.quote_sell(base_amount_in)
+    }
+
+    /// SIM `buy_exact_quote_in` (exact quote in): base out. Revert iff below the
+    /// tx's `min_base_amount_out`. (Same as our own quote_buy: strips the fee
+    /// off the budget then runs the curve.)
+    pub fn sim_buy_quote_in_base_out(&self, quote_in: u64) -> u64 {
+        self.quote_buy(quote_in)
+    }
+
+    /// SIM `boost_buy_and_burn`: base burned for `quote_amount_in` (no user
+    /// fee — the full quote lands in the pool). Revert iff below
+    /// `min_base_amount_burned`.
+    pub fn sim_boost_base_out(&self, quote_in: u64) -> u64 {
+        let b = self.base_reserve as u128;
+        let q = self.quote_reserve as u128;
+        let qin = quote_in as u128;
+        if qin == 0 {
+            return 0;
+        }
+        (b * qin / (q + qin))
+            .min(b.saturating_sub(1))
+            .min(u64::MAX as u128) as u64
+    }
+
     /// Apply an observed `buy_exact_quote_in` (exact-IN on the QUOTE side:
     /// the user spends `spendable_quote_in` total, fees included, and receives
     /// whatever base that buys). Pool: quote vault gains the pool-bound input

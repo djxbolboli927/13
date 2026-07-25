@@ -39,6 +39,24 @@ const DISC_BOOST_BUY_AND_BURN: [u8; 8] = [105, 68, 6, 175, 0, 7, 35, 162];
 const DISC_WITHDRAW: [u8; 8] = [183, 18, 70, 156, 148, 109, 161, 34];
 /// Meteora DAMM v2 `swap` anchor discriminator (sha256("global:swap")[..8]).
 const DISC_METEORA_SWAP: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
+/// Meteora DAMM v2 `swap2` (current; `swap` is deprecated). Data after the
+/// discriminator: `amount_0 u64@8`, `amount_1 u64@16`, `swap_mode u8@24`
+/// (0=ExactIn, 1=PartialFill, 2=ExactOut). Verified against the official IDL.
+const DISC_METEORA_SWAP2: [u8; 8] = [65, 75, 63, 76, 235, 91, 91, 136];
+
+/// A decoded Meteora leg riding inside a competitor's (arb) transaction.
+#[derive(Debug, Clone, Copy)]
+pub struct MeteoraLeg {
+    pub pool: Pubkey,
+    /// Input amount (ExactIn/PartialFill) — for ExactOut this is the desired out.
+    pub amount_in: u64,
+    /// The user's slippage bound: `minimum_amount_out` (ExactIn/PartialFill) or
+    /// `maximum_amount_in` (ExactOut).
+    pub min_out: u64,
+    /// True for swap2 ExactOut mode — the curve runs in reverse, so our
+    /// forward-only verdict math does not apply (we log but skip its verdict).
+    pub exact_out: bool,
+}
 
 /// Which PumpSwap instruction was observed — RAW program semantics, NOT the
 /// economic token direction. On a normal pool base = token, quote = WSOL; on an
@@ -74,6 +92,14 @@ pub struct PumpSwapSignal {
     pub base_amount: u64,
     /// QUOTE-mint-side arg: limit (Buy/Sell) or EXACT in (BuyQuoteIn/Boost).
     pub quote_amount: u64,
+    /// The Pump ix's user slippage bound = the u64 at data offset 16 (always):
+    /// `max_quote_amount_in` (Buy), `min_quote_amount_out` (Sell),
+    /// `min_base_amount_out` (BuyQuoteIn), `min_base_amount_burned` (Boost).
+    /// Used by the Phase-1 sim to decide whether THIS competitor tx reverts.
+    pub pump_slippage: u64,
+    /// How many of OUR pools this tx touches: 1 (single swap) or 2 (Pump↔Meteora
+    /// arb). Diagnostic only.
+    pub hops: u8,
     /// Fee payer (static key 0) — lets the engine ignore opaque markers caused
     /// by OUR OWN in-flight transactions.
     pub fee_payer: Pubkey,
@@ -83,15 +109,17 @@ pub struct PumpSwapSignal {
     /// Slot this shred belongs to — used to keep the live pool state in sync
     /// (apply only shreds newer than the last gRPC account update).
     pub slot: u64,
-    /// If this same tx also carried a Meteora DAMM v2 `swap` (i.e. it is an
+    /// If this same tx also carried a Meteora DAMM v2 swap/swap2 (i.e. it is an
     /// arb that touches a Meteora pool), the Meteora pool and its `amount_in`.
     /// Direction is the OPPOSITE of the Pump leg (a circular arb), resolved by
     /// the engine which knows each pool's token side.
     pub meteora_pool: Option<Pubkey>,
-    /// Retained for detection/diagnostics; the engine no longer applies Meteora
-    /// legs to state (assume-first — competitor arb legs mostly revert).
-    #[allow(dead_code)]
     pub meteora_amount_in: Option<u64>,
+    /// The Meteora leg's slippage bound (`minimum_amount_out`, or
+    /// `maximum_amount_in` when `meteora_exact_out`). For the Phase-1 verdict.
+    pub meteora_min_out: Option<u64>,
+    /// swap2 ExactOut — reverse curve; the forward verdict math is skipped.
+    pub meteora_exact_out: bool,
 }
 
 /// Runtime counters for observability.
@@ -419,20 +447,29 @@ impl ShredConsumer {
 
             self.metrics.matched.fetch_add(1, Ordering::Relaxed);
             decoded_pools.push(pool);
-            let (meteora_pool, meteora_amount_in) = match meteora {
-                Some((p, a)) => (Some(p), Some(a)),
-                None => (None, None),
+            // The Pump slippage bound is ALWAYS the u64 at data offset 16.
+            let pump_slippage = arg1;
+            let (meteora_pool, meteora_amount_in, meteora_min_out, meteora_exact_out) = match meteora
+            {
+                Some(m) => (Some(m.pool), Some(m.amount_in), Some(m.min_out), m.exact_out),
+                None => (None, None, None, false),
             };
+            // Hops: 1 = Pump-only; 2 = also touches a watched Meteora pool.
+            let hops = if meteora_pool.is_some() { 2 } else { 1 };
             let signal = PumpSwapSignal {
                 pool,
                 kind,
                 base_amount,
                 quote_amount,
+                pump_slippage,
+                hops,
                 fee_payer,
                 sig: tx_sig,
                 slot,
                 meteora_pool,
                 meteora_amount_in,
+                meteora_min_out,
+                meteora_exact_out,
             };
             // Non-blocking: if the engine is busy, drop (staleness makes an old
             // signal worthless anyway).
@@ -464,11 +501,15 @@ impl ShredConsumer {
                     kind: PumpIxKind::Opaque,
                     base_amount: 0,
                     quote_amount: 0,
+                    pump_slippage: 0,
+                    hops: 1,
                     fee_payer,
                     sig: tx_sig,
                     slot,
                     meteora_pool: None,
                     meteora_amount_in: None,
+                    meteora_min_out: None,
+                    meteora_exact_out: false,
                 };
                 match tx.try_send(signal) {
                     Ok(()) => self.metrics.signals_sent.fetch_add(1, Ordering::Relaxed),
@@ -478,30 +519,53 @@ impl ShredConsumer {
         }
     }
 
-    /// Find a Meteora DAMM v2 `swap` instruction in this tx and return its pool
-    /// (account index 1 of the swap) and `amount_in` (first u64 after the 8-byte
-    /// discriminator). `None` if the tx has no Meteora swap. We take the FIRST
-    /// one — a Pump↔Meteora circular arb has exactly one Meteora leg.
+    /// Find a Meteora DAMM v2 `swap` OR `swap2` instruction in this tx and
+    /// decode its pool (account index 1), input amount and slippage bound.
+    /// `None` if the tx has no Meteora swap. We take the FIRST one — a
+    /// Pump↔Meteora circular arb has exactly one Meteora leg.
     fn find_meteora_swap(
         &self,
         msg: &solana_sdk::message::VersionedMessage,
         full_keys: &[Pubkey],
-    ) -> Option<(Pubkey, u64)> {
+    ) -> Option<MeteoraLeg> {
         for ix in msg.instructions() {
             let program = full_keys.get(ix.program_id_index as usize)?;
-            if *program != self.meteora {
+            if *program != self.meteora || ix.data.len() < 8 {
                 continue;
             }
-            if ix.data.len() < 16 || ix.data[0..8] != DISC_METEORA_SWAP {
-                continue;
-            }
+            let disc: [u8; 8] = ix.data[0..8].try_into().ok()?;
             // cp-amm swap accounts: [pool_authority, pool, ...]; index 1 = pool.
-            let pool = ix.accounts.get(1).and_then(|i| full_keys.get(*i as usize))?;
-            if *pool == Pubkey::default() {
-                continue;
+            let pool = match ix.accounts.get(1).and_then(|i| full_keys.get(*i as usize)) {
+                Some(p) if *p != Pubkey::default() => *p,
+                _ => continue,
+            };
+            if disc == DISC_METEORA_SWAP {
+                // swap: amount_in u64@8, minimum_amount_out u64@16.
+                if ix.data.len() < 24 {
+                    continue;
+                }
+                let amount_in = u64::from_le_bytes(ix.data[8..16].try_into().ok()?);
+                let min_out = u64::from_le_bytes(ix.data[16..24].try_into().ok()?);
+                return Some(MeteoraLeg { pool, amount_in, min_out, exact_out: false });
             }
-            let amount_in = u64::from_le_bytes(ix.data[8..16].try_into().ok()?);
-            return Some((*pool, amount_in));
+            if disc == DISC_METEORA_SWAP2 {
+                // swap2: amount_0 u64@8, amount_1 u64@16, swap_mode u8@24.
+                if ix.data.len() < 25 {
+                    continue;
+                }
+                let amount_0 = u64::from_le_bytes(ix.data[8..16].try_into().ok()?);
+                let amount_1 = u64::from_le_bytes(ix.data[16..24].try_into().ok()?);
+                let mode = ix.data[24];
+                // 0=ExactIn, 1=PartialFill → (amount_in, min_out) = (a0, a1).
+                // 2=ExactOut → (desired_out, max_in) = (a0, a1); reverse curve.
+                let exact_out = mode == 2;
+                return Some(MeteoraLeg {
+                    pool,
+                    amount_in: amount_0,
+                    min_out: amount_1,
+                    exact_out,
+                });
+            }
         }
         None
     }

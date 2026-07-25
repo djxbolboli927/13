@@ -178,6 +178,9 @@ pub struct ShredArbEngine {
     pub jito_grpc_limiter: Option<Arc<Mutex<RateLimiter>>>,
     pub user_pubkey: String,
     pub pool_state: PoolStateCache,
+    /// Phase-1 diagnostic ledger (shared with the pool-state gRPC task, which
+    /// reconciles our verdicts against the transaction-update stream).
+    sim_ledger: Arc<crate::sim_ledger::SimLedger>,
     /// Keyed by Pump.fun pool pubkey (what the signal carries). Each entry holds
     /// EVERY pair for that Pump pool — one per Meteora counter-pool, since a
     /// token can grow additional Meteora pools over time. Shared, mutable
@@ -394,6 +397,7 @@ impl ShredArbEngine {
             jito_limiter,
             jito_grpc_limiter,
             user_pubkey,
+            sim_ledger: pool_state.sim_ledger(),
             pool_state,
             registry,
             params,
@@ -551,6 +555,108 @@ impl ShredArbEngine {
     /// apply in instruction order with no race. Pure math, no await. Returns
     /// the pairs to assess and the post-trade Pump state, or `None` when there
     /// is nothing to assess (unknown pool, opaque marker, below trigger, …).
+    /// Phase-1 diagnostic: compute a competitor tx's OWN leg output(s) and
+    /// revert verdict on the PRE-swap state, then record it in the sim ledger
+    /// (which reconciles against the gRPC transaction-update). `pump_pre` is the
+    /// Pump state the tx executes against (normalized base=token/quote=WSOL).
+    fn record_sim_verdict(
+        &self,
+        sig: &PumpSwapSignal,
+        pairs: &[ArbPair],
+        pump_pre: &PumpPool,
+        token_is_base: bool,
+        econ_buy: bool,
+    ) {
+        use crate::shred_stream::PumpIxKind as K;
+        // Pump leg on the RAW-orientation view (flip for inverted pools so the
+        // raw base/quote amounts and fee side match on-chain).
+        let raw = if token_is_base {
+            *pump_pre
+        } else {
+            pump_pre.flipped()
+        };
+        let (kind_label, pump_in, pump_out, pump_bound, pump_revert) = match sig.kind {
+            K::Buy => {
+                let quote_in = raw.sim_buy_quote_in(sig.base_amount);
+                // revert iff required quote in EXCEEDS the user's max.
+                ("buy", sig.base_amount, quote_in, sig.pump_slippage, quote_in > sig.pump_slippage)
+            }
+            K::Sell => {
+                let quote_out = raw.sim_sell_quote_out(sig.base_amount);
+                ("sell", sig.base_amount, quote_out, sig.pump_slippage, quote_out < sig.pump_slippage)
+            }
+            K::BuyQuoteIn => {
+                let base_out = raw.sim_buy_quote_in_base_out(sig.quote_amount);
+                ("buy_exact_quote_in", sig.quote_amount, base_out, sig.pump_slippage, base_out < sig.pump_slippage)
+            }
+            K::BoostBuyBurn => {
+                let base_out = raw.sim_boost_base_out(sig.quote_amount);
+                ("boost", sig.quote_amount, base_out, sig.pump_slippage, base_out < sig.pump_slippage)
+            }
+            K::Opaque => return,
+        };
+
+        // Meteora leg (2-hop arb), on its PRE-swap state. Direction = OPPOSITE of
+        // the competitor's economic Pump direction (circular arb).
+        let mut met_present = false;
+        let (mut met_in, mut met_out, mut met_bound, mut met_revert) = (0u64, 0u64, 0u64, false);
+        if let (Some(mpool), Some(amt), Some(bound)) =
+            (sig.meteora_pool, sig.meteora_amount_in, sig.meteora_min_out)
+        {
+            if let Some(pair) = pairs.iter().find(|p| p.meteora.pool == mpool) {
+                let fee_num = self.params.meteora_fee_bps.saturating_mul(100_000);
+                if let Some(met) = self.pool_state.meteora_pool(
+                    &mpool,
+                    fee_num,
+                    self.params.meteora_fee_worst_case,
+                ) {
+                    met_present = true;
+                    met_in = amt;
+                    met_bound = bound;
+                    if sig.meteora_exact_out {
+                        // Reverse curve — our forward math doesn't apply; log the
+                        // leg but don't claim a verdict (kept as OK).
+                        met_out = 0;
+                        met_revert = false;
+                    } else {
+                        // competitor pump BUY ⇒ they SELL token into Meteora
+                        // (token in ⇒ a_to_b = token_is_a); vice versa.
+                        let a_to_b = if econ_buy {
+                            pair.meteora.token_is_a
+                        } else {
+                            !pair.meteora.token_is_a
+                        };
+                        met_out = met.swap_exact_in(amt, a_to_b).map(|s| s.amount_out).unwrap_or(0);
+                        met_revert = met_out < bound;
+                    }
+                }
+            }
+        }
+
+        let tx_revert = pump_revert || (met_present && met_revert);
+        self.sim_ledger.record(
+            sig.sig,
+            crate::sim_ledger::SimRecord {
+                slot: sig.slot,
+                hops: sig.hops,
+                pump_pool: Some(sig.pool),
+                meteora_pool: sig.meteora_pool,
+                kind: kind_label,
+                pump_in,
+                pump_out,
+                pump_bound,
+                pump_revert,
+                pump_present: true,
+                met_in,
+                met_out,
+                met_bound,
+                met_revert,
+                met_present,
+                tx_revert,
+            },
+        );
+    }
+
     fn apply_signal(&self, sig: &PumpSwapSignal) -> Option<(Vec<ArbPair>, PumpPool)> {
         self.signals_received.fetch_add(1, Ordering::Relaxed);
         let pairs = match self.registry.get(&sig.pool) {
@@ -631,6 +737,12 @@ impl ShredArbEngine {
             }
         };
 
+        // ── Phase-1 sim: compute THIS competitor tx's own output + revert
+        // verdict on the PRE-swap state, and record it for reconcile against the
+        // gRPC transaction-update. Uses `pump_now` (the state the tx executes
+        // against). Diagnostic only — changes no trading decision.
+        self.record_sim_verdict(sig, &pairs, &pump_now, token_is_base, econ_buy);
+
         // ── ALWAYS advance live state — even for trades below the trigger
         // (small trades still move the pool; skipping them drifts the overlay).
         // RAW values in; orientation resolved inside.
@@ -656,7 +768,6 @@ impl ShredArbEngine {
         if sig.meteora_pool.is_some() {
             self.arb_ignored.fetch_add(1, Ordering::Relaxed);
         }
-        let _ = econ_buy; // economic direction retained for the trigger logic
 
         // ── Triggers gate ONLY the assessment, never the state advance ───────
         if sol_side < self.params.min_trigger_lamports {
@@ -1954,11 +2065,14 @@ impl ShredArbEngine {
                 let reverted = ss.landed_err.load(Ordering::Relaxed);
                 let dropped = ss.dropped.load(Ordering::Relaxed);
                 let unknown = ss.unknown.load(Ordering::Relaxed);
+                let (sim_recorded, sim_checks, sim_matched, sim_mismatched, sim_unsimulated, sim_pending) =
+                    self.sim_ledger.snapshot();
                 eprintln!(
                     "\n[shred-arb 30s] watching_pools={}\n\
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} burned_signals={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}] | opaque[seen={} dirty_skip={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
+                     SIM     : recorded={} reconcile_checks={} matched={} mismatched={} unsimulated={} pending={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
@@ -1988,6 +2102,12 @@ impl ShredArbEngine {
                     self.nosend_too_locks.load(Ordering::Relaxed),
                     self.nosend_send_err.load(Ordering::Relaxed),
                     self.nosend_preempted.load(Ordering::Relaxed),
+                    sim_recorded,
+                    sim_checks,
+                    sim_matched,
+                    sim_mismatched,
+                    sim_unsimulated,
+                    sim_pending,
                     self.route_cache_hits.load(Ordering::Relaxed),
                     self.route_cache_misses.load(Ordering::Relaxed),
                     self.route_cache.len(),
