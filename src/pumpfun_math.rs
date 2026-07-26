@@ -27,11 +27,15 @@ const LAMPORTS_PER_SOL: u128 = 1_000_000_000;
 /// the on-chain Fee Program applies (canonical PumpSwap pools). When present it
 /// overrides the hardcoded `FEE_TIERS` table below, so the fee auto-tracks any
 /// change Pump makes to the tiers — no code change, no guessing.
-static ONCHAIN_TIERS: std::sync::OnceLock<Vec<(u128, u64, u64)>> = std::sync::OnceLock::new();
+/// `(mcap_threshold_lamports, lp_bps, protocol_bps, creator_bps)` — the three
+/// fee components stored SEPARATELY so each can be ceiled individually exactly
+/// like the on-chain program (a single combined ceil can be 1-2 lamports off).
+static ONCHAIN_TIERS: std::sync::OnceLock<Vec<(u128, u64, u64, u64)>> =
+    std::sync::OnceLock::new();
 
 /// Install the on-chain PumpSwap fee tiers (called once at startup after the
 /// FeeConfig account is read + validated). Ascending by lamport threshold.
-pub fn set_onchain_fee_tiers(tiers: Vec<(u128, u64, u64)>) {
+pub fn set_onchain_fee_tiers(tiers: Vec<(u128, u64, u64, u64)>) {
     let _ = ONCHAIN_TIERS.set(tiers);
 }
 
@@ -42,19 +46,20 @@ pub fn onchain_fee_tiers_loaded() -> bool {
 
 /// `calculateFeeTier` over the on-chain tiers (thresholds in lamports, ascending):
 /// the highest-threshold tier whose threshold ≤ mcap; if mcap is below the first
-/// threshold, the first (highest-fee) tier. Returns `(total_bps, lp_bps)`.
-fn fee_from_onchain_tiers(mcap_lamports: u128) -> Option<(u64, u64)> {
+/// threshold, the first (highest-fee) tier. Returns `(lp_bps, protocol_bps,
+/// creator_bps)`.
+fn fee_from_onchain_tiers(mcap_lamports: u128) -> Option<(u64, u64, u64)> {
     let tiers = ONCHAIN_TIERS.get()?;
     if tiers.is_empty() {
         return None;
     }
     if mcap_lamports < tiers[0].0 {
-        return Some((tiers[0].1, tiers[0].2));
+        return Some((tiers[0].1, tiers[0].2, tiers[0].3));
     }
-    let mut chosen = (tiers[0].1, tiers[0].2);
-    for &(thresh, total, lp) in tiers {
+    let mut chosen = (tiers[0].1, tiers[0].2, tiers[0].3);
+    for &(thresh, lp, protocol, creator) in tiers {
         if mcap_lamports >= thresh {
-            chosen = (total, lp);
+            chosen = (lp, protocol, creator);
         } else {
             break;
         }
@@ -99,11 +104,12 @@ const FEE_TIERS: &[(u64, u64, u64)] = &[
 /// to NON-canonical pools (`is_pump_pool == false`) — those charge a flat fee
 /// and IGNORE market cap. Read from the FeeConfig at startup. Every INVERTED
 /// pool (base = WSOL) is non-canonical, so this covers those too.
-static ONCHAIN_FLAT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+static ONCHAIN_FLAT: std::sync::OnceLock<(u64, u64, u64)> = std::sync::OnceLock::new();
 
-/// Install the on-chain flat fee (total_bps, lp_bps) for non-canonical pools.
-pub fn set_onchain_flat_fee(total_bps: u64, lp_bps: u64) {
-    let _ = ONCHAIN_FLAT.set((total_bps, lp_bps));
+/// Install the on-chain flat fee `(lp_bps, protocol_bps, creator_bps)` for
+/// non-canonical pools.
+pub fn set_onchain_flat_fee(lp_bps: u64, protocol_bps: u64, creator_bps: u64) {
+    let _ = ONCHAIN_FLAT.set((lp_bps, protocol_bps, creator_bps));
 }
 
 /// `(total_fee_bps, lp_fee_bps)` for a PumpSwap pool given its reserves and the
@@ -121,7 +127,7 @@ pub fn fee_for_reserves(
     quote_reserve: u64,
     supply_base_units: u128,
     is_canonical: bool,
-) -> (u64, u64) {
+) -> (u64, u64, u64) {
     // NON-canonical pools (`is_pump_pool == false`) charge the on-chain FLAT fee
     // and IGNORE market cap. Running them through the market-cap tier schedule
     // over-states the fee (up to 125 bps vs the real ~30 bps), which mis-sizes
@@ -129,19 +135,19 @@ pub fn fee_for_reserves(
     // `is_pump_pool` is true iff the pool's `coin_creator` is set (non-default);
     // the caller passes that as `is_canonical`.
     if !is_canonical {
-        if let Some(&(total, lp)) = ONCHAIN_FLAT.get() {
-            return (total, lp);
+        if let Some(&(lp, protocol, creator)) = ONCHAIN_FLAT.get() {
+            return (lp, protocol, creator);
         }
-        // No on-chain flat fee read yet → the observed flat schedule: lp 25 +
-        // protocol 5 = 30 bps total (real WSOL-HOOD event).
-        return (30, 25);
+        // No on-chain flat fee read yet → the observed flat schedule (real
+        // WSOL-HOOD / WSOL-GUS sell events): lp 25 + protocol 5 + creator 0.
+        return (25, 5, 0);
     }
-    let highest = (
-        FEE_TIERS[FEE_TIERS.len() - 1].1,
-        FEE_TIERS[FEE_TIERS.len() - 1].2,
-    );
+    // Hardcoded fallback carries only (total, lp); split the rest into protocol
+    // (creator 0) — only used if the on-chain FeeConfig read failed.
+    let hi = FEE_TIERS[FEE_TIERS.len() - 1];
+    let split = |total: u64, lp: u64| -> (u64, u64, u64) { (lp, total.saturating_sub(lp), 0) };
     if base_reserve == 0 || supply_base_units == 0 {
-        return highest; // unknown market cap → highest fee
+        return split(hi.1, hi.2); // unknown market cap → highest fee
     }
     let mcap_lamports =
         (quote_reserve as u128).saturating_mul(supply_base_units) / base_reserve as u128;
@@ -149,14 +155,13 @@ pub fn fee_for_reserves(
     if let Some(f) = fee_from_onchain_tiers(mcap_lamports) {
         return f;
     }
-    // Fallback: the hardcoded schedule (matches the published fees.png tiers).
     let mcap_sol = (mcap_lamports / LAMPORTS_PER_SOL).min(u64::MAX as u128) as u64;
     for &(thresh, total, lp) in FEE_TIERS {
         if mcap_sol >= thresh {
-            return (total, lp);
+            return split(total, lp);
         }
     }
-    (125, 2)
+    (2, 123, 0)
 }
 
 /// Read + validate the on-chain PumpSwap `FeeConfig` and install its fee tiers.
@@ -170,7 +175,7 @@ pub fn fee_for_reserves(
 /// `Fees { lp_fee_bps u64, protocol_fee_bps u64, creator_fee_bps u64 }`.
 pub fn load_onchain_fee_tiers(
     rpc: &solana_client::rpc_client::RpcClient,
-) -> Option<Vec<(u128, u64, u64)>> {
+) -> Option<Vec<(u128, u64, u64, u64)>> {
     use solana_sdk::pubkey::Pubkey;
     let fee_program = Pubkey::from_str_const("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
     let pamm = Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
@@ -187,7 +192,7 @@ pub fn load_onchain_fee_tiers(
         if let (Some(lp), Some(protocol), Some(creator)) = (rd(41), rd(49), rd(57)) {
             let total = lp.saturating_add(protocol).saturating_add(creator);
             if total > 0 && total <= 1_000 && lp <= 1_000 && protocol <= 1_000 && creator <= 1_000 {
-                set_onchain_flat_fee(total, lp);
+                set_onchain_flat_fee(lp, protocol, creator);
             }
         }
     }
@@ -198,7 +203,7 @@ pub fn load_onchain_fee_tiers(
     if len == 0 || len > 64 {
         return None; // implausible → wrong offset/layout, bail to fallback
     }
-    let mut tiers: Vec<(u128, u64, u64)> = Vec::with_capacity(len);
+    let mut tiers: Vec<(u128, u64, u64, u64)> = Vec::with_capacity(len);
     for _ in 0..len {
         let threshold = u128::from_le_bytes(d.get(off..off + 16)?.try_into().ok()?);
         let lp = u64::from_le_bytes(d.get(off + 16..off + 24)?.try_into().ok()?);
@@ -210,7 +215,7 @@ pub fn load_onchain_fee_tiers(
         if total > 1_000 || lp > 1_000 || protocol > 1_000 || creator > 1_000 {
             return None;
         }
-        tiers.push((threshold, total, lp));
+        tiers.push((threshold, lp, protocol, creator));
     }
     // Thresholds must be non-decreasing (ascending schedule).
     if tiers.windows(2).any(|w| w[1].0 < w[0].0) {
@@ -233,10 +238,15 @@ fn ceil_div(a: u128, b: u128) -> u128 {
 pub struct PumpPool {
     pub base_reserve: u64,
     pub quote_reserve: u64,
-    /// Total fee in bps — dynamic, selected from the market-cap tier schedule.
+    /// Total fee in bps = lp + protocol + creator (kept for logging / callers).
     pub total_fee_bps: u64,
-    /// LP portion of the fee that stays in the pool.
+    /// LP portion — the ONLY fee that stays in the pool vault.
     pub lp_fee_bps: u64,
+    /// Protocol portion — leaves the pool to the protocol fee account.
+    pub protocol_fee_bps: u64,
+    /// Coin-creator portion — leaves the pool to the creator vault (0 on
+    /// non-canonical / inverted pools).
+    pub creator_fee_bps: u64,
 }
 
 impl PumpPool {
@@ -250,14 +260,28 @@ impl PumpPool {
         supply_base_units: u128,
         is_canonical: bool,
     ) -> Self {
-        let (total_fee_bps, lp_fee_bps) =
+        let (lp_fee_bps, protocol_fee_bps, creator_fee_bps) =
             fee_for_reserves(base_reserve, quote_reserve, supply_base_units, is_canonical);
         Self {
             base_reserve,
             quote_reserve,
-            total_fee_bps,
+            total_fee_bps: lp_fee_bps + protocol_fee_bps + creator_fee_bps,
             lp_fee_bps,
+            protocol_fee_bps,
+            creator_fee_bps,
         }
+    }
+
+    /// The three swap fees on `amount`, each ceiled INDIVIDUALLY (128-bit) —
+    /// exactly as the on-chain program does: `ceilDiv(amount*bps, 10000)` per
+    /// component. Returns `(lp, protocol, creator)`.
+    #[inline]
+    fn fees_on(&self, amount: u128) -> (u128, u128, u128) {
+        (
+            ceil_div(amount * self.lp_fee_bps as u128, BPS_DENOM as u128),
+            ceil_div(amount * self.protocol_fee_bps as u128, BPS_DENOM as u128),
+            ceil_div(amount * self.creator_fee_bps as u128, BPS_DENOM as u128),
+        )
     }
 
     /// RAW-orientation view for INVERTED pools (program base_mint = WSOL):
@@ -283,20 +307,44 @@ impl PumpPool {
 
     // ── Quoting: our own arbitrage legs ──────────────────────────────────────
 
-    /// BUY: spend `quote_in_budget` lamports of WSOL (fees included), receive
-    /// token base. Returns `base_out`.
-    pub fn quote_buy(&self, quote_in_budget: u64) -> u64 {
-        // Strip the fee that is added on top of the pool-bound input.
-        let pool_quote_in = (quote_in_budget as u128) * BPS_DENOM as u128
-            / (BPS_DENOM + self.total_fee_bps) as u128;
-        if pool_quote_in == 0 {
-            return 0;
+    /// BUY exact-quote-in: spend `spendable` lamports of WSOL (fees included),
+    /// receive token base. Reproduces the on-chain `buy_exact_quote_in` math to
+    /// the lamport: floor the effective quote, ceil each fee, correct any dust
+    /// overshoot, then the curve runs on `effective - 1` (the program's `-1`).
+    pub fn quote_buy(&self, spendable: u64) -> u64 {
+        self.buy_quote_in_parts(spendable).0
+    }
+
+    /// Shared core for `buy_exact_quote_in`: returns
+    /// `(base_out, input_amount, lp_fee)` — `input_amount` and `lp_fee` are what
+    /// the pool quote vault gains (`+= input_amount + lp_fee`).
+    fn buy_quote_in_parts(&self, spendable: u64) -> (u64, u64, u64) {
+        let total_bps = self.total_fee_bps as u128;
+        let mut eff = (spendable as u128) * BPS_DENOM as u128 / (BPS_DENOM as u128 + total_bps);
+        if eff == 0 {
+            return (0, 0, 0);
         }
-        // base_out = floor(B * qin / (Q + qin))
+        let (lp, protocol, creator) = self.fees_on(eff);
+        // Dust correction: if effective + fees overshoot the spendable, shrink.
+        let total_with_fees = eff + lp + protocol + creator;
+        if total_with_fees > spendable as u128 {
+            eff = eff.saturating_sub(total_with_fees - spendable as u128);
+        }
+        // The curve runs on `effective - 1` (verbatim from the program port).
+        let input_amount = if eff > 0 { eff - 1 } else { 0 };
+        if input_amount == 0 {
+            return (0, 0, 0);
+        }
         let b = self.base_reserve as u128;
         let q = self.quote_reserve as u128;
-        let out = b * pool_quote_in / (q + pool_quote_in);
-        out.min(u64::MAX as u128) as u64
+        let base_out = (b * input_amount / (q + input_amount)).min(b.saturating_sub(1));
+        // LP fee retained in the pool is computed on the (post-dust) effective.
+        let lp_fee = ceil_div(eff * self.lp_fee_bps as u128, BPS_DENOM as u128);
+        (
+            base_out.min(u64::MAX as u128) as u64,
+            input_amount.min(u64::MAX as u128) as u64,
+            lp_fee.min(u64::MAX as u128) as u64,
+        )
     }
 
     /// SELL: spend `base_in` token, receive WSOL. Returns net lamports out
@@ -309,8 +357,10 @@ impl PumpPool {
             return 0;
         }
         let gross = q * bi / (b + bi); // floor
-        let fee = ceil_div(gross * self.total_fee_bps as u128, BPS_DENOM as u128);
-        gross.saturating_sub(fee).min(u64::MAX as u128) as u64
+        // Each fee component ceiled individually, exactly like on-chain.
+        let (lp, protocol, creator) = self.fees_on(gross);
+        gross.saturating_sub(lp + protocol + creator)
+            .min(u64::MAX as u128) as u64
     }
 
     // ── Prediction: apply a swap we OBSERVED on ShredStream ──────────────────
@@ -325,7 +375,8 @@ impl PumpPool {
         if out == 0 {
             return *self;
         }
-        // quote that must enter the pool for that base out: ceil(Q*out/(B-out))
+        // quote that must enter the pool for that base out: ceil(Q*out/(B-out)).
+        // Only the LP fee is retained in the vault; protocol + creator leave it.
         let quote_in = ceil_div(q * out, b - out);
         let lp_fee = ceil_div(quote_in * self.lp_fee_bps as u128, BPS_DENOM as u128);
         let new_base = (b - out) as u64;
@@ -349,12 +400,11 @@ impl PumpPool {
         if out == 0 {
             return 0;
         }
-        let quote_raw = ceil_div(q * out, b - out);
-        ceil_div(
-            quote_raw * (BPS_DENOM as u128 + self.total_fee_bps as u128),
-            BPS_DENOM as u128,
-        )
-        .min(u64::MAX as u128) as u64
+        // Pool quote-in required for the exact base out, then add each fee
+        // (ceiled individually) — the total the user must pay.
+        let quote_in = ceil_div(q * out, b - out);
+        let (lp, protocol, creator) = self.fees_on(quote_in);
+        (quote_in + lp + protocol + creator).min(u64::MAX as u128) as u64
     }
 
     /// SIM `sell` (exact base in): net quote out. Revert iff below the tx's
@@ -390,18 +440,16 @@ impl PumpPool {
     /// whatever base that buys). Pool: quote vault gains the pool-bound input
     /// plus the LP fee; base vault pays out the curve amount.
     pub fn after_observed_buy_quote_in(&self, spendable_quote_in: u64) -> PumpPool {
-        let pool_quote_in = (spendable_quote_in as u128) * BPS_DENOM as u128
-            / (BPS_DENOM + self.total_fee_bps) as u128;
-        if pool_quote_in == 0 {
+        let (base_out, input_amount, lp_fee) = self.buy_quote_in_parts(spendable_quote_in);
+        if base_out == 0 {
             return *self;
         }
         let b = self.base_reserve as u128;
         let q = self.quote_reserve as u128;
-        let out = (b * pool_quote_in / (q + pool_quote_in)).min(b.saturating_sub(1));
-        let lp_fee = ceil_div(pool_quote_in * self.lp_fee_bps as u128, BPS_DENOM as u128);
+        // base vault pays out base_out; quote vault gains the pool input + LP fee.
         PumpPool {
-            base_reserve: (b - out) as u64,
-            quote_reserve: (q + pool_quote_in + lp_fee).min(u64::MAX as u128) as u64,
+            base_reserve: (b - base_out as u128).min(u64::MAX as u128) as u64,
+            quote_reserve: (q + input_amount as u128 + lp_fee as u128).min(u64::MAX as u128) as u64,
             ..*self
         }
     }
@@ -467,5 +515,28 @@ mod tests {
         let before = p.spot_price(6, 9);
         let after = p.after_observed_buy(10_000_000).spot_price(6, 9);
         assert!(after > before);
+    }
+}
+
+
+#[cfg(test)]
+mod gus_event_tests {
+    use super::*;
+    // Real on-chain WSOL-GUS sell event (base=WSOL, quote=GUS), non-canonical:
+    // lp=25, protocol=5, creator=0. base_in=21544, reserves as in the event.
+    // gross=54858763, lpFee=137147, protocolFee=27430, userQuoteAmountOut=54694186.
+    #[test]
+    fn gus_sell_lamport_exact() {
+        // flipped orientation already applied by the caller; here we build the
+        // RAW pool (base=WSOL reserve, quote=GUS reserve) and sell base_in WSOL.
+        let p = PumpPool {
+            base_reserve: 56_240_500_100,
+            quote_reserve: 143_208_572_392_022,
+            total_fee_bps: 30,
+            lp_fee_bps: 25,
+            protocol_fee_bps: 5,
+            creator_fee_bps: 0,
+        };
+        assert_eq!(p.quote_sell(21_544), 54_694_186);
     }
 }
