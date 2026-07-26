@@ -49,6 +49,14 @@ pub struct SimRecord {
     /// Whole-tx verdict = ANY present leg reverts (a 2-hop arb reverts if either
     /// leg fails its slippage).
     pub tx_revert: bool,
+    /// Token-2022 transfer-fee rate read from the token's mint state account
+    /// (basis points). Usually 0 for these tokens, but read live so we never
+    /// assume — logged so it can be compared against the real tx on solscan.
+    pub tfee_bps: u16,
+    /// Token-2022 transfer fee (in token base units) taken on the token amount
+    /// that moved in this swap, at `tfee_bps`. 0 when the mint has no transfer
+    /// fee extension.
+    pub tfee_token: u64,
 }
 
 impl SimRecord {
@@ -119,6 +127,8 @@ impl SimLedger {
             met_out = rec.met_out,
             met_bound = rec.met_bound,
             met_verdict = if rec.met_revert { "REVERT" } else { "OK" },
+            tfee_bps = rec.tfee_bps,
+            tfee_token = rec.tfee_token,
             tx_verdict = if rec.tx_revert { "REVERT" } else { "OK" },
             "sim"
         );
@@ -126,12 +136,13 @@ impl SimLedger {
             "sim",
             &format!(
                 "slot={} sig={sig} hops={} dex={} {} kind={} pump[in={} out={} bound={} verdict={}] \
-                 meteora[in={} out={} bound={} verdict={}] tx_verdict={}",
+                 meteora[in={} out={} bound={} verdict={}] token2022_fee[bps={} taken={}] tx_verdict={}",
                 rec.slot, rec.hops, rec.dex_label(), rec.pools_str(), rec.kind,
                 rec.pump_in, rec.pump_out, rec.pump_bound,
                 if rec.pump_revert { "REVERT" } else { "OK" },
                 rec.met_in, rec.met_out, rec.met_bound,
                 if rec.met_revert { "REVERT" } else { "OK" },
+                rec.tfee_bps, rec.tfee_token,
                 if rec.tx_revert { "REVERT" } else { "OK" },
             ),
         );

@@ -407,6 +407,7 @@ fn spawn_shred_arb(
         never_close: sa.never_close_pools,
         rpc_sim_compare: sa.rpc_sim_compare,
         disable_preempt: sa.disable_preempt,
+        sim_only: sa.sim_only,
     };
 
     // Errors-only file log (errors + why-not-sent + why-lost) under /root/g.

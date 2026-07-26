@@ -338,6 +338,14 @@ pub struct ShredArbConfig {
     /// longer profitable. An unchanged pool always sends. true = always send.
     #[serde(default)]
     pub disable_preempt: bool,
+    /// SIM-ONLY mode. When true the engine runs the full detect + per-tx sim +
+    /// gRPC reconcile pipeline but NEVER sends a transaction to the network:
+    /// `execute()` short-circuits after logging the opportunity. Use this to
+    /// study whether our simulation matches reality without flooding the
+    /// network with (often phantom-profit) sends. Default true — sending is an
+    /// explicit opt-in.
+    #[serde(default = "default_true")]
+    pub sim_only: bool,
 }
 
 fn default_alt_fetch_providers() -> Vec<String> {
@@ -467,6 +475,7 @@ impl Default for ShredArbConfig {
             meteora_max_stale_slots: 0,
             rpc_sim_compare: false,
             disable_preempt: false,
+            sim_only: true,
         }
     }
 }

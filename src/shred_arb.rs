@@ -164,6 +164,10 @@ pub struct ArbParams {
     /// tx touched it) the trade is re-priced on the fresh state and dropped if
     /// no longer profitable. true = always send.
     pub disable_preempt: bool,
+    /// SIM-ONLY: run the full detect+sim+reconcile pipeline but never send. The
+    /// engine logs opportunities and records sim verdicts; `execute()` returns
+    /// before touching the network. Default true.
+    pub sim_only: bool,
 }
 
 pub struct ShredArbEngine {
@@ -276,6 +280,8 @@ pub struct ShredArbEngine {
     // ── why a PROFITABLE opportunity did NOT reach the network ──
     /// Suppressed by the per-pool send de-dup window.
     nosend_dedup: AtomicU64,
+    /// Opportunities suppressed because we're in sim-only mode (never sent).
+    nosend_sim_only: AtomicU64,
     /// A forced leg quote failed on Metis (no route / timeout).
     nosend_quote_fail: AtomicU64,
     /// /swap-instructions failed.
@@ -444,6 +450,7 @@ impl ShredArbEngine {
             not_profitable: AtomicU64::new(0),
             sent: AtomicU64::new(0),
             nosend_dedup: AtomicU64::new(0),
+            nosend_sim_only: AtomicU64::new(0),
             nosend_quote_fail: AtomicU64::new(0),
             nosend_swapix_fail: AtomicU64::new(0),
             nosend_build_fail: AtomicU64::new(0),
@@ -665,6 +672,27 @@ impl ShredArbEngine {
             }
         }
 
+        // ── Token-2022 transfer fee (READ from the mint state; usually 0) ────
+        // Read the live transfer-fee rate from the token's mint account and
+        // compute the fee taken on the TOKEN (base) amount that moved in this
+        // Pump swap, so it can be compared against the real tx on solscan. The
+        // token base amount is `base_amount` for buy/sell (exact-base sides) and
+        // the computed base_out for the exact-quote-in / boost sides.
+        let tfee_bps = match pairs.first() {
+            Some(p) => self.pool_state.mint_transfer_fee_bps(&p.token_mint) as u64,
+            None => 0,
+        };
+        let token_amt = match sig.kind {
+            K::Buy | K::Sell => sig.base_amount,
+            K::BuyQuoteIn | K::BoostBuyBurn => pump_out,
+            K::Opaque => 0,
+        };
+        let tfee_token = if tfee_bps == 0 {
+            0
+        } else {
+            (((token_amt as u128) * tfee_bps as u128 + 9_999) / 10_000) as u64
+        };
+
         let tx_revert = pump_revert || (met_present && met_revert);
         self.sim_ledger.record(
             sig.sig,
@@ -685,6 +713,8 @@ impl ShredArbEngine {
                 met_revert,
                 met_present,
                 tx_revert,
+                tfee_bps: tfee_bps as u16,
+                tfee_token,
             },
         );
         Some(tx_revert)
@@ -1306,6 +1336,15 @@ impl ShredArbEngine {
         recheck: Recheck,
         legs: [LegSnapshot; 2],
     ) {
+        // SIM-ONLY: we ran the full detect + per-tx sim + reconcile pipeline and
+        // logged the opportunity above, but in sim-only mode we NEVER send —
+        // this is the switch that stops the network flood while we validate that
+        // our simulation matches reality. Sending is an explicit opt-in.
+        if self.params.sim_only {
+            self.nosend_sim_only.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
         // De-dupe: don't blast the same pool with identical txs while an earlier
         // one is still unconfirmed. Kept SMALL and configurable (send_dedup_ms,
         // 0 = off) so multiple distinct opportunities in one block can each send.
@@ -2117,7 +2156,7 @@ impl ShredArbEngine {
                     "\n[shred-arb 30s] watching_pools={}\n\
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} burned_signals={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}] | opaque[seen={} dirty_skip={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
-                     NOT-SENT: dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
+                     NOT-SENT: sim_only={} dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
                      SIM     : recorded={} reconcile_checks={} matched={} mismatched={} unsimulated={} paused_dark={} skipped_revert={} pending={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
@@ -2140,6 +2179,7 @@ impl ShredArbEngine {
                     reverted,
                     dropped,
                     unknown,
+                    self.nosend_sim_only.load(Ordering::Relaxed),
                     self.nosend_dedup.load(Ordering::Relaxed),
                     self.nosend_quote_fail.load(Ordering::Relaxed),
                     self.nosend_swapix_fail.load(Ordering::Relaxed),
