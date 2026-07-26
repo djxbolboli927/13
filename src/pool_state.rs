@@ -127,6 +127,12 @@ pub struct PoolStateCache {
     /// Phase-1 diagnostic: our per-tx simulation verdicts, reconciled here
     /// against the gRPC transaction-update stream (fed on the same subscription).
     sim_ledger: Arc<SimLedger>,
+    /// The LAST transaction-update (signature + slot) seen for each account we
+    /// subscribe to (keyed by the account, e.g. a Pump vault). Together with
+    /// `last_update_slot` (the last ACCOUNT-update slot) this lets the sim log
+    /// show, at the moment it computes a tx, exactly which confirmed tx and which
+    /// confirmed account-state it is building on — so a gap is visible.
+    last_tx_sig: Arc<DashMap<Pubkey, (solana_sdk::signature::Signature, u64)>>,
 }
 
 fn read_u128_le(data: &[u8], off: usize) -> Option<u128> {
@@ -332,6 +338,7 @@ impl PoolStateCache {
             updates: Arc::new(AtomicU64::new(0)),
             accounts: Arc::new(std::sync::Mutex::new(Vec::new())),
             change: Arc::new(tokio::sync::Notify::new()),
+            last_tx_sig: Arc::new(DashMap::with_capacity(256)),
             live_pump: Arc::new(DashMap::with_capacity(256)),
             live_meteora: Arc::new(DashMap::with_capacity(256)),
             sim_ledger: Arc::new(SimLedger::default()),
@@ -421,6 +428,14 @@ impl PoolStateCache {
     /// the staleness diagnostic (current slot − this = how many slots behind).
     pub fn last_update_slot(&self, account: &Pubkey) -> Option<u64> {
         self.last_update_slot.get(account).map(|v| *v.value())
+    }
+
+    /// The last transaction-update (signature + slot) seen touching `account`.
+    pub fn last_tx_sig(
+        &self,
+        account: &Pubkey,
+    ) -> Option<(solana_sdk::signature::Signature, u64)> {
+        self.last_tx_sig.get(account).map(|v| *v.value())
     }
 
     /// Decode a Meteora pool account into its pricing slice. The fee is read
@@ -825,12 +840,13 @@ impl PoolStateCache {
         let acct_set = self.accounts.clone();
         let change = self.change.clone();
         let sim_ledger = self.sim_ledger.clone();
+        let last_tx_sig = self.last_tx_sig.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
             loop {
                 match run_stream(
                     &endpoint, &x_token, &acct_set, &change, &inner, &last_update,
-                    &last_update_slot, &slot, &updates, &sim_ledger,
+                    &last_update_slot, &slot, &updates, &sim_ledger, &last_tx_sig,
                 )
                 .await
                 {
@@ -930,6 +946,7 @@ async fn run_stream(
     slot: &Arc<AtomicU64>,
     updates: &Arc<AtomicU64>,
     sim_ledger: &Arc<SimLedger>,
+    last_tx_sig: &Arc<DashMap<Pubkey, (solana_sdk::signature::Signature, u64)>>,
 ) -> Result<()> {
     let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
         .x_token(Some(x_token.to_string()))?
@@ -996,6 +1013,12 @@ async fn run_stream(
                             // network's — catching a wrong amount, not just a wrong
                             // revert verdict.
                             let balances = post_token_balances(&info);
+                            // Remember this as the last tx-update for every
+                            // account it touched (e.g. our Pump vaults), so the
+                            // sim log can show which confirmed tx it built on.
+                            for acct in balances.keys() {
+                                last_tx_sig.insert(*acct, (sig, t.slot));
+                            }
                             sim_ledger.reconcile(&sig, t.slot, real_revert, &balances);
                         }
                     }

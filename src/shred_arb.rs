@@ -725,6 +725,16 @@ impl ShredArbEngine {
             Some(p) => (Some(p.pump.token_vault()), Some(p.pump.wsol_vault())),
             None => (None, None),
         };
+        // Confirmed context this sim is built on — makes the "simulated ahead of
+        // confirmation" gap visible: the last account-update slot we hold for the
+        // pool vault, and the last transaction-update (confirmed tx) on it.
+        let last_acct_slot = pump_token_vault
+            .and_then(|v| self.pool_state.last_update_slot(&v))
+            .unwrap_or(0);
+        let last_tx_sig = pump_token_vault
+            .and_then(|v| self.pool_state.last_tx_sig(&v))
+            .map(|(s, _)| s.to_string())
+            .unwrap_or_else(|| "none-yet".to_string());
         self.sim_ledger.record(
             sig.sig,
             crate::sim_ledger::SimRecord {
@@ -750,6 +760,8 @@ impl ShredArbEngine {
                 pump_wsol_vault,
                 pred_base: pred_pool.base_reserve,
                 pred_quote: pred_pool.quote_reserve,
+                last_acct_slot,
+                last_tx_sig,
             },
         );
         Some(tx_revert)
