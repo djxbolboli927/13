@@ -57,6 +57,18 @@ pub struct SimRecord {
     /// that moved in this swap, at `tfee_bps`. 0 when the mint has no transfer
     /// fee extension.
     pub tfee_token: u64,
+    /// The Pump vault accounts, so the reconcile can read the REAL post-swap
+    /// reserves out of the transaction-update's post_token_balances and compare
+    /// them to what our sim advanced the pool to.
+    pub pump_token_vault: Option<Pubkey>,
+    pub pump_wsol_vault: Option<Pubkey>,
+    /// Our PREDICTED post-swap Pump reserves (canonical orientation: base=token,
+    /// quote=WSOL) after this tx — i.e. the state our sim carries forward to the
+    /// NEXT tx. A reverted tx leaves them at the pre-swap reserves. Compared to
+    /// the on-chain post_token_balances to catch a wrong AMOUNT even when the
+    /// revert verdict happened to be right.
+    pub pred_base: u64,
+    pub pred_quote: u64,
 }
 
 impl SimRecord {
@@ -88,6 +100,9 @@ pub struct SimLedger {
     pub matched: AtomicU64,
     /// Our verdict disagreed (missed revert or false revert).
     pub mismatched: AtomicU64,
+    /// The revert verdict was right but our computed AMOUNT (post-swap reserves)
+    /// was wrong — the previously-invisible class of bug.
+    pub value_mismatched: AtomicU64,
     /// tx-updates on our pools for a signature we NEVER simulated (a swap type
     /// / path we don't decode yet — e.g. a pure-Meteora tx, a router CPI).
     pub unsimulated: AtomicU64,
@@ -101,6 +116,7 @@ impl Default for SimLedger {
             checks: AtomicU64::new(0),
             matched: AtomicU64::new(0),
             mismatched: AtomicU64::new(0),
+            value_mismatched: AtomicU64::new(0),
             unsimulated: AtomicU64::new(0),
         }
     }
@@ -152,10 +168,19 @@ impl SimLedger {
         }
     }
 
-    /// Ground truth from the gRPC transaction-update stream: does our verdict for
-    /// `sig` match the real on-chain outcome? Logs `[reconcile-tx]` and bumps the
-    /// match/mismatch counters. `real_revert = meta.err.is_some()`.
-    pub fn reconcile(&self, sig: &Signature, slot: u64, real_revert: bool) {
+    /// Ground truth from the gRPC transaction-update stream: does our verdict AND
+    /// our computed amount for `sig` match the real on-chain outcome? `real_base`
+    /// / `real_quote` are the REAL post-swap Pump reserves for this tx, read from
+    /// the transaction-update's post_token_balances (None if the vaults weren't
+    /// in the meta — e.g. a pure-Meteora tx). Logs `[reconcile-tx]` and bumps the
+    /// verdict AND value match/mismatch counters.
+    pub fn reconcile(
+        &self,
+        sig: &Signature,
+        slot: u64,
+        real_revert: bool,
+        balances: &std::collections::HashMap<Pubkey, u64>,
+    ) {
         let Some((_, rec)) = self.records.remove(sig) else {
             // A tx touched our pool that we never simulated (unknown swap type
             // or a path we don't decode). This is itself a diagnostic signal.
@@ -163,11 +188,37 @@ impl SimLedger {
             return;
         };
         self.checks.fetch_add(1, Ordering::Relaxed);
-        let matched = rec.tx_revert == real_revert;
+        let verdict_ok = rec.tx_revert == real_revert;
+        // Real post-swap reserves for THIS tx, read from its post_token_balances
+        // (raw token amounts of our Pump vaults). None if the vaults weren't in
+        // this tx's balance set (e.g. a tx that didn't move them).
+        let real_base = rec.pump_token_vault.and_then(|v| balances.get(&v).copied());
+        let real_quote = rec.pump_wsol_vault.and_then(|v| balances.get(&v).copied());
+
+        // Value check: does the pool state our sim carries forward match the real
+        // post-swap reserves? Only meaningful when we actually have the real
+        // reserves for this tx's Pump vaults. base/quote delta in raw units.
+        let (value_known, base_delta, quote_delta) = match (real_base, real_quote) {
+            (Some(rb), Some(rq)) => (
+                true,
+                rb as i128 - rec.pred_base as i128,
+                rq as i128 - rec.pred_quote as i128,
+            ),
+            _ => (false, 0, 0),
+        };
+        let value_ok = !value_known || (base_delta == 0 && quote_delta == 0);
+
+        // A tx is fully correct only if BOTH the revert verdict AND (when known)
+        // the resulting reserves match. A wrong amount with a right verdict — the
+        // exact bug that used to slip through as match=Y — now counts as a miss.
+        let matched = verdict_ok && value_ok;
         if matched {
             self.matched.fetch_add(1, Ordering::Relaxed);
         } else {
             self.mismatched.fetch_add(1, Ordering::Relaxed);
+        }
+        if value_known && !value_ok {
+            self.value_mismatched.fetch_add(1, Ordering::Relaxed);
         }
         info!(
             target: "reconcile",
@@ -179,6 +230,14 @@ impl SimLedger {
             pools = %rec.pools_str(),
             our_verdict = if rec.tx_revert { "REVERT" } else { "OK" },
             real = if real_revert { "REVERT" } else { "OK" },
+            verdict_match = if verdict_ok { "Y" } else { "N" },
+            pred_base = rec.pred_base,
+            pred_quote = rec.pred_quote,
+            real_base = real_base.unwrap_or(0),
+            real_quote = real_quote.unwrap_or(0),
+            base_delta = base_delta as i64,
+            quote_delta = quote_delta as i64,
+            value_match = if !value_known { "?" } else if value_ok { "Y" } else { "N" },
             r#match = if matched { "Y" } else { "N" },
             "reconcile-tx"
         );
@@ -186,22 +245,30 @@ impl SimLedger {
             "reconcile",
             &format!(
                 "grpc_slot={slot} sim_slot={} sig={sig} hops={} dex={} {} \
-                 our_verdict={} real={} match={}",
+                 our_verdict={} real={} verdict_match={} \
+                 pred[base={} quote={}] real[base={} quote={}] delta[base={} quote={}] \
+                 value_match={} match={}",
                 rec.slot, rec.hops, rec.dex_label(), rec.pools_str(),
                 if rec.tx_revert { "REVERT" } else { "OK" },
                 if real_revert { "REVERT" } else { "OK" },
+                if verdict_ok { "Y" } else { "N" },
+                rec.pred_base, rec.pred_quote,
+                real_base.unwrap_or(0), real_quote.unwrap_or(0),
+                base_delta as i64, quote_delta as i64,
+                if !value_known { "?" } else if value_ok { "Y" } else { "N" },
                 if matched { "Y" } else { "N" },
             ),
         );
     }
 
     /// Snapshot the counters for the 30s report.
-    pub fn snapshot(&self) -> (u64, u64, u64, u64, u64, usize) {
+    pub fn snapshot(&self) -> (u64, u64, u64, u64, u64, u64, usize) {
         (
             self.recorded.load(Ordering::Relaxed),
             self.checks.load(Ordering::Relaxed),
             self.matched.load(Ordering::Relaxed),
             self.mismatched.load(Ordering::Relaxed),
+            self.value_mismatched.load(Ordering::Relaxed),
             self.unsimulated.load(Ordering::Relaxed),
             self.records.len(),
         )

@@ -24,6 +24,7 @@ use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
     SubscribeRequestFilterAccounts, SubscribeRequestFilterTransactions, SubscribeRequestPing,
+    SubscribeUpdateTransactionInfo,
 };
 
 use crate::sim_ledger::SimLedger;
@@ -843,6 +844,45 @@ impl PoolStateCache {
     }
 }
 
+/// Map each token account touched by a transaction to its RAW post-swap balance,
+/// read from the transaction-update's `post_token_balances`. `account_index` in
+/// each balance indexes the tx's FULL account list — static message keys first,
+/// then loaded writable, then loaded readonly addresses (the canonical Solana
+/// order) — so we reconstruct that list and resolve each index to a pubkey. This
+/// is the network's ground-truth pool state after the tx, used by the reconcile
+/// to check our predicted reserves to the lamport.
+fn post_token_balances(info: &SubscribeUpdateTransactionInfo) -> HashMap<Pubkey, u64> {
+    let mut out = HashMap::new();
+    let Some(txn) = info.transaction.as_ref() else {
+        return out;
+    };
+    let Some(meta) = info.meta.as_ref() else {
+        return out;
+    };
+    let mut keys: Vec<Pubkey> = Vec::new();
+    if let Some(msg) = txn.message.as_ref() {
+        for k in &msg.account_keys {
+            keys.push(Pubkey::try_from(k.as_slice()).unwrap_or_default());
+        }
+    }
+    for k in &meta.loaded_writable_addresses {
+        keys.push(Pubkey::try_from(k.as_slice()).unwrap_or_default());
+    }
+    for k in &meta.loaded_readonly_addresses {
+        keys.push(Pubkey::try_from(k.as_slice()).unwrap_or_default());
+    }
+    for tb in &meta.post_token_balances {
+        let idx = tb.account_index as usize;
+        let Some(pk) = keys.get(idx) else { continue };
+        if let Some(amt) = tb.ui_token_amount.as_ref() {
+            if let Ok(v) = amt.amount.parse::<u64>() {
+                out.insert(*pk, v);
+            }
+        }
+    }
+    out
+}
+
 fn build_request(accounts: &[Pubkey]) -> SubscribeRequest {
     let acct_strs: Vec<String> = accounts.iter().map(|p| p.to_string()).collect();
     let mut accounts_filter: HashMap<String, SubscribeRequestFilterAccounts> = HashMap::new();
@@ -947,8 +987,16 @@ async fn run_stream(
                         if let Ok(sig) =
                             solana_sdk::signature::Signature::try_from(info.signature.as_slice())
                         {
-                            let real_revert = info.meta.map(|m| m.err.is_some()).unwrap_or(false);
-                            sim_ledger.reconcile(&sig, t.slot, real_revert);
+                            let real_revert =
+                                info.meta.as_ref().map(|m| m.err.is_some()).unwrap_or(false);
+                            // Real post-swap reserves come from post_token_balances:
+                            // map each token account (by its index into the tx's
+                            // full account list) to its raw post balance, so the
+                            // reconcile can compare OUR predicted reserves to the
+                            // network's — catching a wrong amount, not just a wrong
+                            // revert verdict.
+                            let balances = post_token_balances(&info);
+                            sim_ledger.reconcile(&sig, t.slot, real_revert, &balances);
                         }
                     }
                 }

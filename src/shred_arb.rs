@@ -711,6 +711,20 @@ impl ShredArbEngine {
         };
 
         let tx_revert = pump_revert || (met_present && met_revert);
+        // Predicted post-swap Pump reserves this tx leaves behind — exactly the
+        // state we carry to the next tx. A reverted tx moves NOTHING, so it stays
+        // at the pre-swap reserves. The reconcile compares this to the real
+        // post_token_balances so a wrong AMOUNT is caught even when the revert
+        // verdict is right.
+        let pred_pool = if tx_revert {
+            *pump_pre
+        } else {
+            pump_pre.after_observed(token_is_base, sig.kind, sig.base_amount, sig.quote_amount)
+        };
+        let (pump_token_vault, pump_wsol_vault) = match pairs.first() {
+            Some(p) => (Some(p.pump.token_vault()), Some(p.pump.wsol_vault())),
+            None => (None, None),
+        };
         self.sim_ledger.record(
             sig.sig,
             crate::sim_ledger::SimRecord {
@@ -732,6 +746,10 @@ impl ShredArbEngine {
                 tx_revert,
                 tfee_bps: tfee_bps as u16,
                 tfee_token,
+                pump_token_vault,
+                pump_wsol_vault,
+                pred_base: pred_pool.base_reserve,
+                pred_quote: pred_pool.quote_reserve,
             },
         );
         Some(tx_revert)
@@ -2177,14 +2195,21 @@ impl ShredArbEngine {
                 let reverted = ss.landed_err.load(Ordering::Relaxed);
                 let dropped = ss.dropped.load(Ordering::Relaxed);
                 let unknown = ss.unknown.load(Ordering::Relaxed);
-                let (sim_recorded, sim_checks, sim_matched, sim_mismatched, sim_unsimulated, sim_pending) =
-                    self.sim_ledger.snapshot();
+                let (
+                    sim_recorded,
+                    sim_checks,
+                    sim_matched,
+                    sim_mismatched,
+                    sim_value_mismatched,
+                    sim_unsimulated,
+                    sim_pending,
+                ) = self.sim_ledger.snapshot();
                 eprintln!(
                     "\n[shred-arb 30s] watching_pools={}\n\
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} burned_signals={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}] | opaque[seen={} dirty_skip={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: sim_only={} dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
-                     SIM     : recorded={} reconcile_checks={} matched={} mismatched={} unsimulated={} paused_dark={} skipped_revert={} pending={}\n\
+                     SIM     : recorded={} reconcile_checks={} matched={} mismatched={} value_wrong={} unsimulated={} paused_dark={} skipped_revert={} pending={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
@@ -2219,6 +2244,7 @@ impl ShredArbEngine {
                     sim_checks,
                     sim_matched,
                     sim_mismatched,
+                    sim_value_mismatched,
                     sim_unsimulated,
                     self.sim_paused_dark.load(Ordering::Relaxed),
                     self.sim_skipped_revert.load(Ordering::Relaxed),
