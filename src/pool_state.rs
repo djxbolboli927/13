@@ -117,10 +117,21 @@ pub struct PoolStateCache {
     /// restarts from confirmed state — landed ones show up as a gRPC account
     /// update, unlanded ones are moot.
     /// `(built_on_grpc_slot, shred_block_slot, inflight_count, PumpPool)`. The
-    /// count = how many in-flight Pump swaps we've folded into THIS block's
-    /// overlay (the "behind" the operator wants to see). It resets to 0 when the
-    /// gRPC confirmed state advances (new block / new account update).
-    live_pump: Arc<DashMap<Pubkey, (u64, u64, u32, PumpPool)>>,
+    /// PENDING (in-flight) Pump swaps per token vault, observed on shreds but not
+    /// yet reflected in the confirmed gRPC state. Each entry is
+    /// `(shred_slot, is_token_buy, token_amount)` in our TOKEN frame (the engine
+    /// already resolved orientation + exact amount before calling apply).
+    ///
+    /// Reconciliation model: the gRPC account feed updates a vault ONCE per block
+    /// (its end-of-block state, which already includes every pump swap that
+    /// landed in that block), while pump changes MANY times per block via shreds.
+    /// So a swap is still "pending" iff its `shred_slot` is NEWER than the vault's
+    /// confirmed gRPC slot; once gRPC catches up to (or past) that slot the swap
+    /// is confirmed and dropped. The live pool = the confirmed gRPC decode with
+    /// every remaining pending swap folded on top, in slot order. This keeps
+    /// pending swaps alive across the several-slot gRPC lag instead of discarding
+    /// them at each block boundary (which under-moved our predicted state).
+    live_pump: Arc<DashMap<Pubkey, Vec<(u64, bool, u64)>>>,
     /// LIVE overlay of Meteora pools, keyed by pool account (only `sqrt_price`
     /// advances on a swap; liquidity/fees stay from the decoded cache).
     live_meteora: Arc<DashMap<Pubkey, (u64, MeteoraPool)>>,
@@ -587,76 +598,76 @@ impl PoolStateCache {
     // underlying cache was at when we (re)built it; once gRPC catches up past that
     // slot the overlay is dropped and rebuilt from ground truth — no drift.
 
-    /// Apply an observed Pump swap (from a shred) to the live pump overlay.
-    /// `shred_slot` is the shred's slot; if it's not newer than the cached state
-    /// the swap is already reflected on-chain and only the base is (re)seeded.
+    /// Record an observed Pump swap (from a shred) as PENDING for its vault.
+    /// `is_buy`/`base_amount` are already in our TOKEN frame (orientation + exact
+    /// amount resolved by the engine). A swap whose `shred_slot` is not newer than
+    /// the confirmed gRPC slot is already on-chain and is not recorded. Every call
+    /// also prunes swaps the confirmed state has since caught up to — this is the
+    /// reconciliation: pending = swaps strictly newer than the confirmed slot.
     pub fn apply_pump_swap(
         &self,
-        pool: &Pubkey,
+        _pool: &Pubkey,
         token_vault: &Pubkey,
-        wsol_vault: &Pubkey,
-        token_mint: &Pubkey,
+        _wsol_vault: &Pubkey,
+        _token_mint: &Pubkey,
         is_buy: bool,
         base_amount: u64,
         shred_slot: u64,
     ) {
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
-        // ACCUMULATE in-flight Pump swaps, but only WITHIN THE SAME BLOCK: base is
-        // the existing overlay iff it was built on the same confirmed gRPC slot
-        // AND the same shred block slot, else the fresh confirmed decode.
-        // Successive holder/sniper buys+sells inside one block are summed so the
-        // NEXT shred prices against a pool reflecting them; a new block discards
-        // the previous block's queue (start fresh). NOTE: the caller only feeds
-        // SIMPLE (non-arb) Pump swaps here — multi-hop arb legs are ignored for
-        // state prediction (they mostly revert on the Meteora side).
-        let (base, count) = match self.live_pump.get(token_vault) {
-            Some(e) if e.value().0 == cur && e.value().1 == shred_slot => (e.value().3, e.value().2),
-            _ => match self.pump_pool(pool, token_vault, wsol_vault, token_mint) {
-                Some(p) => (p, 0),
-                None => return,
-            },
-        };
-        let advanced = if shred_slot <= cur {
-            base // already on-chain / in the cache
-        } else if is_buy {
-            base.after_observed_buy(base_amount)
-        } else {
-            base.after_observed_sell(base_amount)
-        };
-        // Count this in-flight swap (the pump "behind"); resets when `cur` moves.
-        self.live_pump.insert(*token_vault, (cur, shred_slot, count.saturating_add(1), advanced));
-    }
-
-    /// Pump "behind": how many in-flight Pump swaps are accumulated in the
-    /// current block's overlay for this vault. 0 when the overlay is stale (the
-    /// confirmed gRPC state already caught up) or absent.
-    pub fn pump_behind(&self, token_vault: &Pubkey) -> u32 {
-        let cur = self.last_update_slot(token_vault).unwrap_or(0);
-        match self.live_pump.get(token_vault) {
-            Some(e) if e.value().0 == cur => e.value().2,
-            _ => 0,
+        let mut pending = self.live_pump.entry(*token_vault).or_default();
+        // Reconcile: drop every swap the confirmed gRPC state now includes
+        // (gRPC updates a vault once per block with that block's end state, so a
+        // swap at slot <= cur is confirmed). Keep the strictly-newer ones.
+        pending.retain(|&(slot, _, _)| slot > cur);
+        if shred_slot > cur && base_amount > 0 {
+            pending.push((shred_slot, is_buy, base_amount));
         }
     }
 
-    /// Pump pool including any live (shred-advanced) state, valid only when it is
-    /// still built on the current confirmed gRPC slot AND belongs to the block
-    /// `shred_slot` we are pricing for; otherwise the fresh cache decode. Passing
-    /// a NEW block slot therefore discards the previous block's accumulated queue.
+    /// How many PENDING (in-flight, not-yet-confirmed) Pump swaps are folded on
+    /// top of the confirmed state for this vault — the operator's "behind".
+    pub fn pump_behind(&self, token_vault: &Pubkey) -> u32 {
+        let cur = self.last_update_slot(token_vault).unwrap_or(0);
+        match self.live_pump.get(token_vault) {
+            Some(e) => e.value().iter().filter(|&&(slot, _, _)| slot > cur).count() as u32,
+            None => 0,
+        }
+    }
+
+    /// The confirmed Pump pool (fresh gRPC decode) with every still-PENDING shred
+    /// swap (slot newer than the confirmed gRPC slot) folded on top, in slot
+    /// order. This keeps in-flight swaps reflected across the multi-slot gRPC lag
+    /// instead of discarding them at block boundaries. `shred_slot` is accepted
+    /// for API compatibility but no longer gates folding — the confirmed slot is
+    /// the reconciliation boundary, so ALL pending swaps are reflected.
     pub fn pump_pool_live(
         &self,
         pool: &Pubkey,
         token_vault: &Pubkey,
         wsol_vault: &Pubkey,
         token_mint: &Pubkey,
-        shred_slot: u64,
+        _shred_slot: u64,
     ) -> Option<PumpPool> {
+        let mut p = self.pump_pool(pool, token_vault, wsol_vault, token_mint)?;
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
         if let Some(e) = self.live_pump.get(token_vault) {
-            if e.value().0 == cur && e.value().1 == shred_slot {
-                return Some(e.value().3);
+            let mut pending: Vec<(u64, bool, u64)> = e
+                .value()
+                .iter()
+                .copied()
+                .filter(|&(slot, _, _)| slot > cur)
+                .collect();
+            pending.sort_by_key(|&(slot, _, _)| slot);
+            for (_, is_buy, amt) in pending {
+                p = if is_buy {
+                    p.after_observed_buy(amt)
+                } else {
+                    p.after_observed_sell(amt)
+                };
             }
         }
-        self.pump_pool(pool, token_vault, wsol_vault, token_mint)
+        Some(p)
     }
 
     /// Apply an observed Meteora swap (from a shred) to the live meteora overlay.
