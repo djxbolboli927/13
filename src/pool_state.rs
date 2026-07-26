@@ -628,22 +628,20 @@ impl PoolStateCache {
                 None => return,
             },
         };
-        let advanced = if shred_slot <= cur {
-            base // already on-chain / in the cache
+        // Advance unless gRPC has moved STRICTLY PAST this shred's slot (then the
+        // tx is already reflected in the confirmed snapshot). Equal slot is NOT
+        // "already applied": a shred tx executes DURING its slot and is seen
+        // before the confirmed account update for that slot lands, so freezing
+        // the overlay for the whole current slot under-applies every in-flight
+        // swap in it — the exact drift that made successive same-slot legs price
+        // on a stale checkpoint.
+        let _ = K::Opaque; // (Opaque never reaches here; handled via invalidate)
+        let advanced = if shred_slot < cur {
+            base // already on-chain / in the confirmed cache
+        } else if kind == K::Opaque {
+            return; // handled via invalidate_pump, never here
         } else {
-            let raw = if token_is_base { base } else { base.flipped() };
-            let adv = match kind {
-                K::Buy => raw.after_observed_buy(base_amount),
-                K::Sell => raw.after_observed_sell(base_amount),
-                K::BuyQuoteIn => raw.after_observed_buy_quote_in(quote_amount),
-                K::BoostBuyBurn => raw.after_observed_boost(quote_amount),
-                K::Opaque => return, // handled via invalidate_pump, never here
-            };
-            if token_is_base {
-                adv
-            } else {
-                adv.flipped()
-            }
+            base.after_observed(token_is_base, kind, base_amount, quote_amount)
         };
         self.live_pump
             .insert(*token_vault, (cur, shred_slot, count.saturating_add(1), advanced));

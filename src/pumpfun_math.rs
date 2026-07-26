@@ -493,6 +493,36 @@ impl PumpPool {
             ..*self
         }
     }
+
+    /// Apply an observed Pump swap (any kind) in RAW instruction terms and
+    /// return the pool AFTER it. `token_is_base` = false ⇒ INVERTED pool
+    /// (program base_mint = WSOL): flip to the raw view, run the raw math, flip
+    /// back — the base amount is then WSOL lamports and the fee lands on the
+    /// token side, exactly like on-chain. This is the SINGLE source of truth for
+    /// advancing pool state by an observed swap; used both to advance the live
+    /// overlay and to THREAD successive legs of one transaction.
+    pub fn after_observed(
+        &self,
+        token_is_base: bool,
+        kind: crate::shred_stream::PumpIxKind,
+        base_amount: u64,
+        quote_amount: u64,
+    ) -> PumpPool {
+        use crate::shred_stream::PumpIxKind as K;
+        let raw = if token_is_base { *self } else { self.flipped() };
+        let adv = match kind {
+            K::Buy => raw.after_observed_buy(base_amount),
+            K::Sell => raw.after_observed_sell(base_amount),
+            K::BuyQuoteIn => raw.after_observed_buy_quote_in(quote_amount),
+            K::BoostBuyBurn => raw.after_observed_boost(quote_amount),
+            K::Opaque => return *self,
+        };
+        if token_is_base {
+            adv
+        } else {
+            adv.flipped()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -538,5 +568,43 @@ mod gus_event_tests {
             creator_fee_bps: 0,
         };
         assert_eq!(p.quote_sell(21_544), 54_694_186);
+    }
+
+    // Real on-chain tx 4Hc6fz6TWqpkm3r989QzyG5EjyiQnqhzcGRbVvBU9... on the
+    // inverted WSOL-HOOD pool HA53...: ONE transaction that SELLS then BUYS on
+    // the same pool (an MEV round-trip). The bug: the bot priced the BUY leg on
+    // the PRE-sell reserves (giving ~136.5T) instead of threading the sell's
+    // output into it. Threaded, the buy must reproduce the event's
+    // userQuoteAmountIn to the lamport.
+    #[test]
+    fn hood_two_leg_tx_threads_exact() {
+        use crate::shred_stream::PumpIxKind as K;
+        // Canonical storage orientation: base = token (HOOD), quote = WSOL.
+        let pre = PumpPool {
+            base_reserve: 13_009_898_307_115_929, // HOOD
+            quote_reserve: 1_491_639_723_915,     // WSOL
+            total_fee_bps: 30,
+            lp_fee_bps: 25,
+            protocol_fee_bps: 5,
+            creator_fee_bps: 0,
+        };
+        // Inverted pool ⇒ token_is_base = false. Sell leg: base_amount_in is
+        // WSOL lamports (19572384788), quote_amount is the min-out bound.
+        let after_sell = pre.after_observed(false, K::Sell, 19_572_384_788, 165_904_440_947_356);
+        // Post-sell reserves must equal the on-chain buyEvent pool reserves.
+        assert_eq!(after_sell.base_reserve, 12_841_822_530_447_943); // HOOD
+        assert_eq!(after_sell.quote_reserve, 1_511_212_108_703); // WSOL
+
+        // Buy leg: base_amount_out = 15447235134 WSOL out. Priced on the RAW
+        // (flipped) post-sell view, the total quote-in the user pays must equal
+        // the event's userQuoteAmountIn.
+        let threaded_buy = after_sell.flipped().sim_buy_quote_in(15_447_235_134);
+        assert_eq!(threaded_buy, 133_019_412_107_677);
+
+        // Sanity: pricing the same buy on the PRE-sell state (the old bug) is
+        // materially higher — proving the threading actually changed the result.
+        let buggy_buy = pre.flipped().sim_buy_quote_in(15_447_235_134);
+        assert_eq!(buggy_buy, 136_547_137_738_493);
+        assert!(buggy_buy > threaded_buy);
     }
 }

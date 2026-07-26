@@ -491,12 +491,21 @@ impl ShredArbEngine {
                 solana_sdk::pubkey::Pubkey,
                 (Vec<ArbPair>, PumpPool),
             > = std::collections::HashMap::new();
+            // Threaded working state for this batch, keyed by the Pump token
+            // vault. Successive legs of the SAME transaction (an MEV sell→buy on
+            // one pool is the common case) — and successive in-flight txs on the
+            // same pool this slot — MUST each price on the previous leg's OUTPUT
+            // reserves, not on the shared pre-batch checkpoint. Without this, a
+            // tx's second leg was priced on the pre-first-leg pool and produced a
+            // 2-3% wrong output while still logging verdict=OK.
+            let mut work: std::collections::HashMap<solana_sdk::pubkey::Pubkey, PumpPool> =
+                std::collections::HashMap::new();
             for s in batch {
                 if newest.saturating_sub(s.slot) > STALE_SIGNAL_SLOTS {
                     self.skip_stale_signal.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                if let Some(out) = self.apply_signal(&s) {
+                if let Some(out) = self.apply_signal(&s, &mut work) {
                     to_assess.insert(s.pool, out);
                 }
             }
@@ -720,7 +729,11 @@ impl ShredArbEngine {
         Some(tx_revert)
     }
 
-    fn apply_signal(&self, sig: &PumpSwapSignal) -> Option<(Vec<ArbPair>, PumpPool)> {
+    fn apply_signal(
+        &self,
+        sig: &PumpSwapSignal,
+        work: &mut std::collections::HashMap<solana_sdk::pubkey::Pubkey, PumpPool>,
+    ) -> Option<(Vec<ArbPair>, PumpPool)> {
         self.signals_received.fetch_add(1, Ordering::Relaxed);
         let pairs = match self.registry.get(&sig.pool) {
             Some(p) => p.clone(),
@@ -783,15 +796,19 @@ impl ShredArbEngine {
             sig.base_amount
         };
 
-        // Current Pump reserves (live overlay: includes any earlier shred txs
-        // on this pool not yet delivered by gRPC).
-        let pump_now = match self.pool_state.pump_pool_live(
-            &first.pump.pool,
-            &token_vault,
-            &wsol_vault,
-            &first.token_mint,
-            sig.slot,
-        ) {
+        // Current Pump reserves. Prefer the batch WORKING state (threads earlier
+        // legs of THIS tx / earlier in-flight txs on this pool this batch); fall
+        // back to the live overlay (checkpoint + cross-batch shreds) and finally
+        // to the confirmed gRPC decode.
+        let pump_now = match work.get(&token_vault).copied().or_else(|| {
+            self.pool_state.pump_pool_live(
+                &first.pump.pool,
+                &token_vault,
+                &wsol_vault,
+                &first.token_mint,
+                sig.slot,
+            )
+        }) {
             Some(p) => p,
             None => {
                 self.skip_no_pump_state.fetch_add(1, Ordering::Relaxed);
@@ -809,9 +826,17 @@ impl ShredArbEngine {
         let verdict = self.record_sim_verdict(sig, &pairs, &pump_now, token_is_base, econ_buy);
         match verdict {
             Some(false) => {
-                // Believed to SUCCEED → advance the live overlay (RAW values in;
-                // orientation resolved inside). This runs for trades below the
-                // trigger too — small ones still move the pool.
+                // Believed to SUCCEED → advance BOTH the batch working state (so
+                // the NEXT leg of this tx prices on this leg's output) and the
+                // cross-batch live overlay. Threaded on the SAME pre-leg state
+                // we just priced, so the two never diverge.
+                let advanced = pump_now.after_observed(
+                    token_is_base,
+                    sig.kind,
+                    sig.base_amount,
+                    sig.quote_amount,
+                );
+                work.insert(token_vault, advanced);
                 self.pool_state.apply_pump_swap(
                     &first.pump.pool,
                     &token_vault,
@@ -825,12 +850,15 @@ impl ShredArbEngine {
                 );
             }
             Some(true) => {
-                // Believed to REVERT → do NOT touch the overlay.
+                // Believed to REVERT → moves NOTHING. Keep the working state at
+                // the pre-leg reserves so a following leg sees the unchanged pool.
+                work.insert(token_vault, pump_now);
                 self.sim_skipped_revert.fetch_add(1, Ordering::Relaxed);
             }
             None => {
                 // Dark-paused → we are waiting for the gRPC checkpoint; do not
                 // advance (the overlay was already invalidated for the dark tx).
+                work.insert(token_vault, pump_now);
             }
         }
         // Meteora legs of competitor ARB txs are NOT applied to state
@@ -859,18 +887,9 @@ impl ShredArbEngine {
             }
         }
 
-        // Predicted post-trade Pump reserves — the live overlay now includes
-        // this shred, so read it back for pricing.
-        let pump_after = self
-            .pool_state
-            .pump_pool_live(
-                &first.pump.pool,
-                &token_vault,
-                &wsol_vault,
-                &first.token_mint,
-                sig.slot,
-            )
-            .unwrap_or(pump_now);
+        // Predicted post-trade Pump reserves — the batch working state now holds
+        // this leg's output (threaded), so price the opportunity against it.
+        let pump_after = work.get(&token_vault).copied().unwrap_or(pump_now);
         Some((pairs, pump_after))
     }
 
