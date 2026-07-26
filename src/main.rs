@@ -779,8 +779,13 @@ fn spawn_shred_arb(
         engine.clone().spawn_reporter();
         engine.clone().spawn_fee_audit(sa.fee_audit_log_secs);
         // Second opportunity source: re-assess all pairs from current state
-        // every 200ms, not only when a Pump shred fires.
-        engine.clone().spawn_state_evaluator(200);
+        // every 200ms, not only when a Pump shred fires. OFF by default — it
+        // judges profit on cached state we never simulated (recorded=0) and
+        // fabricates opportunities off a stale snapshot. Opportunities should
+        // come only from actually-simulated shred transactions.
+        if sa.state_evaluator_enabled {
+            engine.clone().spawn_state_evaluator(200);
+        }
         eprintln!("[shred-arb] strategy started");
         engine.run(rx).await;
     });

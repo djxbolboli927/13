@@ -346,6 +346,14 @@ pub struct ShredArbConfig {
     /// explicit opt-in.
     #[serde(default = "default_true")]
     pub sim_only: bool,
+    /// Second opportunity source: a 200ms timer that re-assesses every pair from
+    /// the CURRENT cached (account-update) state, without simulating any
+    /// competitor transaction. It's the source of "profitable/not_profitable"
+    /// counts with recorded=0 — profit judged on state we never validated — and
+    /// of phantom opportunities priced off a slightly-stale snapshot. Default
+    /// OFF: opportunities come only from actually-simulated shred transactions.
+    #[serde(default)]
+    pub state_evaluator_enabled: bool,
 }
 
 fn default_alt_fetch_providers() -> Vec<String> {
@@ -476,6 +484,7 @@ impl Default for ShredArbConfig {
             rpc_sim_compare: false,
             disable_preempt: false,
             sim_only: true,
+            state_evaluator_enabled: false,
         }
     }
 }
