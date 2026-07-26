@@ -133,6 +133,14 @@ pub struct PoolStateCache {
     /// show, at the moment it computes a tx, exactly which confirmed tx and which
     /// confirmed account-state it is building on — so a gap is visible.
     last_tx_sig: Arc<DashMap<Pubkey, (solana_sdk::signature::Signature, u64)>>,
+    /// The ACCOUNT-update correlation: for each account, the signature of the
+    /// transaction that PRODUCED its current cached state, plus the slot and
+    /// write_version (intra-slot order). Yellowstone stamps every account-update
+    /// with `txn_signature`, so we know EXACTLY which tx each pool-state change
+    /// belongs to — no guessing from amounts. This is the key to knowing whether
+    /// the reserves we price a tx on are really that tx's immediate predecessor.
+    last_acct_tx:
+        Arc<DashMap<Pubkey, (Option<solana_sdk::signature::Signature>, u64, u64)>>,
 }
 
 fn read_u128_le(data: &[u8], off: usize) -> Option<u128> {
@@ -339,6 +347,7 @@ impl PoolStateCache {
             accounts: Arc::new(std::sync::Mutex::new(Vec::new())),
             change: Arc::new(tokio::sync::Notify::new()),
             last_tx_sig: Arc::new(DashMap::with_capacity(256)),
+            last_acct_tx: Arc::new(DashMap::with_capacity(256)),
             live_pump: Arc::new(DashMap::with_capacity(256)),
             live_meteora: Arc::new(DashMap::with_capacity(256)),
             sim_ledger: Arc::new(SimLedger::default()),
@@ -436,6 +445,17 @@ impl PoolStateCache {
         account: &Pubkey,
     ) -> Option<(solana_sdk::signature::Signature, u64)> {
         self.last_tx_sig.get(account).map(|v| *v.value())
+    }
+
+    /// The transaction (signature + slot + write_version) that produced the
+    /// current cached state of `account`, taken from the account-update's
+    /// `txn_signature`. This is the exact "which tx does this pool state belong
+    /// to" correlation.
+    pub fn acct_state_tx(
+        &self,
+        account: &Pubkey,
+    ) -> Option<(Option<solana_sdk::signature::Signature>, u64, u64)> {
+        self.last_acct_tx.get(account).map(|v| *v.value())
     }
 
     /// Decode a Meteora pool account into its pricing slice. The fee is read
@@ -841,12 +861,14 @@ impl PoolStateCache {
         let change = self.change.clone();
         let sim_ledger = self.sim_ledger.clone();
         let last_tx_sig = self.last_tx_sig.clone();
+        let last_acct_tx = self.last_acct_tx.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
             loop {
                 match run_stream(
                     &endpoint, &x_token, &acct_set, &change, &inner, &last_update,
                     &last_update_slot, &slot, &updates, &sim_ledger, &last_tx_sig,
+                    &last_acct_tx,
                 )
                 .await
                 {
@@ -947,6 +969,9 @@ async fn run_stream(
     updates: &Arc<AtomicU64>,
     sim_ledger: &Arc<SimLedger>,
     last_tx_sig: &Arc<DashMap<Pubkey, (solana_sdk::signature::Signature, u64)>>,
+    last_acct_tx: &Arc<
+        DashMap<Pubkey, (Option<solana_sdk::signature::Signature>, u64, u64)>,
+    >,
 ) -> Result<()> {
     let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
         .x_token(Some(x_token.to_string()))?
@@ -988,6 +1013,15 @@ async fn run_stream(
                 slot.store(a.slot, Ordering::Relaxed);
                 if let Some(info) = a.account {
                     if let Ok(pk) = Pubkey::try_from(info.pubkey.as_slice()) {
+                        // Correlate this state change to the tx that caused it:
+                        // Yellowstone stamps every account-update with the
+                        // producing tx's signature. Store it (+ slot +
+                        // write_version) so we know exactly which tx this pool
+                        // state belongs to.
+                        let acct_sig = info.txn_signature.as_ref().and_then(|s| {
+                            solana_sdk::signature::Signature::try_from(s.as_slice()).ok()
+                        });
+                        last_acct_tx.insert(pk, (acct_sig, a.slot, info.write_version));
                         cache.insert(pk, info.data);
                         last_update.insert(pk, std::time::Instant::now());
                         last_update_slot.insert(pk, a.slot);

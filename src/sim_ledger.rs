@@ -75,6 +75,12 @@ pub struct SimRecord {
     /// If `last_tx_sig` is far behind this tx, we simulated ahead of confirmation.
     pub last_acct_slot: u64,
     pub last_tx_sig: String,
+    /// THE correlation: the signature of the transaction that PRODUCED the pool
+    /// reserves this sim was computed on (from the account-update's
+    /// `txn_signature`). If this is not the tx immediately before the simulated
+    /// tx, we priced on the wrong state — the reserves belong to a different
+    /// point in the pool's history.
+    pub acct_state_tx: String,
 }
 
 impl SimRecord {
@@ -153,6 +159,7 @@ impl SimLedger {
             tfee_token = rec.tfee_token,
             last_acct_slot = rec.last_acct_slot,
             last_tx_sig = %rec.last_tx_sig,
+            acct_state_tx = %rec.acct_state_tx,
             tx_verdict = if rec.tx_revert { "REVERT" } else { "OK" },
             "sim"
         );
@@ -161,14 +168,14 @@ impl SimLedger {
             &format!(
                 "slot={} sig={sig} hops={} dex={} {} kind={} pump[in={} out={} bound={} verdict={}] \
                  meteora[in={} out={} bound={} verdict={}] token2022_fee[bps={} taken={}] \
-                 last_acct_slot={} last_tx_sig={} tx_verdict={}",
+                 last_acct_slot={} last_tx_sig={} acct_state_tx={} tx_verdict={}",
                 rec.slot, rec.hops, rec.dex_label(), rec.pools_str(), rec.kind,
                 rec.pump_in, rec.pump_out, rec.pump_bound,
                 if rec.pump_revert { "REVERT" } else { "OK" },
                 rec.met_in, rec.met_out, rec.met_bound,
                 if rec.met_revert { "REVERT" } else { "OK" },
                 rec.tfee_bps, rec.tfee_token,
-                rec.last_acct_slot, rec.last_tx_sig,
+                rec.last_acct_slot, rec.last_tx_sig, rec.acct_state_tx,
                 if rec.tx_revert { "REVERT" } else { "OK" },
             ),
         );

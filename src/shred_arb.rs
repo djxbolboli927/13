@@ -735,6 +735,11 @@ impl ShredArbEngine {
             .and_then(|v| self.pool_state.last_tx_sig(&v))
             .map(|(s, _)| s.to_string())
             .unwrap_or_else(|| "none-yet".to_string());
+        // THE correlation: which tx produced the reserves we are pricing on.
+        let acct_state_tx = pump_token_vault
+            .and_then(|v| self.pool_state.acct_state_tx(&v))
+            .map(|(s, _, _)| s.map(|s| s.to_string()).unwrap_or_else(|| "no-sig".into()))
+            .unwrap_or_else(|| "none-yet".to_string());
         self.sim_ledger.record(
             sig.sig,
             crate::sim_ledger::SimRecord {
@@ -762,6 +767,7 @@ impl ShredArbEngine {
                 pred_quote: pred_pool.quote_reserve,
                 last_acct_slot,
                 last_tx_sig,
+                acct_state_tx,
             },
         );
         Some(tx_revert)
