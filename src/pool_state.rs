@@ -612,17 +612,17 @@ impl PoolStateCache {
     ) {
         use crate::shred_stream::PumpIxKind as K;
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
-        // ACCUMULATE in-flight Pump swaps, but only WITHIN THE SAME BLOCK: base
-        // is the existing overlay iff it was built on the same confirmed gRPC
-        // slot AND the same shred block slot, else the fresh confirmed decode.
-        // Successive swaps inside one block are summed so the NEXT shred prices
-        // against a pool reflecting them; a new block discards the previous
-        // block's queue (landed swaps arrive as a gRPC update, unlanded ones
-        // are moot — accumulating them across blocks over-moves the price).
+        // CHECKPOINT MODEL (validator-style): the base is the gRPC-confirmed
+        // vault state at slot `cur`, and we ACCUMULATE every in-flight swap with
+        // slot > cur on top of it — ACROSS BLOCKS — until gRPC advances (which
+        // moves `cur` and rebuilds from the fresh checkpoint). The overlay is
+        // valid as long as it was built on the CURRENT confirmed slot; a new
+        // block does NOT reset it (the old per-block reset discarded prior
+        // blocks' swaps whenever gRPC lagged even one slot, which drifted the
+        // reserves by several % on active pools). Only successful swaps reach
+        // here — the caller gates on the sim verdict.
         let (base, count) = match self.live_pump.get(token_vault) {
-            Some(e) if e.value().0 == cur && e.value().1 == shred_slot => {
-                (e.value().3, e.value().2)
-            }
+            Some(e) if e.value().0 == cur => (e.value().3, e.value().2),
             _ => match self.pump_pool(pool, token_vault, wsol_vault, token_mint) {
                 Some(p) => (p, 0),
                 None => return,
@@ -669,21 +669,22 @@ impl PoolStateCache {
         self.live_pump.remove(token_vault);
     }
 
-    /// Pump pool including any live (shred-advanced) state, valid only when it
-    /// is still built on the current confirmed gRPC slot AND belongs to the
-    /// block `shred_slot` we are pricing for; otherwise the fresh cache decode.
-    /// Passing a NEW block slot therefore discards the previous block's queue.
+    /// Pump pool including any live (shred-advanced) state, valid as long as the
+    /// overlay was built on the CURRENT confirmed gRPC slot (checkpoint model —
+    /// it accumulates every in-flight swap since that checkpoint, across blocks).
+    /// Once gRPC advances, the overlay is stale and we fall back to the fresh
+    /// confirmed decode. `_shred_slot` is retained for call-site symmetry.
     pub fn pump_pool_live(
         &self,
         pool: &Pubkey,
         token_vault: &Pubkey,
         wsol_vault: &Pubkey,
         token_mint: &Pubkey,
-        shred_slot: u64,
+        _shred_slot: u64,
     ) -> Option<PumpPool> {
         let cur = self.last_update_slot(token_vault).unwrap_or(0);
         if let Some(e) = self.live_pump.get(token_vault) {
-            if e.value().0 == cur && e.value().1 == shred_slot {
+            if e.value().0 == cur {
                 return Some(e.value().3);
             }
         }
