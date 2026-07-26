@@ -184,19 +184,28 @@ impl MeteoraPool {
         out.min(u64::MAX as u128) as u64
     }
 
-    /// Convenience: buy the token with WSOL. Returns token amount out.
-    /// `token_is_a` maps the WSOL-in leg to the correct swap direction.
+    /// Convenience: buy the token with WSOL. Returns token amount out, CAPPED to
+    /// the token reserve. `token_is_a` maps the WSOL-in leg to the correct
+    /// direction. The cap enforces a physical invariant: a pool can never pay out
+    /// more of a token than it holds. A stale/edge sqrt_price on a dust pool can
+    /// make the raw curve math return an impossible amount (e.g. 2.5× the whole
+    /// reserve) — that fabricated output is the source of phantom arb profit.
     pub fn buy_token_with_wsol(&self, wsol_in: u64, token_is_a: bool) -> Option<u64> {
         // WSOL in → token out. If token is A then WSOL is B, so B→A (a_to_b=false).
         let a_to_b = !token_is_a;
-        self.swap_exact_in(wsol_in, a_to_b).map(|s| s.amount_out)
+        let token_reserve = self.wsol_reserve(!token_is_a); // token side reserve
+        self.swap_exact_in(wsol_in, a_to_b)
+            .map(|s| s.amount_out.min(token_reserve))
     }
 
-    /// Convenience: sell the token for WSOL. Returns lamports out.
+    /// Convenience: sell the token for WSOL. Returns lamports out, CAPPED to the
+    /// pool's WSOL reserve (same physical invariant as `buy_token_with_wsol`).
     pub fn sell_token_for_wsol(&self, token_in: u64, token_is_a: bool) -> Option<u64> {
         // token in → WSOL out. If token is A then A→B (a_to_b=true).
         let a_to_b = token_is_a;
-        self.swap_exact_in(token_in, a_to_b).map(|s| s.amount_out)
+        let wsol_reserve = self.wsol_reserve(token_is_a);
+        self.swap_exact_in(token_in, a_to_b)
+            .map(|s| s.amount_out.min(wsol_reserve))
     }
 
     /// Advance this pool's `sqrt_price` by an OBSERVED swap of `amount_in` in the

@@ -674,7 +674,15 @@ impl ShredArbEngine {
                         } else {
                             !pair.meteora.token_is_a
                         };
-                        met_out = met.swap_exact_in(amt, a_to_b).map(|s| s.amount_out).unwrap_or(0);
+                        // Cap to the OUT-side reserve (a pool can't pay out more
+                        // than it holds). wsol_reserve(true)=reserve_B (out when
+                        // a_to_b), wsol_reserve(false)=reserve_A — so the out-side
+                        // reserve is exactly wsol_reserve(a_to_b).
+                        let out_reserve = met.wsol_reserve(a_to_b);
+                        met_out = met
+                            .swap_exact_in(amt, a_to_b)
+                            .map(|s| s.amount_out.min(out_reserve))
+                            .unwrap_or(0);
                         met_revert = met_out < bound;
                     }
                 }
