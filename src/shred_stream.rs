@@ -25,24 +25,12 @@ mod pb {
 }
 use pb::{shredstream_proxy_client::ShredstreamProxyClient, SubscribeEntriesRequest};
 
-// Anchor 8-byte discriminators for EVERY PumpSwap instruction that moves value
-// through the pool vaults (missing one = mispricing the pool).
-const DISC_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
-const DISC_SELL: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
-/// `buy_exact_quote_in(spendable_quote_in, min_base_amount_out, …)` — exact-IN
-/// on the QUOTE side (u64 at [8..16] is QUOTE, unlike `buy` where it's base).
-const DISC_BUY_EXACT_QUOTE_IN: [u8; 8] = [198, 46, 21, 82, 180, 217, 232, 112];
-/// `boost_buy_and_burn(quote_amount_in, min_base_amount_burned)` — pump's
-/// buyback bot: quote enters the pool vault, bought base is burned out of it.
-const DISC_BOOST_BUY_AND_BURN: [u8; 8] = [105, 68, 6, 175, 0, 7, 35, 162];
-/// `withdraw` (remove liquidity) — the direct rug signal.
-const DISC_WITHDRAW: [u8; 8] = [183, 18, 70, 156, 148, 109, 161, 34];
-/// Meteora DAMM v2 `swap` anchor discriminator (sha256("global:swap")[..8]).
-const DISC_METEORA_SWAP: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
-/// Meteora DAMM v2 `swap2` (current; `swap` is deprecated). Data after the
-/// discriminator: `amount_0 u64@8`, `amount_1 u64@16`, `swap_mode u8@24`
-/// (0=ExactIn, 1=PartialFill, 2=ExactOut). Verified against the official IDL.
-const DISC_METEORA_SWAP2: [u8; 8] = [65, 75, 63, 76, 235, 91, 91, 136];
+// Anchor 8-byte discriminators — single source of truth in `crate::decoders`,
+// where each program's full instruction catalogue is documented.
+use crate::decoders::meteora_damm_v2::{DISC_SWAP as DISC_METEORA_SWAP, DISC_SWAP2 as DISC_METEORA_SWAP2};
+use crate::decoders::pump_amm::{
+    DISC_BOOST_BUY_AND_BURN, DISC_BUY, DISC_BUY_EXACT_QUOTE_IN, DISC_SELL, DISC_WITHDRAW,
+};
 
 /// A decoded Meteora leg riding inside a competitor's (arb) transaction.
 #[derive(Debug, Clone, Copy)]
@@ -225,6 +213,11 @@ pub struct ShredConsumer {
     order_seq: AtomicU64,
     /// Per-block diagnostic tracker (prints every 10 blocks).
     block_log: std::sync::Mutex<BlockTracker>,
+    /// Known aggregator/router program ids (Jupiter, OKX, DFlow, …). A tx that
+    /// invokes one of these as a STATIC key is let through the cheap pre-filter
+    /// even when the Pump program itself is ALT-hidden, so router swaps on a
+    /// watched pool are resolved and enqueued instead of being dropped.
+    router_programs: HashSet<Pubkey>,
     pub metrics: Arc<ShredMetrics>,
 }
 
@@ -251,6 +244,7 @@ impl ShredConsumer {
             alt_candidate_tx: std::sync::RwLock::new(None),
             order_seq: AtomicU64::new(0),
             block_log: std::sync::Mutex::new(BlockTracker::default()),
+            router_programs: crate::decoders::known_router_pubkeys().into_iter().collect(),
             metrics,
         }
     }
@@ -410,8 +404,15 @@ impl ShredConsumer {
         let msg = &vtx.message;
         let static_keys = msg.static_account_keys();
 
-        // Quick reject: the invoked program must appear as a static key.
-        if !static_keys.iter().any(|k| *k == self.pumpfun) {
+        // Cheap pre-filter: process the tx if a program we can act on appears as
+        // a STATIC key — either the Pump/Meteora AMM itself (native swap), or a
+        // KNOWN router (Jupiter/OKX/DFlow) that CPIs into our pools with the AMM
+        // program ALT-hidden. Without the router clause every aggregator tx on a
+        // watched pool was dropped here, leaving holes in the ordered sequence.
+        let touches_known_program = static_keys.iter().any(|k| {
+            *k == self.pumpfun || *k == self.meteora || self.router_programs.contains(k)
+        });
+        if !touches_known_program {
             return;
         }
         self.metrics.pump_txns.fetch_add(1, Ordering::Relaxed);
@@ -557,10 +558,14 @@ impl ShredConsumer {
         }
 
         // ── Opaque path: watched pool touched via a router / private bot ──────
-        // The tx invokes the Pump program (it's in the static keys) and one of
-        // OUR pools appears in its account list, but we decoded NO top-level
-        // swap for that pool — the swap rides inside a CPI (Jupiter route,
-        // Axiom, unknown on-chain bots) whose data we cannot decode statically.
+        // The tx invokes the Pump/Meteora AMM or a known router (Jupiter/OKX/
+        // DFlow) and one of OUR pools appears in its (ALT-resolved) account list,
+        // but we decoded NO top-level Pump swap for that pool — the swap rides
+        // inside a CPI (Jupiter route, Axiom, unknown on-chain bots) whose exact
+        // amounts are not in shred data (they live in tx meta). We cannot price
+        // it, so we enqueue it as an Unreadable marker: the sequencer waits for
+        // this tx's own account-update to learn the pool's new reserves — it is
+        // never skipped, so the ordered sequence keeps no holes.
         // The pool WILL change by an unknown amount, so tell the engine to
         // invalidate its live overlay and hold trading until fresh gRPC state.
         {

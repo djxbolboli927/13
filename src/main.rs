@@ -9,6 +9,8 @@ mod arbitrage;
 mod ata;
 mod blockhash_cache;
 mod config;
+#[allow(dead_code)]
+mod decoders;
 mod dex_accounts;
 #[allow(dead_code)]
 mod dex_ids;
