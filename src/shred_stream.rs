@@ -126,6 +126,53 @@ pub struct PumpSwapSignal {
     pub order_seq: u64,
 }
 
+/// Per-block diagnostic: records, for each slot, the WATCHED-pool txs the
+/// consumer actually forwarded (in PoH order), and prints a summary every 10
+/// completed blocks. This is how the operator verifies the bot READS every
+/// watched-pool tx of a block instead of jumping from tx 500 to tx 800 — a
+/// gap in the printed `pool_seq`/order means a tx was skipped upstream.
+#[derive(Default)]
+struct BlockTracker {
+    /// slot → (global order_seq, sig) of every watched-pool tx seen in it.
+    open: std::collections::BTreeMap<u64, Vec<(u64, solana_sdk::signature::Signature)>>,
+    /// Completed blocks waiting to be printed (flushed in batches of 10).
+    done: Vec<(u64, Vec<(u64, solana_sdk::signature::Signature)>)>,
+}
+
+impl BlockTracker {
+    fn record(&mut self, slot: u64, order_seq: u64, sig: solana_sdk::signature::Signature) {
+        self.open.entry(slot).or_default().push((order_seq, sig));
+        // A slot more than 2 behind the newest one we've seen is complete
+        // (shreds arrive roughly in slot order) → move it to `done`.
+        if let Some(&newest) = self.open.keys().next_back() {
+            let cutoff = newest.saturating_sub(2);
+            let ready: Vec<u64> = self.open.range(..cutoff).map(|(k, _)| *k).collect();
+            for s in ready {
+                if let Some(v) = self.open.remove(&s) {
+                    self.done.push((s, v));
+                }
+            }
+        }
+        // Print once per 10 completed blocks.
+        while self.done.len() >= 10 {
+            let batch: Vec<(u64, Vec<(u64, solana_sdk::signature::Signature)>)> =
+                self.done.drain(..10).collect();
+            let mut out =
+                String::from("[block-read] last 10 blocks — watched-pool txs seen, in PoH order:");
+            for (s, mut txs) in batch {
+                txs.sort_by_key(|(o, _)| *o); // true leader order, not arrival order
+                out.push_str(&format!("\nblok:{}  count={}", s, txs.len()));
+                for (i, (oseq, sig)) in txs.iter().enumerate() {
+                    let h = sig.to_string();
+                    let head = &h[..h.len().min(5)];
+                    out.push_str(&format!("\n  {}:{} (seq {})", i + 1, head, oseq));
+                }
+            }
+            info!("{}", out);
+        }
+    }
+}
+
 /// Runtime counters for observability.
 #[derive(Default)]
 pub struct ShredMetrics {
@@ -176,6 +223,8 @@ pub struct ShredConsumer {
     /// block order of pending transactions — the ground truth for ordering
     /// shred txs that have no account/transaction update yet.
     order_seq: AtomicU64,
+    /// Per-block diagnostic tracker (prints every 10 blocks).
+    block_log: std::sync::Mutex<BlockTracker>,
     pub metrics: Arc<ShredMetrics>,
 }
 
@@ -201,6 +250,7 @@ impl ShredConsumer {
             pending_alts: std::sync::Mutex::new(HashSet::new()),
             alt_candidate_tx: std::sync::RwLock::new(None),
             order_seq: AtomicU64::new(0),
+            block_log: std::sync::Mutex::new(BlockTracker::default()),
             metrics,
         }
     }
@@ -491,6 +541,12 @@ impl ShredConsumer {
             };
             // Only forward WATCHED pools — see the firehose note above.
             if watched {
+                // Record for the per-block diagnostic BEFORE the try_send drop:
+                // we want to prove the tx was READ, regardless of channel pressure.
+                self.block_log
+                    .lock()
+                    .unwrap()
+                    .record(slot, order_seq, tx_sig);
                 // Non-blocking: if the engine is busy, drop (staleness makes an
                 // old signal worthless anyway).
                 match tx.try_send(signal) {
@@ -517,6 +573,12 @@ impl ShredConsumer {
                     continue; // this pool's swap was decoded above
                 }
                 self.metrics.opaque_matched.fetch_add(1, Ordering::Relaxed);
+                // Opaque txs still TOUCH the pool (in PoH order) — record them so
+                // the per-block diagnostic counts them and the sequence has no gap.
+                self.block_log
+                    .lock()
+                    .unwrap()
+                    .record(slot, order_seq, tx_sig);
                 let signal = PumpSwapSignal {
                     pool: *key,
                     kind: PumpIxKind::Opaque,
