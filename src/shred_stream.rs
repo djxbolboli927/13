@@ -422,10 +422,12 @@ impl ShredConsumer {
                 self.metrics.unresolved_pool.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            // NO target filter here: EVERY decodable Pump swap on the cluster is
-            // forwarded so the engine can advance live state for any pool it
-            // knows. Watched-only side effects (ALT harvest, rug close) stay
-            // gated on the watched set below.
+            // Only WATCHED pools are forwarded. Forwarding every Pump swap on the
+            // cluster floods the engine channel and puts shred processing minutes
+            // behind — so by the time a tx's shred is handled, its account-update
+            // (only ~200ms behind) has long passed, and the ordered sequencer can
+            // never line them up. We trade only watched pools, so that is all the
+            // sequencer needs.
             let watched = self.target_pools.read().unwrap().contains(&pool);
 
             // Feed this tx's ALTs as candidates for the pool (the AltRegistry
@@ -487,12 +489,15 @@ impl ShredConsumer {
                 meteora_exact_out,
                 order_seq,
             };
-            // Non-blocking: if the engine is busy, drop (staleness makes an old
-            // signal worthless anyway).
-            match tx.try_send(signal) {
-                Ok(()) => self.metrics.signals_sent.fetch_add(1, Ordering::Relaxed),
-                Err(_) => self.metrics.signals_dropped.fetch_add(1, Ordering::Relaxed),
-            };
+            // Only forward WATCHED pools — see the firehose note above.
+            if watched {
+                // Non-blocking: if the engine is busy, drop (staleness makes an
+                // old signal worthless anyway).
+                match tx.try_send(signal) {
+                    Ok(()) => self.metrics.signals_sent.fetch_add(1, Ordering::Relaxed),
+                    Err(_) => self.metrics.signals_dropped.fetch_add(1, Ordering::Relaxed),
+                };
+            }
         }
 
         // ── Opaque path: watched pool touched via a router / private bot ──────
