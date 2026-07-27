@@ -120,6 +120,10 @@ pub struct PumpSwapSignal {
     pub meteora_min_out: Option<u64>,
     /// swap2 ExactOut — reverse curve; the forward verdict math is skipped.
     pub meteora_exact_out: bool,
+    /// The leader's block order of this tx (PoH sequence): a monotonic stamp
+    /// assigned as ShredStream entries are read in order. `(slot, order_seq)` is
+    /// the exact order pending shred txs must be simulated in.
+    pub order_seq: u64,
 }
 
 /// Runtime counters for observability.
@@ -166,6 +170,12 @@ pub struct ShredConsumer {
     /// Optional sink for `(pump_pool, alt_keys)` — the ALTs a competitor tx used
     /// on a watched pool, fed to the AltRegistry so it can pick the best table.
     alt_candidate_tx: std::sync::RwLock<Option<mpsc::Sender<(Pubkey, Vec<Pubkey>)>>>,
+    /// Monotonic ORDER stamp assigned to every transaction as we read the
+    /// ShredStream entries. Entries are PoH-sequenced (the leader's exact
+    /// execution order) and we iterate them in order, so this counter IS the
+    /// block order of pending transactions — the ground truth for ordering
+    /// shred txs that have no account/transaction update yet.
+    order_seq: AtomicU64,
     pub metrics: Arc<ShredMetrics>,
 }
 
@@ -190,6 +200,7 @@ impl ShredConsumer {
             rpc,
             pending_alts: std::sync::Mutex::new(HashSet::new()),
             alt_candidate_tx: std::sync::RwLock::new(None),
+            order_seq: AtomicU64::new(0),
             metrics,
         }
     }
@@ -329,7 +340,10 @@ impl ShredConsumer {
             for entry in &entries {
                 for vtx in &entry.transactions {
                     self.metrics.txns.fetch_add(1, Ordering::Relaxed);
-                    self.scan_tx(slot, vtx, tx);
+                    // Stamp EVERY tx (in PoH order) with a monotonic sequence, so
+                    // the pending-tx order is the leader's exact block order.
+                    let order_seq = self.order_seq.fetch_add(1, Ordering::Relaxed);
+                    self.scan_tx(slot, order_seq, vtx, tx);
                 }
             }
         }
@@ -339,6 +353,7 @@ impl ShredConsumer {
     fn scan_tx(
         &self,
         slot: u64,
+        order_seq: u64,
         vtx: &solana_sdk::transaction::VersionedTransaction,
         tx: &mpsc::Sender<PumpSwapSignal>,
     ) {
@@ -470,6 +485,7 @@ impl ShredConsumer {
                 meteora_amount_in,
                 meteora_min_out,
                 meteora_exact_out,
+                order_seq,
             };
             // Non-blocking: if the engine is busy, drop (staleness makes an old
             // signal worthless anyway).
@@ -510,6 +526,7 @@ impl ShredConsumer {
                     meteora_amount_in: None,
                     meteora_min_out: None,
                     meteora_exact_out: false,
+                    order_seq,
                 };
                 match tx.try_send(signal) {
                     Ok(()) => self.metrics.signals_sent.fetch_add(1, Ordering::Relaxed),
