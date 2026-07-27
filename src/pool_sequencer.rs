@@ -72,9 +72,22 @@ struct QueuedTx {
     seen: Instant,
     /// A transaction-update said this tx reverted → it changed nothing.
     reverted: bool,
-    /// An account-update confirmed this tx's resulting pool state (or it was a
-    /// confirmed-reverted step we've walked past).
-    settled: bool,
+    /// We already emitted ONE prediction for this tx against the current
+    /// confirmed frontier. Prevents the "same tx simulated over and over" loop:
+    /// a pending tx is predicted once, then we wait for its OWN account-update to
+    /// confirm it (which removes it) before the next tx is predicted.
+    predicted: bool,
+}
+
+/// The confirmed frontier for a pool: the reserves after the newest account-
+/// update we've accepted, tagged with the tx that produced it and its ordering
+/// keys `(slot, write_version)`.
+#[derive(Clone, Copy, Debug)]
+struct Confirmed {
+    state: PumpPool,
+    sig: Signature,
+    slot: u64,
+    write_version: u64,
 }
 
 /// A request to simulate one tx against a known pre-state — emitted the moment
@@ -91,23 +104,25 @@ pub struct ComputeReq {
     /// The tx whose account-update produced `pre_state` — logged so it's provable
     /// that we compute the tx AFTER the confirmed one, on ITS reserves.
     pub predecessor: Option<Signature>,
+    /// The `(slot, write_version)` of that confirmed account-update.
+    pub confirmed_slot: u64,
+    pub confirmed_write_version: u64,
 }
 
 /// The ordered ledger for a single pool.
 pub struct PoolSeq {
     queue: VecDeque<QueuedTx>,
-    /// Reserves after the last account-update we accepted (the confirmed
-    /// frontier). `None` until the first account-update arrives.
-    confirmed_state: Option<PumpPool>,
-    confirmed_sig: Option<Signature>,
+    /// The confirmed frontier, driven ENTIRELY by account-updates ordered by
+    /// `(slot, write_version)` — never by matching shred-queue signatures. `None`
+    /// until the first account-update arrives.
+    confirmed: Option<Confirmed>,
 }
 
 impl Default for PoolSeq {
     fn default() -> Self {
         Self {
             queue: VecDeque::with_capacity(64),
-            confirmed_state: None,
-            confirmed_sig: None,
+            confirmed: None,
         }
     }
 }
@@ -125,7 +140,7 @@ impl PoolSeq {
             kind,
             seen: now,
             reverted: false,
-            settled: false,
+            predicted: false,
         });
         self.prune(now);
     }
@@ -140,80 +155,89 @@ impl PoolSeq {
         }
     }
 
-    /// An account-update arrived for this pool: `sig` produced state `reserves`.
-    /// This is the authoritative confirmed frontier. Mark the queue up to `sig`
-    /// as settled, adopt the reserves, and return the NEXT tx to simulate — but
-    /// only if it is readable. An unreadable next tx returns `None` (we wait for
-    /// ITS account-update, never skipping it).
+    /// An account-update arrived: `sig` produced `reserves` at `(slot, wv)`. This
+    /// is the ground-truth confirmed state — adopt it ONLY if it is strictly
+    /// newer than our current frontier (updates can arrive out of order; a stale
+    /// one must not clobber a newer state). Any queued shred tx equal to `sig` is
+    /// now confirmed → remove it. Then predict the next pending tx (the one AFTER
+    /// this confirmed one) on these fresh reserves. Returns `None` if the front
+    /// pending tx is unreadable (wait for its account-update) or already
+    /// predicted (wait for its confirmation).
     pub fn on_account_update(
         &mut self,
         sig: Signature,
         reserves: PumpPool,
+        slot: u64,
+        write_version: u64,
         now: Instant,
     ) -> Option<ComputeReq> {
-        self.confirmed_state = Some(reserves);
-        self.confirmed_sig = Some(sig);
-        // Settle everything up to and including `sig` (if we've queued it).
-        if let Some(pos) = self.queue.iter().position(|q| q.sig == sig) {
-            for q in self.queue.iter_mut().take(pos + 1) {
-                q.settled = true;
+        if let Some(c) = &self.confirmed {
+            if (slot, write_version) <= (c.slot, c.write_version) {
+                return None; // stale / duplicate — ignore
             }
         }
+        self.confirmed = Some(Confirmed {
+            state: reserves,
+            sig,
+            slot,
+            write_version,
+        });
+        // This tx is now confirmed on-chain — it's no longer a pending
+        // prediction. Removing it lets the NEXT queued tx become the front.
+        self.queue.retain(|q| q.sig != sig);
         self.prune(now);
         self.next_compute()
     }
 
-    /// A transaction-update arrived for `sig` with `reverted`. A reverted tx
-    /// leaves the pool unchanged and will NOT produce an account-update, so we
-    /// settle it in place (step over it) and can immediately price the tx after
-    /// it on the unchanged confirmed state. A non-reverted tx-update is
-    /// informational here (its account-update drives the frontier).
+    /// A transaction-update arrived for `sig`. A reverted tx changed nothing and
+    /// produces no account-update, so drop it from the pending queue and let the
+    /// next tx be predicted on the unchanged confirmed state. A non-reverted
+    /// tx-update is informational — its account-update drives the frontier.
     pub fn on_tx_update(&mut self, sig: Signature, reverted: bool) -> Option<ComputeReq> {
-        if let Some(q) = self.queue.iter_mut().find(|q| q.sig == sig) {
-            if reverted {
-                q.reverted = true;
-                q.settled = true;
+        if reverted {
+            let before = self.queue.len();
+            self.queue.retain(|q| q.sig != sig);
+            if self.queue.len() != before {
+                return self.next_compute();
             }
         }
-        if reverted {
-            self.next_compute()
-        } else {
-            None
-        }
+        None
     }
 
-    /// The first queued tx that is not yet settled and not reverted, priced on
-    /// the confirmed frontier — if it is readable.
-    fn next_compute(&self) -> Option<ComputeReq> {
-        let pre = self.confirmed_state?;
-        let next = self
-            .queue
-            .iter()
-            .find(|q| !q.settled && !q.reverted)?;
-        match &next.kind {
+    /// Predict the FRONT pending tx (earliest we haven't confirmed) on the
+    /// confirmed reserves — exactly once. We look ONLY at the front: if it's
+    /// unreadable we wait (never skip past it), and if it's already been
+    /// predicted we wait for its account-update to confirm-and-remove it. This
+    /// preserves order and structurally prevents re-predicting the same tx.
+    fn next_compute(&mut self) -> Option<ComputeReq> {
+        let c = self.confirmed?;
+        let front = self.queue.iter_mut().find(|q| !q.reverted)?;
+        match &front.kind {
+            TxKind::Unreadable => None, // wait for its own account-update
             TxKind::Readable {
                 token_is_base,
                 legs,
-            } => Some(ComputeReq {
-                sig: next.sig,
-                slot: next.slot,
-                token_is_base: *token_is_base,
-                legs: legs.clone(),
-                pre_state: pre,
-                predecessor: self.confirmed_sig,
-            }),
-            // Unreadable: we cannot advance past it by computation — hold until
-            // its own account-update lands and moves the frontier.
-            TxKind::Unreadable => None,
+            } => {
+                if front.predicted {
+                    return None; // already priced against the frontier; wait
+                }
+                front.predicted = true;
+                Some(ComputeReq {
+                    sig: front.sig,
+                    slot: front.slot,
+                    token_is_base: *token_is_base,
+                    legs: legs.clone(),
+                    pre_state: c.state,
+                    predecessor: Some(c.sig),
+                    confirmed_slot: c.slot,
+                    confirmed_write_version: c.write_version,
+                })
+            }
         }
     }
 
     pub fn queue_len(&self) -> usize {
         self.queue.len()
-    }
-
-    pub fn confirmed_sig(&self) -> Option<Signature> {
-        self.confirmed_sig
     }
 }
 
@@ -253,11 +277,14 @@ impl Sequencer {
             .enqueue(sig, slot, kind, now);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn on_account_update(
         &self,
         pool: Pubkey,
         sig: Signature,
         reserves: PumpPool,
+        slot: u64,
+        write_version: u64,
         now: Instant,
     ) -> Option<ComputeReq> {
         self.pools
@@ -265,7 +292,7 @@ impl Sequencer {
             .or_insert_with(|| Mutex::new(PoolSeq::default()))
             .lock()
             .unwrap()
-            .on_account_update(sig, reserves, now)
+            .on_account_update(sig, reserves, slot, write_version, now)
     }
 
     /// A transaction-update whose pool we don't know up front — try every pool's
@@ -319,29 +346,64 @@ mod tests {
         let mut s = PoolSeq::default();
         s.enqueue(sig(1), 100, readable(PumpIxKind::Sell, 10, 0), now);
         s.enqueue(sig(2), 100, readable(PumpIxKind::Sell, 20, 0), now);
-        // Account-update for tx1 → its reserves are the pre-state for tx2.
+        // Account-update for tx1 (slot 100, wv 5) → tx1 removed (confirmed), and
+        // tx2 is predicted on tx1's resulting reserves.
         let req = s
-            .on_account_update(sig(1), pool(1_000, 2_000), now)
+            .on_account_update(sig(1), pool(1_000, 2_000), 100, 5, now)
             .expect("tx2 should be ready");
         assert_eq!(req.sig, sig(2));
+        assert_eq!(req.predecessor, Some(sig(1)));
         assert_eq!(req.pre_state.base_reserve, 1_000);
-        assert_eq!(req.pre_state.quote_reserve, 2_000);
+        assert_eq!(req.confirmed_write_version, 5);
     }
 
     #[test]
-    fn waits_on_unreadable_next_never_skips() {
+    fn does_not_repredict_same_tx_on_unrelated_updates() {
+        // THE regression test for the observed bug: account-updates for txs NOT
+        // in our queue must advance the frontier but must NOT re-predict the same
+        // pending tx over and over.
         let now = Instant::now();
         let mut s = PoolSeq::default();
         s.enqueue(sig(1), 100, readable(PumpIxKind::Sell, 10, 0), now);
-        s.enqueue(sig(2), 100, TxKind::Unreadable, now); // aggregator
-        s.enqueue(sig(3), 100, readable(PumpIxKind::Sell, 30, 0), now);
-        // After tx1 confirms, the next is the UNREADABLE tx2 → must wait, not
-        // jump to tx3.
-        assert!(s.on_account_update(sig(1), pool(1_000, 2_000), now).is_none());
-        // When tx2 (the aggregator) confirms with its own reserves, tx3 is now
-        // priced on tx2's resulting state.
+        // An unrelated tx (sig 99, not in queue) confirms → frontier advances,
+        // tx1 predicted once.
         let req = s
-            .on_account_update(sig(2), pool(1_100, 1_800), now)
+            .on_account_update(sig(99), pool(1_000, 2_000), 100, 5, now)
+            .expect("tx1 predicted once");
+        assert_eq!(req.sig, sig(1));
+        // More unrelated updates (newer wv) must NOT re-emit tx1.
+        assert!(s
+            .on_account_update(sig(98), pool(1_010, 1_990), 100, 6, now)
+            .is_none());
+        assert!(s
+            .on_account_update(sig(97), pool(1_020, 1_980), 100, 7, now)
+            .is_none());
+        // A STALE update (older wv) is ignored entirely.
+        assert!(s
+            .on_account_update(sig(96), pool(9, 9), 100, 4, now)
+            .is_none());
+        // Only when tx1's OWN account-update lands is it removed and the next
+        // (none here) considered.
+        assert!(s
+            .on_account_update(sig(1), pool(1_030, 1_970), 100, 8, now)
+            .is_none());
+        assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn waits_on_unreadable_front_never_skips() {
+        let now = Instant::now();
+        let mut s = PoolSeq::default();
+        s.enqueue(sig(2), 100, TxKind::Unreadable, now); // aggregator, front
+        s.enqueue(sig(3), 100, readable(PumpIxKind::Sell, 30, 0), now);
+        // Front is the UNREADABLE tx2 → wait, never jump to tx3.
+        assert!(s
+            .on_account_update(sig(99), pool(1_000, 2_000), 100, 5, now)
+            .is_none());
+        // When tx2 (aggregator) confirms it is removed → tx3 becomes front and is
+        // priced on tx2's resulting reserves.
+        let req = s
+            .on_account_update(sig(2), pool(1_100, 1_800), 100, 6, now)
             .expect("tx3 ready after aggregator confirms");
         assert_eq!(req.sig, sig(3));
         assert_eq!(req.pre_state.base_reserve, 1_100);
@@ -351,16 +413,15 @@ mod tests {
     fn reverted_tx_is_stepped_over_on_unchanged_state() {
         let now = Instant::now();
         let mut s = PoolSeq::default();
-        s.enqueue(sig(1), 100, readable(PumpIxKind::Sell, 10, 0), now);
-        s.enqueue(sig(2), 100, readable(PumpIxKind::Sell, 20, 0), now); // will revert
+        s.enqueue(sig(2), 100, readable(PumpIxKind::Sell, 20, 0), now); // reverts
         s.enqueue(sig(3), 100, readable(PumpIxKind::Sell, 30, 0), now);
-        // tx1 confirms → tx2 is the candidate.
+        // Frontier set; tx2 (front) predicted.
         let req = s
-            .on_account_update(sig(1), pool(1_000, 2_000), now)
-            .expect("tx2 ready");
+            .on_account_update(sig(99), pool(1_000, 2_000), 100, 5, now)
+            .expect("tx2 predicted");
         assert_eq!(req.sig, sig(2));
-        // tx2's transaction-update says REVERT (no account-update will come) →
-        // step over it and price tx3 on the SAME unchanged reserves.
+        // tx2 reverts (no account-update) → dropped, tx3 priced on unchanged
+        // reserves.
         let req = s.on_tx_update(sig(2), true).expect("tx3 ready after revert");
         assert_eq!(req.sig, sig(3));
         assert_eq!(req.pre_state.base_reserve, 1_000);
