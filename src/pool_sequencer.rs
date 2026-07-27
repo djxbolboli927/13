@@ -29,8 +29,11 @@
 
 use crate::pumpfun_math::PumpPool;
 use crate::shred_stream::PumpIxKind;
+use dashmap::DashMap;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How long a tx stays in the ordered queue before it's discarded (roughly a few
@@ -44,6 +47,10 @@ pub struct Leg {
     pub kind: PumpIxKind,
     pub base_amount: u64,
     pub quote_amount: u64,
+    /// The tx's own slippage bound (arg1 of the instruction): min_quote_out for
+    /// sell, max_quote_in for buy, min_base_out for the exact-quote-in / boost
+    /// sides. Drives the revert verdict.
+    pub bound: u64,
 }
 
 /// What we know about a queued tx's effect on THIS pool.
@@ -81,6 +88,9 @@ pub struct ComputeReq {
     /// The exact reserves this tx executes against (the confirmed state of its
     /// immediate predecessor).
     pub pre_state: PumpPool,
+    /// The tx whose account-update produced `pre_state` — logged so it's provable
+    /// that we compute the tx AFTER the confirmed one, on ITS reserves.
+    pub predecessor: Option<Signature>,
 }
 
 /// The ordered ledger for a single pool.
@@ -190,6 +200,7 @@ impl PoolSeq {
                 token_is_base: *token_is_base,
                 legs: legs.clone(),
                 pre_state: pre,
+                predecessor: self.confirmed_sig,
             }),
             // Unreadable: we cannot advance past it by computation — hold until
             // its own account-update lands and moves the frontier.
@@ -203,6 +214,71 @@ impl PoolSeq {
 
     pub fn confirmed_sig(&self) -> Option<Signature> {
         self.confirmed_sig
+    }
+}
+
+/// An event forwarded from the gRPC pool-state stream to drive the sequencer.
+pub enum SeqEvent {
+    /// An account-update: `account` moved to a new state, produced by `sig`.
+    Account {
+        account: Pubkey,
+        sig: Option<Signature>,
+        slot: u64,
+    },
+    /// A transaction-update: `sig` did or did not revert.
+    Tx { sig: Signature, reverted: bool },
+}
+
+/// Concurrent per-pool sequencer: one `PoolSeq` per Pump pool, each behind its
+/// own lock. Shreds enqueue; the gRPC stream drives the account/tx events.
+pub struct Sequencer {
+    pools: DashMap<Pubkey, Mutex<PoolSeq>>,
+}
+
+impl Default for Sequencer {
+    fn default() -> Self {
+        Self {
+            pools: DashMap::with_capacity(64),
+        }
+    }
+}
+
+impl Sequencer {
+    pub fn enqueue(&self, pool: Pubkey, sig: Signature, slot: u64, kind: TxKind, now: Instant) {
+        self.pools
+            .entry(pool)
+            .or_insert_with(|| Mutex::new(PoolSeq::default()))
+            .lock()
+            .unwrap()
+            .enqueue(sig, slot, kind, now);
+    }
+
+    pub fn on_account_update(
+        &self,
+        pool: Pubkey,
+        sig: Signature,
+        reserves: PumpPool,
+        now: Instant,
+    ) -> Option<ComputeReq> {
+        self.pools
+            .entry(pool)
+            .or_insert_with(|| Mutex::new(PoolSeq::default()))
+            .lock()
+            .unwrap()
+            .on_account_update(sig, reserves, now)
+    }
+
+    /// A transaction-update whose pool we don't know up front — try every pool's
+    /// queue (there are only a handful). Returns each pool that produced a new
+    /// compute request as a result (a reverted tx being stepped over).
+    pub fn on_tx_update_any(&self, sig: Signature, reverted: bool) -> Vec<(Pubkey, ComputeReq)> {
+        let mut out = Vec::new();
+        for e in self.pools.iter() {
+            if let Some(req) = e.value().lock().unwrap().on_tx_update(sig, reverted) {
+                out.push((*e.key(), req));
+            }
+        }
+        out
     }
 }
 
@@ -232,6 +308,7 @@ mod tests {
                 kind: k,
                 base_amount: base,
                 quote_amount: quote,
+                bound: 0,
             }],
         }
     }

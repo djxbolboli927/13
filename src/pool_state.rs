@@ -141,6 +141,14 @@ pub struct PoolStateCache {
     /// the reserves we price a tx on are really that tx's immediate predecessor.
     last_acct_tx:
         Arc<DashMap<Pubkey, (Option<solana_sdk::signature::Signature>, u64, u64)>>,
+    /// The ORDERED per-pool transaction sequencer. Shreds enqueue into it (via
+    /// the engine); the account-update/transaction-update handlers below drive
+    /// it, so the simulation advances strictly one confirmed tx at a time.
+    sequencer: Arc<crate::pool_sequencer::Sequencer>,
+    /// Maps each Pump token vault → (pool, wsol_vault, token_mint) so an
+    /// account-update on a vault can be turned into the pool's reserves + used to
+    /// drive the sequencer for the right pool.
+    vault_meta: Arc<DashMap<Pubkey, (Pubkey, Pubkey, Pubkey)>>,
 }
 
 fn read_u128_le(data: &[u8], off: usize) -> Option<u128> {
@@ -351,7 +359,26 @@ impl PoolStateCache {
             live_pump: Arc::new(DashMap::with_capacity(256)),
             live_meteora: Arc::new(DashMap::with_capacity(256)),
             sim_ledger: Arc::new(SimLedger::default()),
+            sequencer: Arc::new(crate::pool_sequencer::Sequencer::default()),
+            vault_meta: Arc::new(DashMap::with_capacity(64)),
         }
+    }
+
+    /// Shared handle to the ordered sequencer — the engine enqueues shred txs.
+    pub fn sequencer(&self) -> Arc<crate::pool_sequencer::Sequencer> {
+        self.sequencer.clone()
+    }
+
+    /// Register a pool's vaults so account-updates on its token vault can be
+    /// resolved to (pool, wsol_vault, mint) and drive the sequencer.
+    pub fn register_pool_vaults(
+        &self,
+        pool: Pubkey,
+        token_vault: Pubkey,
+        wsol_vault: Pubkey,
+        mint: Pubkey,
+    ) {
+        self.vault_meta.insert(token_vault, (pool, wsol_vault, mint));
     }
 
     /// Shared handle to the Phase-1 simulation ledger — the engine records its
@@ -385,15 +412,18 @@ impl PoolStateCache {
     }
 
     /// Total account updates received since start.
+    #[allow(dead_code)]
     pub fn updates(&self) -> u64 {
         self.updates.load(Ordering::Relaxed)
     }
 
     /// Number of distinct accounts currently cached.
+    #[allow(dead_code)]
     pub fn cache_size(&self) -> usize {
         self.inner.len()
     }
 
+    #[allow(dead_code)]
     pub fn has(&self, pk: &Pubkey) -> bool {
         self.inner.contains_key(pk)
     }
@@ -728,6 +758,7 @@ impl PoolStateCache {
     /// Apply an observed Meteora swap (from a shred) to the live meteora overlay.
     /// `a_to_b` is the swap direction; the caller derives it from the arb's Pump
     /// leg and the pool's token side.
+    #[allow(dead_code)]
     pub fn apply_meteora_swap(
         &self,
         pool: &Pubkey,
@@ -862,13 +893,15 @@ impl PoolStateCache {
         let sim_ledger = self.sim_ledger.clone();
         let last_tx_sig = self.last_tx_sig.clone();
         let last_acct_tx = self.last_acct_tx.clone();
+        let sequencer = self.sequencer.clone();
+        let vault_meta = self.vault_meta.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
             loop {
                 match run_stream(
                     &endpoint, &x_token, &acct_set, &change, &inner, &last_update,
                     &last_update_slot, &slot, &updates, &sim_ledger, &last_tx_sig,
-                    &last_acct_tx,
+                    &last_acct_tx, &sequencer, &vault_meta,
                 )
                 .await
                 {
@@ -919,6 +952,98 @@ fn post_token_balances(info: &SubscribeUpdateTransactionInfo) -> HashMap<Pubkey,
         }
     }
     out
+}
+
+/// Run the sequenced simulation for one compute request: price each Pump leg on
+/// the confirmed predecessor state, threading each leg's output into the next,
+/// and emit a `[seq]` line. `predecessor` is the tx whose account-update produced
+/// the pre-state — so the log proves we compute the tx AFTER it, on ITS reserves.
+/// Decode a Pump pool's reserves straight from the cached account bytes (used
+/// inside the stream task, which has no `&self`). Base = token vault amount,
+/// quote = WSOL vault amount, supply from the mint, canonical iff the pool's
+/// coin_creator @211 is set.
+fn build_pump_pool_from_cache(
+    cache: &DashMap<Pubkey, Vec<u8>>,
+    pool: &Pubkey,
+    token_vault: &Pubkey,
+    wsol_vault: &Pubkey,
+    mint: &Pubkey,
+) -> Option<PumpPool> {
+    let base = cache
+        .get(token_vault)
+        .and_then(|e| read_u64_le(e.value(), SPL_AMOUNT_OFFSET))?;
+    let quote = cache
+        .get(wsol_vault)
+        .and_then(|e| read_u64_le(e.value(), SPL_AMOUNT_OFFSET))?;
+    let supply = cache
+        .get(mint)
+        .and_then(|e| read_u64_le(e.value(), 36))
+        .unwrap_or(0) as u128;
+    let is_canonical = cache
+        .get(pool)
+        .and_then(|e| e.value().get(211..243).map(|s| s != [0u8; 32]))
+        .unwrap_or(true);
+    Some(PumpPool::new(base, quote, supply, is_canonical))
+}
+
+fn run_sequenced_sim(pool: Pubkey, req: crate::pool_sequencer::ComputeReq) {
+    use crate::shred_stream::PumpIxKind as K;
+    let predecessor = req.predecessor;
+    let mut state = req.pre_state;
+    for leg in &req.legs {
+        let raw = if req.token_is_base {
+            state
+        } else {
+            state.flipped()
+        };
+        let (label, out, revert) = match leg.kind {
+            K::Sell => {
+                let o = raw.sim_sell_quote_out(leg.base_amount);
+                ("sell", o, o < leg.bound)
+            }
+            K::Buy => {
+                let q = raw.sim_buy_quote_in(leg.base_amount);
+                ("buy", q, q > leg.bound)
+            }
+            K::BuyQuoteIn => {
+                let o = raw.sim_buy_quote_in_base_out(leg.quote_amount);
+                ("buy_exact_quote_in", o, o < leg.bound)
+            }
+            K::BoostBuyBurn => {
+                let o = raw.sim_boost_base_out(leg.quote_amount);
+                ("boost", o, o < leg.bound)
+            }
+            K::Opaque => continue,
+        };
+        info!(
+            target: "seq",
+            sig = %req.sig,
+            pool = %pool,
+            slot = req.slot,
+            kind = label,
+            out,
+            bound = leg.bound,
+            verdict = if revert { "REVERT" } else { "OK" },
+            pre_base = state.base_reserve,
+            pre_quote = state.quote_reserve,
+            predecessor = %predecessor.map(|s| s.to_string()).unwrap_or_else(|| "genesis".into()),
+            "seq"
+        );
+        crate::errlog::log(
+            "seq",
+            &format!(
+                "sig={} pool={pool} slot={} kind={label} out={out} bound={} verdict={} \
+                 pre[base={} quote={}] predecessor={}",
+                req.sig, req.slot, leg.bound,
+                if revert { "REVERT" } else { "OK" },
+                state.base_reserve, state.quote_reserve,
+                predecessor.map(|s| s.to_string()).unwrap_or_else(|| "genesis".into()),
+            ),
+        );
+        if !revert {
+            state = state.after_observed(req.token_is_base, leg.kind, leg.base_amount, leg.quote_amount);
+        }
+    }
 }
 
 fn build_request(accounts: &[Pubkey]) -> SubscribeRequest {
@@ -972,6 +1097,8 @@ async fn run_stream(
     last_acct_tx: &Arc<
         DashMap<Pubkey, (Option<solana_sdk::signature::Signature>, u64, u64)>,
     >,
+    sequencer: &Arc<crate::pool_sequencer::Sequencer>,
+    vault_meta: &Arc<DashMap<Pubkey, (Pubkey, Pubkey, Pubkey)>>,
 ) -> Result<()> {
     let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
         .x_token(Some(x_token.to_string()))?
@@ -1026,6 +1153,27 @@ async fn run_stream(
                         last_update.insert(pk, std::time::Instant::now());
                         last_update_slot.insert(pk, a.slot);
                         updates.fetch_add(1, Ordering::Relaxed);
+                        // Drive the ordered sequencer: if this account-update is
+                        // on a Pump token vault we know, its txn_signature is the
+                        // confirmed frontier — adopt its reserves and simulate the
+                        // NEXT queued tx (the one AFTER it) on exactly that state.
+                        if let (Some(sig), Some(meta)) =
+                            (acct_sig, vault_meta.get(&pk).map(|m| *m.value()))
+                        {
+                            let (pool, wsol_vault, mint) = meta;
+                            if let Some(reserves) =
+                                build_pump_pool_from_cache(&cache, &pool, &pk, &wsol_vault, &mint)
+                            {
+                                if let Some(req) = sequencer.on_account_update(
+                                    pool,
+                                    sig,
+                                    reserves,
+                                    std::time::Instant::now(),
+                                ) {
+                                    run_sequenced_sim(pool, req);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1054,6 +1202,12 @@ async fn run_stream(
                                 last_tx_sig.insert(*acct, (sig, t.slot));
                             }
                             sim_ledger.reconcile(&sig, t.slot, real_revert, &balances);
+                            // Drive the sequencer: a reverted tx changed nothing,
+                            // so step over it and simulate the next queued tx on
+                            // the unchanged confirmed state.
+                            for (pool, req) in sequencer.on_tx_update_any(sig, real_revert) {
+                                run_sequenced_sim(pool, req);
+                            }
                         }
                     }
                 }
