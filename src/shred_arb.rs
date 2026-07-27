@@ -185,9 +185,6 @@ pub struct ShredArbEngine {
     /// Phase-1 diagnostic ledger (shared with the pool-state gRPC task, which
     /// reconciles our verdicts against the transaction-update stream).
     sim_ledger: Arc<crate::sim_ledger::SimLedger>,
-    /// Ordered per-pool sequencer (shared with the pool-state gRPC task, which
-    /// drives it from account/transaction updates). The shred path enqueues.
-    sequencer: Arc<crate::pool_sequencer::Sequencer>,
     /// Keyed by Pump.fun pool pubkey (what the signal carries). Each entry holds
     /// EVERY pair for that Pump pool — one per Meteora counter-pool, since a
     /// token can grow additional Meteora pools over time. Shared, mutable
@@ -413,7 +410,6 @@ impl ShredArbEngine {
             jito_grpc_limiter,
             user_pubkey,
             sim_ledger: pool_state.sim_ledger(),
-            sequencer: pool_state.sequencer(),
             pool_state,
             registry,
             params,
@@ -504,55 +500,14 @@ impl ShredArbEngine {
             // 2-3% wrong output while still logging verdict=OK.
             let mut work: std::collections::HashMap<solana_sdk::pubkey::Pubkey, PumpPool> =
                 std::collections::HashMap::new();
-            // Accumulate one enqueue entry per transaction (grouping its legs in
-            // order) for the ordered sequencer, keyed by signature.
-            let now = std::time::Instant::now();
-            let mut enq: std::collections::HashMap<
-                solana_sdk::signature::Signature,
-                (solana_sdk::pubkey::Pubkey, u64, Option<bool>, Vec<crate::pool_sequencer::Leg>),
-            > = std::collections::HashMap::new();
             for s in batch {
                 if newest.saturating_sub(s.slot) > STALE_SIGNAL_SLOTS {
                     self.skip_stale_signal.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                // Feed the sequencer: register the pool's vaults (idempotent, so
-                // account-updates on them can drive the pool) and record this
-                // tx's leg(s) in arrival order. An opaque tx stays Unreadable.
-                if let Some(pairs) = self.registry.get(&s.pool) {
-                    if let Some(first) = pairs.first() {
-                        self.pool_state.register_pool_vaults(
-                            s.pool,
-                            first.pump.token_vault(),
-                            first.pump.wsol_vault(),
-                            first.token_mint,
-                        );
-                        let e = enq
-                            .entry(s.sig)
-                            .or_insert((s.pool, s.slot, None, Vec::new()));
-                        if s.kind != crate::shred_stream::PumpIxKind::Opaque {
-                            e.2 = Some(first.pump.token_is_a);
-                            e.3.push(crate::pool_sequencer::Leg {
-                                kind: s.kind,
-                                base_amount: s.base_amount,
-                                quote_amount: s.quote_amount,
-                                bound: s.pump_slippage,
-                            });
-                        }
-                    }
-                }
                 if let Some(out) = self.apply_signal(&s, &mut work) {
                     to_assess.insert(s.pool, out);
                 }
-            }
-            for (sig, (pool, slot, tib, legs)) in enq {
-                let kind = match tib {
-                    Some(token_is_base) if !legs.is_empty() => {
-                        crate::pool_sequencer::TxKind::Readable { token_is_base, legs }
-                    }
-                    _ => crate::pool_sequencer::TxKind::Unreadable,
-                };
-                self.sequencer.enqueue(pool, sig, slot, kind, now);
             }
             for (_, (pairs, pump_after)) in to_assess {
                 for pair in pairs {
