@@ -31,7 +31,28 @@
 //! on a watched pool is treated as `Unreadable`: we recognise it (via the pool in
 //! the flattened account keys) and wait for the pool's account-update.
 //!
-//! For reference, the route_plan `Swap` enum variants for our venues (stable):
+//! ─── Observed on-chain (real txs, 2026) — the CURRENT shapes ───────────────
+//! Newer than the historical IDL snapshot; the top-level route DATA is in the
+//! shred and IS decodable (the per-hop Pump/Meteora `.sell`/`.buy` shown in an
+//! explorer are INNER CPIs, i.e. tx meta, NOT in the shred):
+//!
+//!   route (single hop, ANSEMOTHY sell):
+//!     route_plan = [{ swap: PumpSwapSellV3, percent: 100, in_idx: 0, out_idx: 1 }]
+//!     in_amount = 95458148935, quoted_out_amount = 6482955, slippage_bps = 100
+//!
+//!   route_v2 (circular arb WSOL→HOOD→WSOL):
+//!     route_plan = [{ swap: PumpSwapSellV3,                    bps: 10000, 0→1 },
+//!                   { swap: MeteoraDammV2WithRemainingAccounts, bps: 10000, 1→0 }]
+//!     in_amount = 705385, quoted_out_amount = 728774, slippage_bps = 0
+//!   RoutePlanStepV2 uses `bps: u16` where RoutePlanStep uses `percent: u8`.
+//!
+//! To simulate our pool's leg we need its DIRECTION (buy vs sell) and input
+//! amount: for a single-hop 100% PumpSwapSell*, base_amount_in = in_amount. The
+//! Swap-enum variant INDEX (needed to read direction from bytes) is being pinned
+//! from the current IDL before we byte-parse route_plan — a wrong index would
+//! reintroduce phantom amounts, so until pinned these are enqueued Unreadable.
+//!
+//! Historical (older IDL) variant indices, kept for reference only:
 //!   PumpdotfunAmmBuy = 72, PumpdotfunAmmSell = 73, MeteoraDammV2 = 77.
 
 /// Jupiter v6 aggregator program.

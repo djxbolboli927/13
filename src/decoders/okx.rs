@@ -10,6 +10,20 @@
 //!
 //! Note: OKX also ships a separate V1 router repo; if unmatched OKX-shaped txns
 //! appear, capture and add that program id here.
+//!
+//! ─── Observed on-chain (real tx, 2026): `swap_tob` ─────────────────────────
+//! Unlike Jupiter, OKX puts the scalar amounts BEFORE the variable-length routes
+//! vec, so amount_in / expect_amount_out / slippage sit at FIXED offsets and are
+//! readable from the shred without parsing the vec:
+//!   SwapArgs { order_id u64@8, amount_in u64@16, expect_amount_out u64@24,
+//!              slippage u16@32, routes: Vec<Route>@34, … }
+//!   trailing: commission_info u32, platform_fee_rate u16, trim_rate u8.
+//!   Route { dex: Dex(enum), weight: u16, index: u8 }  — weight is a per-leg
+//!   split in basis points (e.g. 10000 = 100%).
+//! Real example: amount_in=5390846552666, expect_amount_out=4270594256,
+//!   slippage=1140, routes=[PumpfunammSell2 w10000, PumpfunammBuy w9000,
+//!   MeteoraDAMMV2Swap2 w1000]. The Dex enum indices (for direction) are being
+//!   pinned from the current IDL before byte-parsing the routes vec.
 
 /// OKX DEX Aggregation Router V2.
 pub const PROGRAM: &str = "6m2CDdhRgxpH4WjvdzxAYbGxwdGUz5MziiL5jek2kBma";
