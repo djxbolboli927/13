@@ -1018,6 +1018,8 @@ pub fn run_sequenced_sim(pool: Pubkey, req: crate::pool_sequencer::ComputeReq) {
             pool = %pool,
             slot = req.slot,
             order_seq,
+            pool_seq = req.pool_seq,
+            queue = %req.label,
             kind = label,
             out,
             bound = leg.bound,
@@ -1030,9 +1032,9 @@ pub fn run_sequenced_sim(pool: Pubkey, req: crate::pool_sequencer::ComputeReq) {
         crate::errlog::log(
             "seq",
             &format!(
-                "sig={} pool={pool} slot={} order_seq={order_seq} kind={label} out={out} \
+                "sig={} pool={pool} slot={} order_seq={order_seq} pool_seq={} queue={} kind={label} out={out} \
                  bound={} verdict={} pre[base={} quote={}] predecessor={}",
-                req.sig, req.slot, leg.bound,
+                req.sig, req.slot, req.pool_seq, req.label, leg.bound,
                 if revert { "REVERT" } else { "OK" },
                 state.base_reserve, state.quote_reserve, predecessor,
             ),
