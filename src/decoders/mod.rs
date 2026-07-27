@@ -36,6 +36,7 @@ pub mod jupiter;
 pub mod meteora_damm_v2;
 pub mod okx;
 pub mod pump_amm;
+pub mod route_decode;
 
 use solana_sdk::pubkey::Pubkey;
 

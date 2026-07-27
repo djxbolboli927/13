@@ -218,6 +218,11 @@ pub struct ShredConsumer {
     /// even when the Pump program itself is ALT-hidden, so router swaps on a
     /// watched pool are resolved and enqueued instead of being dropped.
     router_programs: HashSet<Pubkey>,
+    /// ALT keys known to CONTAIN a watched pool. A private-bot tx (no known
+    /// program in its static keys) that references one of these tables is almost
+    /// certainly touching our pool, so we let it through the pre-filter, resolve
+    /// its accounts, and enqueue it — cheaply, without resolving every cluster tx.
+    pool_alts: std::sync::RwLock<HashSet<Pubkey>>,
     pub metrics: Arc<ShredMetrics>,
 }
 
@@ -232,6 +237,13 @@ impl ShredConsumer {
         metrics
             .watched_pools
             .store(target_pools.len() as u64, Ordering::Relaxed);
+        // Seed the pool-ALT set from any pre-supplied tables that already hold a
+        // watched pool, so private-bot detection works from the first shred.
+        let pool_alts: HashSet<Pubkey> = alt_map
+            .iter()
+            .filter(|(_, members)| members.iter().any(|m| target_pools.contains(m)))
+            .map(|(alt, _)| *alt)
+            .collect();
         Self {
             endpoint,
             target_pools: std::sync::RwLock::new(target_pools),
@@ -245,7 +257,20 @@ impl ShredConsumer {
             order_seq: AtomicU64::new(0),
             block_log: std::sync::Mutex::new(BlockTracker::default()),
             router_programs: crate::decoders::known_router_pubkeys().into_iter().collect(),
+            pool_alts: std::sync::RwLock::new(pool_alts),
             metrics,
+        }
+    }
+
+    /// Record that `alt` contains a watched pool, if it does — so private-bot txs
+    /// referencing this table pass the pre-filter. Called wherever we learn an ALT.
+    fn note_alt_members(&self, alt: Pubkey, members: &[Pubkey]) {
+        let touches = {
+            let targets = self.target_pools.read().unwrap();
+            members.iter().any(|m| targets.contains(m))
+        };
+        if touches {
+            self.pool_alts.write().unwrap().insert(alt);
         }
     }
 
@@ -300,6 +325,7 @@ impl ShredConsumer {
                             if let Ok(addrs) =
                                 crate::transaction::deserialize_alt_addresses(&acct.data)
                             {
+                                me.note_alt_members(alt, &addrs);
                                 me.alt_map.write().unwrap().insert(alt, addrs);
                                 added += 1;
                             }
@@ -330,6 +356,7 @@ impl ShredConsumer {
                 .store(set.len() as u64, Ordering::Relaxed);
         }
         if let Some((alt_key, addrs)) = alt {
+            self.note_alt_members(alt_key, &addrs);
             self.alt_map.write().unwrap().insert(alt_key, addrs);
         }
     }
@@ -412,7 +439,18 @@ impl ShredConsumer {
         let touches_known_program = static_keys.iter().any(|k| {
             *k == self.pumpfun || *k == self.meteora || self.router_programs.contains(k)
         });
-        if !touches_known_program {
+        // Cheap private-bot catch: does this tx reference an ALT we know holds a
+        // watched pool? (Set lookup per ALT key — no full resolution.)
+        let uses_pool_alt = || {
+            let palts = self.pool_alts.read().unwrap();
+            if palts.is_empty() {
+                return false;
+            }
+            msg.address_table_lookups()
+                .map(|ls| ls.iter().any(|l| palts.contains(&l.account_key)))
+                .unwrap_or(false)
+        };
+        if !touches_known_program && !uses_pool_alt() {
             return;
         }
         self.metrics.pump_txns.fetch_add(1, Ordering::Relaxed);
@@ -554,6 +592,77 @@ impl ShredConsumer {
                     Ok(()) => self.metrics.signals_sent.fetch_add(1, Ordering::Relaxed),
                     Err(_) => self.metrics.signals_dropped.fetch_add(1, Ordering::Relaxed),
                 };
+            }
+        }
+
+        // ── Aggregator path: a KNOWN router whose first hop is a Pump SELL we
+        // can PRICE from the shred (Jupiter route/route_v2, OKX swap). The route
+        // input equals the first hop's base_amount_in, so this becomes a normal
+        // Readable Sell signal instead of an Unreadable wait. Only the clean,
+        // single-Pump-pool shapes decode (see route_decode) — anything ambiguous
+        // returns None and falls through to the opaque path below. ────────────
+        {
+            let mut first_hop = None;
+            for ix in msg.instructions() {
+                let program = match full_keys.get(ix.program_id_index as usize) {
+                    Some(p) => *p,
+                    None => continue,
+                };
+                if self.router_programs.contains(&program) {
+                    if let Some(h) = crate::decoders::route_decode::decode_first_hop(&ix.data) {
+                        first_hop = Some(h);
+                        break;
+                    }
+                }
+            }
+            if let Some(hop) = first_hop {
+                // target_pools holds only Pump pools, and the decoded first hop is
+                // a Pump sell, so a single watched pool present IS that sell pool.
+                let pool = {
+                    let targets = self.target_pools.read().unwrap();
+                    let mut found: Vec<Pubkey> = full_keys
+                        .iter()
+                        .copied()
+                        .filter(|k| {
+                            *k != Pubkey::default()
+                                && targets.contains(k)
+                                && !decoded_pools.contains(k)
+                        })
+                        .collect();
+                    found.dedup();
+                    if found.len() == 1 {
+                        Some(found[0])
+                    } else {
+                        None // 0 or ambiguous → let the opaque path handle it
+                    }
+                };
+                if let Some(pool) = pool {
+                    decoded_pools.push(pool);
+                    self.metrics.matched.fetch_add(1, Ordering::Relaxed);
+                    self.block_log.lock().unwrap().record(slot, order_seq, tx_sig);
+                    let signal = PumpSwapSignal {
+                        pool,
+                        kind: PumpIxKind::Sell,
+                        base_amount: hop.base_amount_in,
+                        quote_amount: 0,
+                        // Router enforces slippage at the route level, not per leg
+                        // (the inner CPI uses min_out=0), so no per-leg revert bound.
+                        pump_slippage: 0,
+                        hops: 1,
+                        fee_payer,
+                        sig: tx_sig,
+                        slot,
+                        meteora_pool: None,
+                        meteora_amount_in: None,
+                        meteora_min_out: None,
+                        meteora_exact_out: false,
+                        order_seq,
+                    };
+                    match tx.try_send(signal) {
+                        Ok(()) => self.metrics.signals_sent.fetch_add(1, Ordering::Relaxed),
+                        Err(_) => self.metrics.signals_dropped.fetch_add(1, Ordering::Relaxed),
+                    };
+                }
             }
         }
 
