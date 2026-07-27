@@ -989,8 +989,6 @@ fn build_pump_pool_from_cache(
 fn run_sequenced_sim(pool: Pubkey, req: crate::pool_sequencer::ComputeReq) {
     use crate::shred_stream::PumpIxKind as K;
     let predecessor = req.predecessor;
-    let confirmed_slot = req.confirmed_slot;
-    let confirmed_wv = req.confirmed_write_version;
     let mut state = req.pre_state;
     for leg in &req.legs {
         let raw = if req.token_is_base {
@@ -1029,20 +1027,17 @@ fn run_sequenced_sim(pool: Pubkey, req: crate::pool_sequencer::ComputeReq) {
             pre_base = state.base_reserve,
             pre_quote = state.quote_reserve,
             predecessor = %predecessor.map(|s| s.to_string()).unwrap_or_else(|| "genesis".into()),
-            confirmed_slot,
-            confirmed_wv,
             "seq"
         );
         crate::errlog::log(
             "seq",
             &format!(
                 "sig={} pool={pool} slot={} kind={label} out={out} bound={} verdict={} \
-                 pre[base={} quote={}] predecessor={} confirmed[slot={} wv={}]",
+                 pre[base={} quote={}] predecessor={}",
                 req.sig, req.slot, leg.bound,
                 if revert { "REVERT" } else { "OK" },
                 state.base_reserve, state.quote_reserve,
                 predecessor.map(|s| s.to_string()).unwrap_or_else(|| "genesis".into()),
-                confirmed_slot, confirmed_wv,
             ),
         );
         if !revert {
@@ -1173,8 +1168,6 @@ async fn run_stream(
                                     pool,
                                     sig,
                                     reserves,
-                                    a.slot,
-                                    info.write_version,
                                     std::time::Instant::now(),
                                 ) {
                                     run_sequenced_sim(pool, req);
