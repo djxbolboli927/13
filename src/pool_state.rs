@@ -411,15 +411,18 @@ impl PoolStateCache {
     }
 
     /// Total account updates received since start.
+    #[allow(dead_code)]
     pub fn updates(&self) -> u64 {
         self.updates.load(Ordering::Relaxed)
     }
 
     /// Number of distinct accounts currently cached.
+    #[allow(dead_code)]
     pub fn cache_size(&self) -> usize {
         self.inner.len()
     }
 
+    #[allow(dead_code)]
     pub fn has(&self, pk: &Pubkey) -> bool {
         self.inner.contains_key(pk)
     }
@@ -754,6 +757,7 @@ impl PoolStateCache {
     /// Apply an observed Meteora swap (from a shred) to the live meteora overlay.
     /// `a_to_b` is the swap direction; the caller derives it from the arb's Pump
     /// leg and the pool's token side.
+    #[allow(dead_code)]
     pub fn apply_meteora_swap(
         &self,
         pool: &Pubkey,
@@ -978,7 +982,7 @@ fn build_pump_pool_from_cache(
 /// Simulate one sequencer compute request — the tx AFTER a confirmed hash,
 /// priced on that hash's resulting reserves — and emit a `[seq]` line proving
 /// the order: predecessor= is the confirmed tx H, sig= is its successor.
-fn run_sequenced_sim(pool: Pubkey, req: crate::pool_sequencer::ComputeReq) {
+pub fn run_sequenced_sim(pool: Pubkey, req: crate::pool_sequencer::ComputeReq) {
     use crate::shred_stream::PumpIxKind as K;
     let predecessor = req.predecessor;
     let order_seq = req.order_seq;

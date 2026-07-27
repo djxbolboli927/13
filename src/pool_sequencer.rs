@@ -86,8 +86,13 @@ pub struct PoolSeq {
     /// The latest confirmed reserves (from the last account-update we matched to
     /// a queued tx). `None` until the first match.
     reserves: Option<PumpPool>,
-    /// The `(slot, order_seq)` position of the successor we last emitted, so a
-    /// repeated update for the same H does not re-emit the same successor.
+    /// The CONFIRMED FRONTIER: `(slot, order_seq, sig)` of the last confirmed tx
+    /// H. The tx we want to simulate is the first one strictly after this. Set by
+    /// an account-update (H succeeded, `reserves` are H's result) or a revert
+    /// (H changed nothing, `reserves` unchanged). Only advances forward.
+    confirmed: Option<(u64, u64, Signature)>,
+    /// The `(slot, order_seq)` of the successor we last emitted, so we price each
+    /// successor exactly once no matter how many events poke us.
     last_emitted: Option<(u64, u64)>,
 }
 
@@ -96,6 +101,7 @@ impl Default for PoolSeq {
         Self {
             queue: Vec::with_capacity(64),
             reserves: None,
+            confirmed: None,
             last_emitted: None,
         }
     }
@@ -103,7 +109,10 @@ impl Default for PoolSeq {
 
 impl PoolSeq {
     /// Record a tx from the shred stream at its PoH `order_seq`. Kept sorted by
-    /// `(slot, order_seq)`; deduped by signature; pruned by age.
+    /// `(slot, order_seq)`; deduped by signature; pruned by age. Returns a
+    /// compute request if this newly-arrived tx is the awaited successor of the
+    /// confirmed frontier — the shred can arrive AFTER the predecessor's update,
+    /// so enqueue must also be able to trigger the simulation.
     pub fn enqueue(
         &mut self,
         sig: Signature,
@@ -111,9 +120,10 @@ impl PoolSeq {
         order_seq: u64,
         kind: TxKind,
         now: Instant,
-    ) {
+    ) -> Option<ComputeReq> {
+        self.prune(now);
         if self.queue.iter().any(|q| q.sig == sig) {
-            return;
+            return None;
         }
         let item = QueuedTx {
             sig,
@@ -123,21 +133,20 @@ impl PoolSeq {
             seen: now,
             reverted: false,
         };
-        // Insert keeping the vector sorted by (slot, order_seq).
         let pos = self
             .queue
             .partition_point(|q| (q.slot, q.order_seq) < (slot, order_seq));
         self.queue.insert(pos, item);
-        self.prune(now);
+        self.emit_next()
     }
 
     fn prune(&mut self, now: Instant) {
-        self.queue
-            .retain(|q| now.duration_since(q.seen) <= MAX_AGE);
+        self.queue.retain(|q| now.duration_since(q.seen) <= MAX_AGE);
     }
 
-    /// An account-update arrived for `sig` with resulting `reserves`. Match H in
-    /// the ordered list and simulate the tx AFTER it on these reserves.
+    /// An account-update arrived for `sig` (H) with its resulting `reserves`.
+    /// Advance the confirmed frontier to H (if newer), adopt H's reserves, and
+    /// simulate the tx AFTER H.
     pub fn on_account_update(
         &mut self,
         sig: Signature,
@@ -146,40 +155,53 @@ impl PoolSeq {
     ) -> Option<ComputeReq> {
         self.prune(now);
         let pos = self.position_of(&sig)?; // H not in our ordered list → no-op
-        self.reserves = Some(reserves);
-        self.emit_after(pos)
+        if self.advance_confirmed(pos) {
+            self.reserves = Some(reserves);
+        }
+        self.emit_next()
     }
 
-    /// A transaction-update arrived for `sig`. If it reverted, it changed nothing
-    /// (no account-update will come): mark it reverted and price its successor on
-    /// the UNCHANGED reserves. A non-reverted tx-update is redundant with its
-    /// account-update; we still advance to its successor if reserves are known.
+    /// A transaction-update arrived for `sig`. A reverted tx changed nothing (no
+    /// account-update will come): advance the frontier past it and price the
+    /// successor on the UNCHANGED reserves. A non-reverted tx-update is redundant
+    /// with its account-update — leave the reserves to that.
     pub fn on_tx_update(&mut self, sig: Signature, reverted: bool, now: Instant) -> Option<ComputeReq> {
         self.prune(now);
         let pos = self.position_of(&sig)?;
         if reverted {
             self.queue[pos].reverted = true;
+            self.advance_confirmed(pos);
         }
-        self.emit_after(pos)
+        self.emit_next()
     }
 
     fn position_of(&self, sig: &Signature) -> Option<usize> {
         self.queue.iter().position(|q| q.sig == *sig)
     }
 
-    /// Simulate the first non-reverted tx strictly after `pos` in block order, on
-    /// the confirmed reserves — exactly once. If that successor is unreadable we
-    /// return `None` (wait for its own update, never skip). If we've already
-    /// emitted this exact successor position, return `None`.
-    fn emit_after(&mut self, pos: usize) -> Option<ComputeReq> {
+    /// Move the confirmed frontier to `pos` if it is strictly newer. Returns true
+    /// if it advanced (so the caller may adopt this tx's reserves).
+    fn advance_confirmed(&mut self, pos: usize) -> bool {
+        let key = (self.queue[pos].slot, self.queue[pos].order_seq);
+        let newer = match self.confirmed {
+            Some((s, o, _)) => key > (s, o),
+            None => true,
+        };
+        if newer {
+            self.confirmed = Some((key.0, key.1, self.queue[pos].sig));
+        }
+        newer
+    }
+
+    /// Simulate the first non-reverted tx strictly after the confirmed frontier,
+    /// on the confirmed reserves — exactly once. Unreadable successor → wait.
+    fn emit_next(&mut self) -> Option<ComputeReq> {
         let pre = self.reserves?;
-        let after_key = (self.queue[pos].slot, self.queue[pos].order_seq);
-        let predecessor = self.queue[pos].sig;
-        // First queued tx strictly after H's position that isn't reverted.
+        let (cslot, cseq, csig) = self.confirmed?;
         let next = self
             .queue
             .iter()
-            .find(|q| (q.slot, q.order_seq) > after_key && !q.reverted)?;
+            .find(|q| (q.slot, q.order_seq) > (cslot, cseq) && !q.reverted)?;
         let next_key = (next.slot, next.order_seq);
         match &next.kind {
             TxKind::Unreadable => None, // wait for its own update
@@ -195,7 +217,7 @@ impl PoolSeq {
                     token_is_base: *token_is_base,
                     legs: legs.clone(),
                     pre_state: pre,
-                    predecessor,
+                    predecessor: csig,
                 })
             }
         }
@@ -233,6 +255,7 @@ impl Default for Sequencer {
 }
 
 impl Sequencer {
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue(
         &self,
         pool: Pubkey,
@@ -241,13 +264,13 @@ impl Sequencer {
         order_seq: u64,
         kind: TxKind,
         now: Instant,
-    ) {
+    ) -> Option<ComputeReq> {
         self.pools
             .entry(pool)
             .or_insert_with(|| Mutex::new(PoolSeq::default()))
             .lock()
             .unwrap()
-            .enqueue(sig, slot, order_seq, kind, now);
+            .enqueue(sig, slot, order_seq, kind, now)
     }
 
     pub fn on_account_update(
@@ -402,5 +425,23 @@ mod tests {
         let mut s = PoolSeq::default();
         s.enqueue(sig(1), 100, 1, readable(PumpIxKind::Sell), now);
         assert!(s.on_account_update(sig(99), pool(10, 20), now).is_none());
+    }
+
+    // The successor can be enqueued AFTER its predecessor's update arrives — the
+    // shred may lag. Enqueue must then trigger the simulation.
+    #[test]
+    fn enqueue_after_update_triggers_successor() {
+        let now = Instant::now();
+        let mut s = PoolSeq::default();
+        // Only H is known; its update arrives → no successor yet.
+        s.enqueue(sig(1), 100, 1, readable(PumpIxKind::Sell), now);
+        assert!(s.on_account_update(sig(1), pool(10, 20), now).is_none());
+        // The successor's shred arrives late → enqueue must emit it now.
+        let req = s
+            .enqueue(sig(2), 100, 2, readable(PumpIxKind::Sell), now)
+            .expect("successor simulated on enqueue");
+        assert_eq!(req.sig, sig(2));
+        assert_eq!(req.predecessor, sig(1));
+        assert_eq!(req.pre_state.base_reserve, 10);
     }
 }

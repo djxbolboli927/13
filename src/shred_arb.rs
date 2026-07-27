@@ -551,7 +551,11 @@ impl ShredArbEngine {
                     }
                     _ => crate::pool_sequencer::TxKind::Unreadable,
                 };
-                self.sequencer.enqueue(pool, sig, slot, order_seq, kind, now);
+                // enqueue can immediately return the successor to simulate if the
+                // predecessor's update already landed (shred lag).
+                if let Some(req) = self.sequencer.enqueue(pool, sig, slot, order_seq, kind, now) {
+                    crate::pool_state::run_sequenced_sim(pool, req);
+                }
             }
             for (_, (pairs, pump_after)) in to_assess {
                 for pair in pairs {
