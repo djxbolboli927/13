@@ -30,6 +30,7 @@ mod pool_manager;
 #[allow(dead_code)]
 mod pool_registry;
 #[allow(dead_code)]
+mod pool_sequencer;
 mod pool_state;
 mod program_registry;
 #[allow(dead_code)]
