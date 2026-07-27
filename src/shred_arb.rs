@@ -511,7 +511,14 @@ impl ShredArbEngine {
             let now = std::time::Instant::now();
             let mut enq: std::collections::HashMap<
                 solana_sdk::signature::Signature,
-                (solana_sdk::pubkey::Pubkey, u64, u64, Option<bool>, Vec<crate::pool_sequencer::Leg>),
+                (
+                    solana_sdk::pubkey::Pubkey,
+                    u64,
+                    u64,
+                    Option<bool>,
+                    Vec<crate::pool_sequencer::Leg>,
+                    Option<solana_sdk::pubkey::Pubkey>, // meteora pool (multi-hop)
+                ),
             > = std::collections::HashMap::new();
             for s in batch {
                 if let Some(pairs) = self.registry.get(&s.pool) {
@@ -524,7 +531,7 @@ impl ShredArbEngine {
                         );
                         let e = enq
                             .entry(s.sig)
-                            .or_insert((s.pool, s.slot, s.order_seq, None, Vec::new()));
+                            .or_insert((s.pool, s.slot, s.order_seq, None, Vec::new(), None));
                         if s.kind != crate::shred_stream::PumpIxKind::Opaque {
                             e.3 = Some(first.pump.token_is_a);
                             e.4.push(crate::pool_sequencer::Leg {
@@ -533,6 +540,12 @@ impl ShredArbEngine {
                                 quote_amount: s.quote_amount,
                                 bound: s.pump_slippage,
                             });
+                            // Remember the Meteora pool this tx also hits, for the
+                            // per-pool queue label (and the future cross-pool
+                            // barrier). NOT wired to a barrier in this test phase.
+                            if e.5.is_none() {
+                                e.5 = s.meteora_pool;
+                            }
                         }
                     }
                 }
@@ -544,16 +557,24 @@ impl ShredArbEngine {
                     to_assess.insert(s.pool, out);
                 }
             }
-            for (sig, (pool, slot, order_seq, tib, legs)) in enq {
+            for (sig, (pool, slot, order_seq, tib, legs, meteora_pool)) in enq {
                 let kind = match tib {
                     Some(token_is_base) if !legs.is_empty() => {
                         crate::pool_sequencer::TxKind::Readable { token_is_base, legs }
                     }
                     _ => crate::pool_sequencer::TxKind::Unreadable,
                 };
+                // Multi-hop label info: our detected leg is the PUMP leg (leg 1 in
+                // a Pump→Meteora arb, the common shape we see). If the tx also hit
+                // a watched Meteora pool, record it so the label shows both hops.
+                let multi = meteora_pool.map(|other_pool| crate::pool_sequencer::MultiHop {
+                    other_pool,
+                    other_dex: "Meteora_DAMM_v2",
+                    on_this_pool_leg: 1,
+                });
                 // enqueue can immediately return the successor to simulate if the
                 // predecessor's update already landed (shred lag).
-                if let Some(req) = self.sequencer.enqueue(pool, sig, slot, order_seq, kind, now) {
+                if let Some(req) = self.sequencer.enqueue(pool, sig, slot, order_seq, kind, multi, now) {
                     crate::pool_state::run_sequenced_sim(pool, req);
                 }
             }
