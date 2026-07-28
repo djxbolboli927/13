@@ -16,10 +16,22 @@
 //! variants) returns `None` and the caller falls back to `Unreadable` (wait for
 //! the account-update) — never a guessed amount.
 
-/// Jupiter v6 `route` discriminator.
+/// Jupiter v6 `route` discriminator. args: route_plan Vec, in_amount u64, … .
 const JUP_ROUTE: [u8; 8] = [229, 23, 203, 151, 122, 227, 173, 42];
 /// Jupiter v6 `route_v2` discriminator (route_plan is the LAST field here).
 const JUP_ROUTE_V2: [u8; 8] = [187, 100, 250, 204, 49, 196, 175, 20];
+/// `shared_accounts_route` — the most common form today. args: id u8, route_plan
+/// Vec, in_amount u64, quoted_out u64, slippage u16, platform_fee u8. Same as
+/// `route` but with a 1-byte `id` prefix, so route_plan starts at offset 9.
+const JUP_SHARED_ROUTE: [u8; 8] = [193, 32, 155, 51, 65, 214, 156, 129];
+/// `*_with_token_ledger` variants carry NO in_amount (input comes from a token
+/// ledger set by a prior `set_token_ledger` ix), and `exact_out` variants price
+/// the OUTPUT not the input — neither gives us a first-hop base_amount_in from
+/// bytes alone, so we recognise them only to leave them Unreadable (wait).
+const JUP_ROUTE_WITH_LEDGER: [u8; 8] = [150, 86, 71, 116, 167, 93, 14, 104];
+const JUP_SHARED_ROUTE_WITH_LEDGER: [u8; 8] = [230, 121, 143, 80, 119, 159, 106, 170];
+const JUP_EXACT_OUT_ROUTE: [u8; 8] = [208, 51, 239, 151, 123, 43, 237, 92];
+const JUP_SHARED_EXACT_OUT_ROUTE: [u8; 8] = [176, 209, 105, 168, 154, 125, 69, 62];
 
 /// Jupiter `Swap` enum tags that mean a Pump.fun-AMM SELL (all generations).
 const JUP_PUMP_SELL_TAGS: [u8; 3] = [73, 93, 100]; // PumpSwapSell / V2 / V3
@@ -54,24 +66,71 @@ pub struct PumpSellFirstHop {
     pub base_amount_in: u64,
 }
 
-/// Decode a Jupiter v6 `route` / `route_v2` instruction's first hop.
+/// Walk a v1 `route_plan` Vec<RoutePlanStep> starting at `start` (the u32 len).
+/// Every step is `swap(1-byte tag, ZERO payload) + percent u8 + input u8 +
+/// output u8 = 4 bytes` for our TRUSTED venues; a tag outside that set may carry
+/// a variable payload we can't size, so we bail (→ Unreadable). Returns
+/// (first_tag, first_percent, pump_step_count, offset AFTER the vec).
+fn walk_v1_route_plan(data: &[u8], start: usize) -> Option<(u8, u8, usize, usize)> {
+    let vec_len = u32_le(data, start)? as usize;
+    if vec_len == 0 {
+        return None;
+    }
+    let mut off = start + 4;
+    let mut first: Option<(u8, u8)> = None;
+    let mut pump_steps = 0usize;
+    for i in 0..vec_len {
+        let tag = *data.get(off)?;
+        // Only trust venues we KNOW are zero-payload (Pump + Meteora). Anything
+        // else could carry a payload → we can't reach in_amount safely → bail.
+        if !JUP_PUMP_ANY_TAGS.contains(&tag) && !JUP_METEORA_TAGS.contains(&tag) {
+            return None;
+        }
+        if JUP_PUMP_ANY_TAGS.contains(&tag) {
+            pump_steps += 1;
+        }
+        let percent = *data.get(off + 1)?;
+        data.get(off + 2)?; // input_index
+        data.get(off + 3)?; // output_index
+        if i == 0 {
+            first = Some((tag, percent));
+        }
+        off += 4;
+    }
+    let (t, p) = first?;
+    Some((t, p, pump_steps, off))
+}
+
+/// The v1 first-hop-sell case shared by `route` (route_plan @8) and
+/// `shared_accounts_route` (id u8 @8, route_plan @9).
+fn jupiter_v1_first_hop(data: &[u8], plan_start: usize) -> Option<PumpSellFirstHop> {
+    let (tag, percent, pump_steps, end) = walk_v1_route_plan(data, plan_start)?;
+    // First hop must be a 100% Pump sell, and it must be the ONLY Pump pool in
+    // the route (else a lone watched address can't be attributed to it).
+    if !JUP_PUMP_SELL_TAGS.contains(&tag) || percent != 100 || pump_steps != 1 {
+        return None;
+    }
+    let base_amount_in = u64_le(data, end)?; // in_amount immediately after the vec
+    Some(PumpSellFirstHop { base_amount_in })
+}
+
+/// Decode a Jupiter v6 routing instruction's first hop (all forms).
 pub fn decode_jupiter(data: &[u8]) -> Option<PumpSellFirstHop> {
     let disc: [u8; 8] = data.get(0..8)?.try_into().ok()?;
     if disc == JUP_ROUTE {
-        // route: route_plan Vec FIRST. Only the single-hop shape is unambiguous
-        // (multi-hop v1 would need to skip variable payloads to reach in_amount).
-        let vec_len = u32_le(data, 8)?;
-        if vec_len != 1 {
-            return None;
-        }
-        let tag = *data.get(12)?; // swap enum tag (zero-payload for our venues)
-        let percent = *data.get(13)?; // RoutePlanStep.percent
-        if !JUP_PUMP_SELL_TAGS.contains(&tag) || percent != 100 {
-            return None;
-        }
-        // After the single 4-byte step: in_amount u64 @ 12+4 = 16.
-        let base_amount_in = u64_le(data, 16)?;
-        Some(PumpSellFirstHop { base_amount_in })
+        // route: route_plan Vec FIRST (offset 8), then in_amount.
+        jupiter_v1_first_hop(data, 8)
+    } else if disc == JUP_SHARED_ROUTE {
+        // shared_accounts_route: id u8 @8, route_plan @9, then in_amount.
+        jupiter_v1_first_hop(data, 9)
+    } else if disc == JUP_ROUTE_WITH_LEDGER
+        || disc == JUP_SHARED_ROUTE_WITH_LEDGER
+        || disc == JUP_EXACT_OUT_ROUTE
+        || disc == JUP_SHARED_EXACT_OUT_ROUTE
+    {
+        // Recognised, but no first-hop base input is recoverable from bytes:
+        // token-ledger input comes from a prior ix; exact-out prices the output.
+        None
     } else if disc == JUP_ROUTE_V2 {
         // route_v2: scalars FIRST (in_amount @8), route_plan LAST @30(len)/34(items).
         let in_amount = u64_le(data, 8)?;
@@ -197,6 +256,87 @@ mod tests {
         d.push(0);
         let hop = decode_jupiter(&d).expect("first hop");
         assert_eq!(hop.base_amount_in, 705_385);
+    }
+
+    // shared_accounts_route (id u8 prefix), single-hop PumpSwapSellV3.
+    #[test]
+    fn jupiter_shared_accounts_route_sell() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&JUP_SHARED_ROUTE);
+        d.push(3); // id u8
+        d.extend_from_slice(&1u32.to_le_bytes()); // route_plan len = 1
+        d.push(100); // PumpSwapSellV3
+        d.push(100); // percent
+        d.push(0);
+        d.push(1);
+        d.extend_from_slice(&42_000u64.to_le_bytes()); // in_amount
+        d.extend_from_slice(&40_000u64.to_le_bytes());
+        d.extend_from_slice(&50u16.to_le_bytes());
+        d.push(0);
+        assert_eq!(decode_jupiter(&d).unwrap().base_amount_in, 42_000);
+    }
+
+    // Multi-hop v1 route: Pump sell then Meteora — exactly one Pump pool → decodes.
+    #[test]
+    fn jupiter_route_v1_pump_then_meteora() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&JUP_ROUTE);
+        d.extend_from_slice(&2u32.to_le_bytes()); // 2 steps
+        d.push(73); // PumpSwapSell
+        d.push(100);
+        d.push(0);
+        d.push(1);
+        d.push(77); // MeteoraDammV2
+        d.push(100);
+        d.push(1);
+        d.push(0);
+        d.extend_from_slice(&999u64.to_le_bytes()); // in_amount
+        d.extend_from_slice(&1u64.to_le_bytes());
+        d.extend_from_slice(&0u16.to_le_bytes());
+        d.push(0);
+        assert_eq!(decode_jupiter(&d).unwrap().base_amount_in, 999);
+    }
+
+    // Two Pump hops → ambiguous pool attribution → None.
+    #[test]
+    fn jupiter_two_pump_hops_is_none() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&JUP_ROUTE);
+        d.extend_from_slice(&2u32.to_le_bytes());
+        d.push(73); // PumpSwapSell
+        d.push(100);
+        d.push(0);
+        d.push(1);
+        d.push(72); // PumpSwapBuy — second Pump pool
+        d.push(100);
+        d.push(1);
+        d.push(2);
+        d.extend_from_slice(&999u64.to_le_bytes());
+        d.extend_from_slice(&1u64.to_le_bytes());
+        d.extend_from_slice(&0u16.to_le_bytes());
+        d.push(0);
+        assert!(decode_jupiter(&d).is_none());
+    }
+
+    // An unknown (possibly payloaded) venue tag in the route → bail to None.
+    #[test]
+    fn jupiter_unknown_venue_is_none() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&JUP_ROUTE);
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.push(17); // Whirlpool (carries a payload we don't size) — untrusted
+        d.push(100);
+        d.push(0);
+        d.push(1);
+        d.extend_from_slice(&999u64.to_le_bytes());
+        assert!(decode_jupiter(&d).is_none());
+    }
+
+    // with_token_ledger / exact_out are recognised but yield no amount → None.
+    #[test]
+    fn jupiter_ledger_and_exact_out_are_none() {
+        assert!(decode_jupiter(&JUP_ROUTE_WITH_LEDGER).is_none());
+        assert!(decode_jupiter(&JUP_EXACT_OUT_ROUTE).is_none());
     }
 
     // A buy first-hop (tag 72) must NOT decode — returns None → Unreadable.
