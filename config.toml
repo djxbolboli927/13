@@ -51,6 +51,9 @@ alt_rpc_urls = [
   "https://fra.rpc.solami.dev/sol?api_key=aIww8lUczxwDPh1L",
   "https://fra.rpc.solami.dev/sol?api_key=N1C6d8LCZfykwN3m",
   "https://rpc.fra.shyft.to/?api_key=xSEX5fscaOHCeszQ",
+  "https://rpc.fra.shyft.to?api_key=farYqEW-7r1vxqok",
+  "https://fra.rpc.solami.dev/sol?api_key=BlHcQepNAXJ4GF1D",
+  "https://rpc.fra.shyft.to/?api_key=knYwTQByL7PtSj6r",
   "https://rpc.fra.shyft.to?api_key=UHuyEj8zU19wcFMk",
 ]
 
@@ -141,8 +144,8 @@ proxy_src_bind_port = 20000
 # آرگومان‌های اضافی که عیناً به پروکسی پاس داده می‌شوند (در صورت نیاز نسخه‌ی پروکسی).
 proxy_extra_args = []
 # منبع وضعیت زنده‌ی استخرها (فیلتر باریک فقط روی اکانت‌های همین استخرها).
-pool_state_endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
-pool_state_x_token = "cba491e2cd18e339c6517a51d4d497737cb04edd08d8915fc872c8a30cd5656a"
+pool_state_endpoint = "https://fra.grpc.solami.dev"
+pool_state_x_token = "f6ycmGAItFmy7IFm"
 # فایل کش مشترک با متیس — ربات و متیس دقیقاً از یک لیست استخر استفاده می‌کنند.
 mix_cache_path = "/root/a/metis/1/mix.json"
 # کیپر whitelist‌شده‌ی ShredStream (توسط پروکسی استفاده می‌شود؛ اینجا برای مرجع).
