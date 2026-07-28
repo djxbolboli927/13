@@ -4803,6 +4803,7 @@ dependencies = [
  "bs58",
  "core_affinity",
  "dashmap 6.1.0",
+ "flate2",
  "futures",
  "litesvm",
  "prost",

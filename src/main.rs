@@ -523,6 +523,7 @@ fn spawn_shred_arb(
         // Self-learning ALT cache: resolve pools hidden behind lookup tables so
         // we stop missing swaps competitors already see.
         consumer.clone().spawn_alt_fetcher();
+        consumer.clone().spawn_idl_learner();
 
         // Free ALT fetcher (Jupiter/DFlow/Raptor) — the cheap way to compress the
         // route (no on-chain writes / rent from us).

@@ -223,6 +223,16 @@ pub struct ShredConsumer {
     /// certainly touching our pool, so we let it through the pre-filter, resolve
     /// its accounts, and enqueue it — cheaply, without resolving every cluster tx.
     pool_alts: std::sync::RwLock<HashSet<Pubkey>>,
+    /// Unknown top-level programs seen touching a watched pool — queued for the
+    /// self-learning IDL fetcher to inspect (bounded).
+    pending_programs: std::sync::Mutex<HashSet<Pubkey>>,
+    /// Programs whose on-chain IDL we've learned (name → arg layout by disc).
+    /// Populated by the IDL learner; routers found this way are also added to
+    /// `router_programs` so their future txs pass the pre-filter.
+    learned_idls: std::sync::RwLock<HashMap<Pubkey, crate::decoders::self_learn::ProgramIdl>>,
+    /// Routers DISCOVERED at runtime by the IDL learner (their swap/route txs
+    /// then pass the pre-filter, same as the hard-coded `router_programs`).
+    learned_routers: std::sync::RwLock<HashSet<Pubkey>>,
     pub metrics: Arc<ShredMetrics>,
 }
 
@@ -258,6 +268,9 @@ impl ShredConsumer {
             block_log: std::sync::Mutex::new(BlockTracker::default()),
             router_programs: crate::decoders::known_router_pubkeys().into_iter().collect(),
             pool_alts: std::sync::RwLock::new(pool_alts),
+            pending_programs: std::sync::Mutex::new(HashSet::new()),
+            learned_idls: std::sync::RwLock::new(HashMap::new()),
+            learned_routers: std::sync::RwLock::new(HashSet::new()),
             metrics,
         }
     }
@@ -437,7 +450,10 @@ impl ShredConsumer {
         // program ALT-hidden. Without the router clause every aggregator tx on a
         // watched pool was dropped here, leaving holes in the ordered sequence.
         let touches_known_program = static_keys.iter().any(|k| {
-            *k == self.pumpfun || *k == self.meteora || self.router_programs.contains(k)
+            *k == self.pumpfun
+                || *k == self.meteora
+                || self.router_programs.contains(k)
+                || self.learned_routers.read().unwrap().contains(k)
         });
         // Cheap private-bot catch: does this tx reference an ALT we know holds a
         // watched pool? (Set lookup per ALT key — no full resolution.)
@@ -677,6 +693,7 @@ impl ShredConsumer {
         // never skipped, so the ordered sequence keeps no holes.
         // The pool WILL change by an unknown amount, so tell the engine to
         // invalidate its live overlay and hold trading until fresh gRPC state.
+        let mut opaque_hit = false;
         {
             let targets = self.target_pools.read().unwrap();
             for key in &full_keys {
@@ -686,6 +703,7 @@ impl ShredConsumer {
                 if decoded_pools.contains(key) {
                     continue; // this pool's swap was decoded above
                 }
+                opaque_hit = true;
                 self.metrics.opaque_matched.fetch_add(1, Ordering::Relaxed);
                 // Opaque txs still TOUCH the pool (in PoH order) — record them so
                 // the per-block diagnostic counts them and the sequence has no gap.
@@ -715,6 +733,84 @@ impl ShredConsumer {
                 };
             }
         }
+        // Self-learning: this tx touched a watched pool but we couldn't decode its
+        // swap. Queue any unknown top-level program it invoked for the IDL learner,
+        // which may recognise it as a new router and add it to the filter.
+        if opaque_hit {
+            self.note_unknown_programs(msg, &full_keys);
+        }
+    }
+
+    /// Record top-level programs we don't yet recognise (not Pump/Meteora, not a
+    /// known/learned router, not common infra) so the background IDL learner can
+    /// fetch and classify them. Bounded to keep memory flat.
+    fn note_unknown_programs(&self, msg: &solana_sdk::message::VersionedMessage, full_keys: &[Pubkey]) {
+        let known_router = |k: &Pubkey| {
+            self.router_programs.contains(k) || self.learned_routers.read().unwrap().contains(k)
+        };
+        for ix in msg.instructions() {
+            let program = match full_keys.get(ix.program_id_index as usize) {
+                Some(p) => *p,
+                None => continue,
+            };
+            if program == Pubkey::default()
+                || program == self.pumpfun
+                || program == self.meteora
+                || is_infra_program(&program)
+                || known_router(&program)
+                || self.learned_idls.read().unwrap().contains_key(&program)
+            {
+                continue;
+            }
+            let mut pending = self.pending_programs.lock().unwrap();
+            if pending.len() < 500 {
+                pending.insert(program);
+            }
+        }
+    }
+
+    /// Background task: fetch the on-chain Anchor IDL of unknown programs seen
+    /// touching our pools. If a program's IDL exposes a swap/route instruction we
+    /// register it as a router (its future txs then pass the pre-filter) and cache
+    /// its instruction layout for later amount decoding.
+    pub fn spawn_idl_learner(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let batch: Vec<Pubkey> = {
+                    let mut pending = self.pending_programs.lock().unwrap();
+                    if pending.is_empty() {
+                        continue;
+                    }
+                    let take: Vec<Pubkey> = pending.iter().copied().take(10).collect();
+                    for k in &take {
+                        pending.remove(k);
+                    }
+                    take
+                };
+                let rpc = self.rpc.clone();
+                let me = self.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    for program in batch {
+                        let idl = match crate::decoders::self_learn::fetch_program_idl(&rpc, &program)
+                        {
+                            Some(i) => i,
+                            None => continue, // no on-chain IDL → stays Unreadable
+                        };
+                        let is_router = idl.by_disc.values().any(|ix| {
+                            let n = ix.name.to_lowercase();
+                            n.contains("swap") || n.contains("route")
+                        });
+                        if is_router {
+                            me.learned_routers.write().unwrap().insert(program);
+                            info!(%program, ixs = idl.by_disc.len(), "learned new router IDL on-chain");
+                        }
+                        me.learned_idls.write().unwrap().insert(program, idl);
+                    }
+                })
+                .await;
+            }
+        });
     }
 
     /// Find a Meteora DAMM v2 `swap` OR `swap2` instruction in this tx and
@@ -809,4 +905,18 @@ impl ShredConsumer {
         }
         full
     }
+}
+
+/// Common Solana infrastructure programs that are never routers — skip them when
+/// harvesting unknown program ids for IDL learning.
+fn is_infra_program(p: &Pubkey) -> bool {
+    const INFRA: &[&str] = &[
+        "11111111111111111111111111111111",            // System
+        "ComputeBudget111111111111111111111111111111", // Compute Budget
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // SPL Token
+        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  // Token-2022
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", // Associated Token
+        "Sysvar1111111111111111111111111111111111111",  // Sysvar
+    ];
+    INFRA.contains(&p.to_string().as_str())
 }
