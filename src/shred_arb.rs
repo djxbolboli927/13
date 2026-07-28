@@ -909,6 +909,17 @@ impl ShredArbEngine {
             sig.base_amount
         };
 
+        // GUARD (same rule as the [seq] sequencer's pre_confirmed): if this EXACT
+        // tx already produced the pool's confirmed cached state — i.e. its
+        // account-update arrived before/with its shred — there is nothing to
+        // predict. Simulating it against its own post-swap reserves is the
+        // meaningless `sig == acct_state_tx` case seen in the logs. Skip it.
+        if let Some((Some(state_sig), _, _)) = self.pool_state.acct_state_tx(&token_vault) {
+            if state_sig == sig.sig {
+                return None;
+            }
+        }
+
         // Current Pump reserves. Prefer the batch WORKING state (threads earlier
         // legs of THIS tx / earlier in-flight txs on this pool this batch); fall
         // back to the live overlay (checkpoint + cross-batch shreds) and finally
