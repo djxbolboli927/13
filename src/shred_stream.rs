@@ -288,6 +288,75 @@ impl ShredConsumer {
         *self.alt_rpcs.write().unwrap() = rpcs;
     }
 
+    /// Load a persisted ALT cache from disk so learned tables SURVIVE restarts
+    /// (otherwise every run re-harvests from scratch — the reason "very few ALTs"
+    /// were loaded). Format: one line per table, `<alt_b58> <addr_b58> <addr_b58>…`.
+    pub fn load_alt_cache(&self, path: &str) {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return, // no cache yet — first run
+        };
+        let mut loaded = 0usize;
+        let mut map = self.alt_map.write().unwrap();
+        for line in content.lines() {
+            let mut it = line.split_whitespace();
+            let alt = match it.next().and_then(|s| s.parse::<Pubkey>().ok()) {
+                Some(a) => a,
+                None => continue,
+            };
+            let addrs: Vec<Pubkey> = it.filter_map(|s| s.parse::<Pubkey>().ok()).collect();
+            if !addrs.is_empty() {
+                map.entry(alt).or_insert(addrs);
+                loaded += 1;
+            }
+        }
+        drop(map);
+        // Seed pool_alts from the loaded tables that hold a watched pool.
+        let tables: Vec<(Pubkey, Vec<Pubkey>)> = self
+            .alt_map
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        for (alt, addrs) in tables {
+            self.note_alt_members(alt, &addrs);
+        }
+        info!(loaded, "loaded persisted ALT cache from disk");
+    }
+
+    /// Periodically write the ALT cache to disk so it accumulates across runs.
+    pub fn spawn_alt_persister(self: Arc<Self>, path: String) {
+        tokio::spawn(async move {
+            let mut last_len = 0usize;
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                // Snapshot under the read lock, then write outside it.
+                let snapshot: Vec<(Pubkey, Vec<Pubkey>)> = {
+                    let map = self.alt_map.read().unwrap();
+                    if map.len() == last_len {
+                        continue; // nothing new since last save
+                    }
+                    last_len = map.len();
+                    map.iter().map(|(k, v)| (*k, v.clone())).collect()
+                };
+                let mut out = String::with_capacity(snapshot.len() * 64);
+                for (alt, addrs) in &snapshot {
+                    out.push_str(&alt.to_string());
+                    for a in addrs {
+                        out.push(' ');
+                        out.push_str(&a.to_string());
+                    }
+                    out.push('\n');
+                }
+                let tmp = format!("{path}.tmp");
+                if std::fs::write(&tmp, &out).and_then(|_| std::fs::rename(&tmp, &path)).is_ok() {
+                    info!(tables = snapshot.len(), "persisted ALT cache to disk");
+                }
+            }
+        });
+    }
+
     /// Record that `alt` contains a watched pool, if it does — so private-bot txs
     /// referencing this table pass the pre-filter. Called wherever we learn an ALT.
     fn note_alt_members(&self, alt: Pubkey, members: &[Pubkey]) {

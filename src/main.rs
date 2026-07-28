@@ -533,6 +533,11 @@ fn spawn_shred_arb(
         };
         tracing::info!(count = alt_rpcs.len(), "ALT-harvest RPC pool ready");
         consumer.set_alt_rpcs(alt_rpcs);
+        // Persisted ALT cache: load learned tables from previous runs so we don't
+        // re-harvest from scratch, and keep saving new ones.
+        const ALT_CACHE_PATH: &str = "shred_alt_cache.txt";
+        consumer.load_alt_cache(ALT_CACHE_PATH);
+        consumer.clone().spawn_alt_persister(ALT_CACHE_PATH.to_string());
         consumer.clone().spawn(tx);
         // Self-learning ALT cache: resolve pools hidden behind lookup tables so
         // we stop missing swaps competitors already see.
