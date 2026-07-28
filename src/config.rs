@@ -666,6 +666,22 @@ pub struct RpcConfig {
     /// Empty → falls back to `secondary()`.
     #[serde(default)]
     pub alt_rpc_urls: Vec<String>,
+    /// Where the persisted shred ALT cache lives (survives restarts so a table is
+    /// fetched from RPC at most once, ever). Default: project root.
+    #[serde(default = "default_alt_cache_path")]
+    pub alt_cache_path: String,
+    /// WARM-UP window (seconds): while inside it, harvest the ALTs of EVERY
+    /// Pump.fun tx from shreds (build the broad cache). After it, only the ALTs of
+    /// txs on OUR pools are learned. Default 1800 (30 min).
+    #[serde(default = "default_alt_warmup_secs")]
+    pub alt_warmup_secs: u64,
+}
+
+fn default_alt_cache_path() -> String {
+    "/root/a/shred_alt_cache.txt".to_string()
+}
+fn default_alt_warmup_secs() -> u64 {
+    1800
 }
 
 impl RpcConfig {

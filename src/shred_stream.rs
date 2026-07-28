@@ -239,6 +239,11 @@ pub struct ShredConsumer {
     /// Dedicated RPC clients used ONLY to harvest ALT contents in parallel, kept
     /// off the trading RPC. Empty → the fetcher falls back to `self.rpc`.
     alt_rpcs: std::sync::RwLock<Vec<Arc<solana_client::rpc_client::RpcClient>>>,
+    /// When the consumer started — used to bound the broad ALT warm-up window.
+    started: std::time::Instant,
+    /// Warm-up window: while inside it, harvest EVERY tx's ALTs (build the broad
+    /// cache); after it, only resolve_keys learns ALTs (txs on our pools).
+    alt_warmup: std::sync::RwLock<Duration>,
     pub metrics: Arc<ShredMetrics>,
 }
 
@@ -278,8 +283,15 @@ impl ShredConsumer {
             learned_idls: std::sync::RwLock::new(HashMap::new()),
             learned_routers: std::sync::RwLock::new(HashSet::new()),
             alt_rpcs: std::sync::RwLock::new(Vec::new()),
+            started: std::time::Instant::now(),
+            alt_warmup: std::sync::RwLock::new(Duration::from_secs(1800)),
             metrics,
         }
+    }
+
+    /// Set the broad-harvest warm-up window (from config `alt_warmup_secs`).
+    pub fn set_alt_warmup(&self, secs: u64) {
+        *self.alt_warmup.write().unwrap() = Duration::from_secs(secs);
     }
 
     /// Install the dedicated ALT-harvest RPC pool (built from
@@ -474,24 +486,46 @@ impl ShredConsumer {
                     let chunk: Vec<Pubkey> = chunk.to_vec();
                     handles.push(tokio::task::spawn_blocking(move || {
                         let mut added = 0usize;
+                        let mut failed: Vec<Pubkey> = Vec::new();
                         for alt in chunk {
-                            if let Ok(acct) = rpc.get_account(&alt) {
-                                if let Ok(addrs) =
-                                    crate::transaction::deserialize_alt_addresses(&acct.data)
-                                {
-                                    me.note_alt_members(alt, &addrs);
-                                    me.alt_map.write().unwrap().insert(alt, addrs);
-                                    added += 1;
+                            match rpc.get_account(&alt) {
+                                Ok(acct) => {
+                                    match crate::transaction::deserialize_alt_addresses(&acct.data)
+                                    {
+                                        Ok(addrs) => {
+                                            me.note_alt_members(alt, &addrs);
+                                            me.alt_map.write().unwrap().insert(alt, addrs);
+                                            added += 1;
+                                        }
+                                        // Not an ALT account (or malformed) → do NOT
+                                        // retry; it will never parse.
+                                        Err(_) => {}
+                                    }
                                 }
+                                // RPC error (429/timeout) → keep it for a later retry.
+                                Err(_) => failed.push(alt),
                             }
                         }
-                        added
+                        (added, failed)
                     }));
                 }
                 let mut added = 0usize;
+                let mut retry: Vec<Pubkey> = Vec::new();
                 for h in handles {
-                    if let Ok(n) = h.await {
+                    if let Ok((n, failed)) = h.await {
                         added += n;
+                        retry.extend(failed);
+                    }
+                }
+                // Never drop unprocessed tables: re-queue RPC failures for a later
+                // attempt (the queue is ALT-only and unbounded except for safety).
+                if !retry.is_empty() {
+                    let known = self.alt_map.read().unwrap();
+                    let mut pending = self.pending_alts.lock().unwrap();
+                    for k in retry {
+                        if !known.contains_key(&k) {
+                            pending.insert(k);
+                        }
                     }
                 }
                 if added > 0 {
@@ -616,28 +650,31 @@ impl ShredConsumer {
         let msg = &vtx.message;
         let static_keys = msg.static_account_keys();
 
-        // HARVEST FIRST (before the pre-filter drops most txs): queue every ALT
-        // table this tx references that we don't already know, so the background
-        // pool fetches its contents. This breaks the chicken-and-egg where an
-        // ALT-hidden competitor pool tx was dropped before its table could be
-        // learned — next time we see that table, the pool resolves. Cheap: reads
-        // the table keys only (no resolution). Most tables repeat, so the set
-        // converges quickly.
-        if let Some(lookups) = msg.address_table_lookups() {
-            if !lookups.is_empty() {
-                let unknown: Vec<Pubkey> = {
-                    let known = self.alt_map.read().unwrap();
-                    lookups
-                        .iter()
-                        .map(|l| l.account_key)
-                        .filter(|k| !known.contains_key(k))
-                        .collect()
-                };
-                if !unknown.is_empty() {
-                    let mut pending = self.pending_alts.lock().unwrap();
-                    if pending.len() < 50_000 {
-                        for k in unknown {
-                            pending.insert(k);
+        // HARVEST FIRST (before the pre-filter drops most txs): during the WARM-UP
+        // window, queue every ALT table any tx references that we don't already
+        // know, so the pool fetches its contents. This breaks the chicken-and-egg
+        // where an ALT-hidden competitor pool tx was dropped before its table
+        // could be learned — next time we see that table, the pool resolves.
+        // Cheap (reads table keys only). After warm-up we stop the broad sweep and
+        // let resolve_keys learn only the ALTs of txs on OUR pools. The queue is
+        // never dropped for lack of space (bounded only by a large safety cap).
+        if self.started.elapsed() < *self.alt_warmup.read().unwrap() {
+            if let Some(lookups) = msg.address_table_lookups() {
+                if !lookups.is_empty() {
+                    let unknown: Vec<Pubkey> = {
+                        let known = self.alt_map.read().unwrap();
+                        lookups
+                            .iter()
+                            .map(|l| l.account_key)
+                            .filter(|k| !known.contains_key(k))
+                            .collect()
+                    };
+                    if !unknown.is_empty() {
+                        let mut pending = self.pending_alts.lock().unwrap();
+                        if pending.len() < 1_000_000 {
+                            for k in unknown {
+                                pending.insert(k);
+                            }
                         }
                     }
                 }

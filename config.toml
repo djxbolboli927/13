@@ -56,6 +56,12 @@ alt_rpc_urls = [
   "https://rpc.fra.shyft.to/?api_key=knYwTQByL7PtSj6r",
   "https://rpc.fra.shyft.to?api_key=UHuyEj8zU19wcFMk",
 ]
+# مسیرِ فایلِ کشِ ALT (بین restartها می‌ماند؛ هر جدول فقط یک‌بار از RPC گرفته
+# می‌شود، برای همیشه). در ریشهٔ پروژه.
+alt_cache_path = "/root/a/shred_alt_cache.txt"
+# پنجرهٔ warm-up (ثانیه): تا وقتی داخلش هستیم، ALTِ هر تراکنشِ پامپ‌فان از شردز
+# گرفته می‌شود (ساختِ کشِ کامل). بعدش فقط ALTِ استخرهای خودمان. پیش‌فرض ۳۰ دقیقه.
+alt_warmup_secs = 1800
 
 [yellowstone_grpc]
 endpoint = "https://grpc.fra.shyft.to"
