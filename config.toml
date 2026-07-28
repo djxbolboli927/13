@@ -44,6 +44,15 @@ url = "https://rpc.fra.shyft.to?api_key=B3iwa4mECQr5C9eW"
 # استخر). این ترافیک را از RPC معاملاتی جدا می‌کند تا blockhash و ارسال
 # تراکنش هیچ‌وقت به ریت‌لیمیت نخورند (خطاهای 429). خالی = از همان url بالا.
 secondary_url = "https://rpc.fra.shyft.to/?api_key=9ivFV0BIFM_lLrob"
+# RPCهای اختصاصی برای harvest کردنِ محتوای ALTها از شردز (تا استخرهای پنهانِ
+# رقبا resolve شوند). این‌ها به‌صورت موازی و پرسرعت (~۱۰ درخواست/ثانیه هرکدام)
+# صدا زده می‌شوند و از RPC معاملاتی جدا هستند. خالی = از secondary استفاده کن.
+alt_rpc_urls = [
+  "https://fra.rpc.solami.dev/sol?api_key=aIww8lUczxwDPh1L",
+  "https://fra.rpc.solami.dev/sol?api_key=N1C6d8LCZfykwN3m",
+  "https://rpc.fra.shyft.to/?api_key=xSEX5fscaOHCeszQ",
+  "https://rpc.fra.shyft.to?api_key=UHuyEj8zU19wcFMk",
+]
 
 [yellowstone_grpc]
 endpoint = "https://grpc.fra.shyft.to"
