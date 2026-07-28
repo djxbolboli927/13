@@ -331,6 +331,23 @@ impl ShredConsumer {
             let mut last_len = 0usize;
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
+                // Refresh pool_alts from the WHOLE cache against the CURRENT watch
+                // set. Pools are added dynamically, so an ALT harvested BEFORE its
+                // pool was watched would otherwise never enter pool_alts (and its
+                // private-bot txs would keep failing the pre-filter). Recomputing
+                // closes that staleness gap.
+                {
+                    let targets = self.target_pools.read().unwrap();
+                    if !targets.is_empty() {
+                        let map = self.alt_map.read().unwrap();
+                        let mut palts = self.pool_alts.write().unwrap();
+                        for (alt, addrs) in map.iter() {
+                            if addrs.iter().any(|m| targets.contains(m)) {
+                                palts.insert(*alt);
+                            }
+                        }
+                    }
+                }
                 // Snapshot under the read lock, then write outside it.
                 let snapshot: Vec<(Pubkey, Vec<Pubkey>)> = {
                     let map = self.alt_map.read().unwrap();
