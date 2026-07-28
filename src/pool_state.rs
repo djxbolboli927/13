@@ -1147,6 +1147,28 @@ async fn run_stream(
                         let acct_sig = info.txn_signature.as_ref().and_then(|s| {
                             solana_sdk::signature::Signature::try_from(s.as_slice()).ok()
                         });
+                        // DIAGNOSTIC (pure measurement, no logic change): the whole
+                        // [seq] sequencer can only be driven if account-updates carry
+                        // txn_signature. Count how many do vs don't and log every 500,
+                        // so it's a runtime FACT whether [seq] can ever fire.
+                        {
+                            static WITH_SIG: AtomicU64 = AtomicU64::new(0);
+                            static NO_SIG: AtomicU64 = AtomicU64::new(0);
+                            if acct_sig.is_some() {
+                                WITH_SIG.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                NO_SIG.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let w = WITH_SIG.load(Ordering::Relaxed);
+                            let n = NO_SIG.load(Ordering::Relaxed);
+                            if (w + n) % 500 == 0 {
+                                tracing::info!(
+                                    with_txn_sig = w,
+                                    without_txn_sig = n,
+                                    "[acct-sig diag] account-updates carrying txn_signature"
+                                );
+                            }
+                        }
                         last_acct_tx.insert(pk, (acct_sig, a.slot, info.write_version));
                         cache.insert(pk, info.data);
                         last_update.insert(pk, std::time::Instant::now());
