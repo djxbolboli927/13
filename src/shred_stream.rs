@@ -236,6 +236,9 @@ pub struct ShredConsumer {
     /// Routers DISCOVERED at runtime by the IDL learner (their swap/route txs
     /// then pass the pre-filter, same as the hard-coded `router_programs`).
     learned_routers: std::sync::RwLock<HashSet<Pubkey>>,
+    /// Dedicated RPC clients used ONLY to harvest ALT contents in parallel, kept
+    /// off the trading RPC. Empty → the fetcher falls back to `self.rpc`.
+    alt_rpcs: std::sync::RwLock<Vec<Arc<solana_client::rpc_client::RpcClient>>>,
     pub metrics: Arc<ShredMetrics>,
 }
 
@@ -274,8 +277,15 @@ impl ShredConsumer {
             pending_programs: std::sync::Mutex::new(HashSet::new()),
             learned_idls: std::sync::RwLock::new(HashMap::new()),
             learned_routers: std::sync::RwLock::new(HashSet::new()),
+            alt_rpcs: std::sync::RwLock::new(Vec::new()),
             metrics,
         }
+    }
+
+    /// Install the dedicated ALT-harvest RPC pool (built from
+    /// `config.rpc.alt_rpc_urls`). Called once at startup before the fetcher runs.
+    pub fn set_alt_rpcs(&self, rpcs: Vec<Arc<solana_client::rpc_client::RpcClient>>) {
+        *self.alt_rpcs.write().unwrap() = rpcs;
     }
 
     /// Record that `alt` contains a watched pool, if it does — so private-bot txs
@@ -334,8 +344,20 @@ impl ShredConsumer {
     pub fn spawn_alt_fetcher(self: Arc<Self>) {
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                // Drain up to N unknown ALTs (skip ones already known).
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                // The dedicated ALT-harvest RPC pool (falls back to the main rpc).
+                let rpcs: Vec<Arc<solana_client::rpc_client::RpcClient>> = {
+                    let pool = self.alt_rpcs.read().unwrap();
+                    if pool.is_empty() {
+                        vec![self.rpc.clone()]
+                    } else {
+                        pool.clone()
+                    }
+                };
+                // Take up to ~10 unknown ALTs per RPC per second (each get_account
+                // is ~50-100ms, so one RPC does ~10/s sequentially).
+                let per_rpc = 10usize;
+                let want = per_rpc * rpcs.len();
                 let batch: Vec<Pubkey> = {
                     let mut pending = self.pending_alts.lock().unwrap();
                     if pending.is_empty() {
@@ -346,7 +368,7 @@ impl ShredConsumer {
                         .iter()
                         .filter(|k| !known.contains_key(k))
                         .copied()
-                        .take(25)
+                        .take(want)
                         .collect();
                     for k in &take {
                         pending.remove(k);
@@ -356,27 +378,39 @@ impl ShredConsumer {
                 if batch.is_empty() {
                     continue;
                 }
-                let rpc = self.rpc.clone();
-                let me = self.clone();
-                // Blocking RPC off the async worker.
-                let _ = tokio::task::spawn_blocking(move || {
-                    let mut added = 0usize;
-                    for alt in batch {
-                        if let Ok(acct) = rpc.get_account(&alt) {
-                            if let Ok(addrs) =
-                                crate::transaction::deserialize_alt_addresses(&acct.data)
-                            {
-                                me.note_alt_members(alt, &addrs);
-                                me.alt_map.write().unwrap().insert(alt, addrs);
-                                added += 1;
+                // Split the batch across the RPC pool and fetch each chunk in
+                // parallel (one blocking worker per RPC → ~10/s × pool size).
+                let chunk_size = batch.len().div_ceil(rpcs.len()).max(1);
+                let mut handles = Vec::new();
+                for (i, chunk) in batch.chunks(chunk_size).enumerate() {
+                    let rpc = rpcs[i % rpcs.len()].clone();
+                    let me = self.clone();
+                    let chunk: Vec<Pubkey> = chunk.to_vec();
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        let mut added = 0usize;
+                        for alt in chunk {
+                            if let Ok(acct) = rpc.get_account(&alt) {
+                                if let Ok(addrs) =
+                                    crate::transaction::deserialize_alt_addresses(&acct.data)
+                                {
+                                    me.note_alt_members(alt, &addrs);
+                                    me.alt_map.write().unwrap().insert(alt, addrs);
+                                    added += 1;
+                                }
                             }
                         }
+                        added
+                    }));
+                }
+                let mut added = 0usize;
+                for h in handles {
+                    if let Ok(n) = h.await {
+                        added += n;
                     }
-                    if added > 0 {
-                        info!(added, "shred ALT cache learned new lookup tables");
-                    }
-                })
-                .await;
+                }
+                if added > 0 {
+                    info!(added, "shred ALT cache learned new lookup tables");
+                }
             }
         });
     }
@@ -495,6 +529,34 @@ impl ShredConsumer {
     ) {
         let msg = &vtx.message;
         let static_keys = msg.static_account_keys();
+
+        // HARVEST FIRST (before the pre-filter drops most txs): queue every ALT
+        // table this tx references that we don't already know, so the background
+        // pool fetches its contents. This breaks the chicken-and-egg where an
+        // ALT-hidden competitor pool tx was dropped before its table could be
+        // learned — next time we see that table, the pool resolves. Cheap: reads
+        // the table keys only (no resolution). Most tables repeat, so the set
+        // converges quickly.
+        if let Some(lookups) = msg.address_table_lookups() {
+            if !lookups.is_empty() {
+                let unknown: Vec<Pubkey> = {
+                    let known = self.alt_map.read().unwrap();
+                    lookups
+                        .iter()
+                        .map(|l| l.account_key)
+                        .filter(|k| !known.contains_key(k))
+                        .collect()
+                };
+                if !unknown.is_empty() {
+                    let mut pending = self.pending_alts.lock().unwrap();
+                    if pending.len() < 50_000 {
+                        for k in unknown {
+                            pending.insert(k);
+                        }
+                    }
+                }
+            }
+        }
 
         // Cheap pre-filter: process the tx if a program we can act on appears as
         // a STATIC key — either the Pump/Meteora AMM itself (native swap), or a

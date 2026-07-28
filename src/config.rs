@@ -660,6 +660,12 @@ pub struct RpcConfig {
     /// Falls back to `url` when empty.
     #[serde(default)]
     pub secondary_url: String,
+    /// Dedicated RPC endpoints for HARVESTING address-lookup-table contents from
+    /// the shred stream (so ALT-hidden competitor pools become resolvable). These
+    /// are hammered in parallel (~10 req/s each) and kept OFF the trading RPC.
+    /// Empty → falls back to `secondary()`.
+    #[serde(default)]
+    pub alt_rpc_urls: Vec<String>,
 }
 
 impl RpcConfig {

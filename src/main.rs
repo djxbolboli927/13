@@ -440,6 +440,8 @@ fn spawn_shred_arb(
     // Load pools and run the strategy in a background task that RETRIES the
     // mix.json read — if Metis hasn't written it yet (or is restarting) the bot
     // waits instead of giving up and parking.
+    // Owned copy of the ALT-harvest RPC URLs (the task is 'static, can't borrow config).
+    let alt_rpc_urls: Vec<String> = config.rpc.alt_rpc_urls.clone();
     tokio::spawn(async move {
         use std::collections::{HashMap, HashSet};
 
@@ -519,6 +521,18 @@ fn spawn_shred_arb(
             rpc_client.clone(),
         ));
         let shred_metrics = consumer.metrics.clone();
+        // Dedicated RPC pool for parallel ALT harvesting (kept off the trading
+        // RPC). Falls back to the secondary RPC when none are configured.
+        let alt_rpcs: Vec<Arc<RpcClient>> = if alt_rpc_urls.is_empty() {
+            vec![rpc_secondary.clone()]
+        } else {
+            alt_rpc_urls
+                .iter()
+                .map(|u| Arc::new(RpcClient::new(u.clone())))
+                .collect()
+        };
+        tracing::info!(count = alt_rpcs.len(), "ALT-harvest RPC pool ready");
+        consumer.set_alt_rpcs(alt_rpcs);
         consumer.clone().spawn(tx);
         // Self-learning ALT cache: resolve pools hidden behind lookup tables so
         // we stop missing swaps competitors already see.
