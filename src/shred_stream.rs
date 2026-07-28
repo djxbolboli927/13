@@ -618,22 +618,32 @@ impl ShredConsumer {
         // single-Pump-pool shapes decode (see route_decode) — anything ambiguous
         // returns None and falls through to the opaque path below. ────────────
         {
-            let mut first_hop = None;
+            // A decoded first-hop leg: (kind, base_amount, quote_amount).
+            let mut leg: Option<(PumpIxKind, u64, u64)> = None;
             for ix in msg.instructions() {
                 let program = match full_keys.get(ix.program_id_index as usize) {
                     Some(p) => *p,
                     None => continue,
                 };
+                // 1) HARD-CODED routers (Jupiter/OKX): first hop Pump sell.
                 if self.router_programs.contains(&program) {
                     if let Some(h) = crate::decoders::route_decode::decode_first_hop(&ix.data) {
-                        first_hop = Some(h);
+                        leg = Some((PumpIxKind::Sell, h.base_amount_in, 0));
                         break;
                     }
                 }
+                // 2) SELF-LEARNED routers (scalar-first): read amount_in by field
+                //    name, take direction from the instruction NAME (…sell…/…buy…).
+                //    A generic "swap"/"route" name gives no direction → skip (stays
+                //    opaque). Only named buy/sell instructions become Readable.
+                if let Some(l) = self.learned_router_leg(&program, &ix.data) {
+                    leg = Some(l);
+                    break;
+                }
             }
-            if let Some(hop) = first_hop {
-                // target_pools holds only Pump pools, and the decoded first hop is
-                // a Pump sell, so a single watched pool present IS that sell pool.
+            if let Some((kind, base_amount, quote_amount)) = leg {
+                // target_pools holds only Pump pools; a single watched pool present
+                // IS the pool this leg swaps on.
                 let pool = {
                     let targets = self.target_pools.read().unwrap();
                     let mut found: Vec<Pubkey> = full_keys
@@ -658,9 +668,9 @@ impl ShredConsumer {
                     self.block_log.lock().unwrap().record(slot, order_seq, tx_sig);
                     let signal = PumpSwapSignal {
                         pool,
-                        kind: PumpIxKind::Sell,
-                        base_amount: hop.base_amount_in,
-                        quote_amount: 0,
+                        kind,
+                        base_amount,
+                        quote_amount,
                         // Router enforces slippage at the route level, not per leg
                         // (the inner CPI uses min_out=0), so no per-leg revert bound.
                         pump_slippage: 0,
@@ -738,6 +748,32 @@ impl ShredConsumer {
         // which may recognise it as a new router and add it to the filter.
         if opaque_hit {
             self.note_unknown_programs(msg, &full_keys);
+        }
+    }
+
+    /// Try to read a first-hop leg from a SELF-LEARNED router's instruction. Uses
+    /// the learned IDL to find the instruction by discriminator, its direction
+    /// from the instruction NAME (contains "sell"/"buy"), and its input amount
+    /// from a leading scalar arg (`amount_in`/`in_amount`/…). Returns
+    /// `(kind, base_amount, quote_amount)` or None (→ stays opaque). A sell's
+    /// input is the base token; a buy spends exact quote (`buy_exact_quote_in`).
+    fn learned_router_leg(&self, program: &Pubkey, data: &[u8]) -> Option<(PumpIxKind, u64, u64)> {
+        if data.len() < 8 {
+            return None;
+        }
+        let disc: [u8; 8] = data[0..8].try_into().ok()?;
+        let learned = self.learned_idls.read().unwrap();
+        let idl = learned.get(program)?;
+        let def = idl.by_disc.get(&disc)?;
+        let name = def.name.to_lowercase();
+        let scalars = crate::decoders::self_learn::extract_leading_scalars(data, def);
+        let amount = crate::decoders::self_learn::amount_in(&scalars)?;
+        if name.contains("sell") {
+            Some((PumpIxKind::Sell, amount, 0)) // base_amount_in
+        } else if name.contains("buy") {
+            Some((PumpIxKind::BuyQuoteIn, 0, amount)) // exact quote in
+        } else {
+            None // generic swap/route: no direction → opaque
         }
     }
 

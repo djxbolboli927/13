@@ -138,6 +138,14 @@ pub struct PoolSeq {
     /// The `(slot, order_seq)` of the successor we last emitted, so we price each
     /// successor exactly once no matter how many events poke us.
     last_emitted: Option<(u64, u64)>,
+    /// Account-updates that arrived BEFORE the tx's shred (so the tx wasn't in the
+    /// queue yet). Keyed by signature → (its resulting reserves, seen). When the
+    /// shred finally enqueues this sig we confirm it from here and NEVER simulate
+    /// it — a tx whose account-update already arrived is settled, not predicted.
+    pre_confirmed: std::collections::HashMap<Signature, (PumpPool, Instant)>,
+    /// Reverts (tx-updates) that arrived before the tx's shred — same idea: on
+    /// enqueue we mark it reverted and advance, never simulating it.
+    pre_reverted: std::collections::HashMap<Signature, Instant>,
 }
 
 impl PoolSeq {
@@ -151,6 +159,8 @@ impl PoolSeq {
             reserves_tx: None,
             confirmed: None,
             last_emitted: None,
+            pre_confirmed: std::collections::HashMap::new(),
+            pre_reverted: std::collections::HashMap::new(),
         }
     }
 }
@@ -190,11 +200,32 @@ impl PoolSeq {
             .queue
             .partition_point(|q| (q.slot, q.order_seq) < (slot, order_seq));
         self.queue.insert(pos, item);
+        // If this tx's own update ALREADY arrived (before its shred), confirm it
+        // now from the stashed state and NEVER simulate it — it is settled, not a
+        // prediction. Its successor is what we emit instead.
+        if let Some((reserves, _)) = self.pre_confirmed.remove(&sig) {
+            if let Some(p) = self.position_of(&sig) {
+                if self.advance_confirmed(p) {
+                    self.reserves = Some(reserves);
+                    self.reserves_tx = Some((slot, order_seq, sig));
+                }
+            }
+        }
+        if self.pre_reverted.remove(&sig).is_some() {
+            if let Some(p) = self.position_of(&sig) {
+                self.queue[p].reverted = true;
+                self.advance_confirmed(p);
+            }
+        }
         self.emit_next()
     }
 
     fn prune(&mut self, now: Instant) {
         self.queue.retain(|q| now.duration_since(q.seen) <= MAX_AGE);
+        self.pre_confirmed
+            .retain(|_, (_, seen)| now.duration_since(*seen) <= MAX_AGE);
+        self.pre_reverted
+            .retain(|_, seen| now.duration_since(*seen) <= MAX_AGE);
     }
 
     /// An account-update arrived for `sig` (H) with its resulting `reserves`.
@@ -207,7 +238,17 @@ impl PoolSeq {
         now: Instant,
     ) -> Option<ComputeReq> {
         self.prune(now);
-        let pos = self.position_of(&sig)?; // H not in our ordered list → no-op
+        let pos = match self.position_of(&sig) {
+            Some(p) => p,
+            None => {
+                // The tx's shred hasn't arrived yet: stash its confirmed reserves
+                // so that when the shred enqueues this sig we settle it WITHOUT
+                // ever simulating it (never re-run the hash that produced this
+                // account-update).
+                self.pre_confirmed.insert(sig, (reserves, now));
+                return self.emit_next();
+            }
+        };
         let key = (self.queue[pos].slot, self.queue[pos].order_seq);
         if self.advance_confirmed(pos) {
             // This account-update is the newest confirmed SUCCESSFUL tx: it
@@ -233,7 +274,17 @@ impl PoolSeq {
     /// the pool state back to the last real account-update before recomputing.
     pub fn on_tx_update(&mut self, sig: Signature, reverted: bool, now: Instant) -> Option<ComputeReq> {
         self.prune(now);
-        let pos = self.position_of(&sig)?;
+        let pos = match self.position_of(&sig) {
+            Some(p) => p,
+            None => {
+                // Revert arrived before the shred: stash so enqueue settles it
+                // without simulating it.
+                if reverted {
+                    self.pre_reverted.insert(sig, now);
+                }
+                return self.emit_next();
+            }
+        };
         if reverted {
             let key = (self.queue[pos].slot, self.queue[pos].order_seq);
             let was_new = !self.queue[pos].reverted;
@@ -725,6 +776,31 @@ mod tests {
         assert_eq!(r3.sig, sig(3));
         assert_eq!(r3.pre_state.base_reserve, 10); // unchanged seq1 reserves
         assert_eq!(r3.predecessor, sig(1)); // anchor is seq1, not the reverted seq2
+    }
+
+    // The account-update for a tx can arrive BEFORE its shred. When the shred
+    // then enqueues that tx, it must be SETTLED (confirmed) and NEVER simulated;
+    // only its successor is emitted. This is the operator's rule: never re-run the
+    // hash that produced an account-update.
+    #[test]
+    fn account_update_before_shred_never_simulates_that_tx() {
+        let now = Instant::now();
+        let mut s = PoolSeq::new(tpool());
+        // seq1's account-update arrives first (seq1 not yet in the queue) → stashed.
+        assert!(s.on_account_update(sig(1), pool(10, 20), now).is_none());
+        // seq1's shred arrives late. It must NOT be emitted (it's already settled),
+        // and there is no successor yet → None.
+        assert!(s
+            .enqueue(sig(1), 100, 1, readable(PumpIxKind::Sell), None, now)
+            .is_none());
+        // seq2 arrives → it IS the successor of the settled seq1, priced on seq1's
+        // confirmed reserves.
+        let req = s
+            .enqueue(sig(2), 100, 2, readable(PumpIxKind::Sell), None, now)
+            .expect("seq2 simulated on seq1's confirmed reserves");
+        assert_eq!(req.sig, sig(2));
+        assert_eq!(req.predecessor, sig(1));
+        assert_eq!(req.pre_state.base_reserve, 10);
     }
 
     // Per-pool sequence numbers are assigned 1,2,3,... in enqueue order, and the
