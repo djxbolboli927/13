@@ -390,14 +390,30 @@ impl ShredConsumer {
     /// Add a Pump.fun pool to the watch set at runtime (and optionally its ALT
     /// contents for account resolution). Takes effect on the next shred.
     pub fn add_target(&self, pool: Pubkey, alt: Option<(Pubkey, Vec<Pubkey>)>) {
-        let mut set = self.target_pools.write().unwrap();
-        if set.insert(pool) {
-            self.metrics
-                .watched_pools
-                .store(set.len() as u64, Ordering::Relaxed);
-        }
+        // Compute everything that needs the target set, then DROP the write guard
+        // before taking any other lock. Calling a method that re-reads
+        // target_pools while this write guard is held self-deadlocks the thread —
+        // and since the shred consumer also reads target_pools, that froze the
+        // whole consumer. Keep this critical section lock-clean.
+        let alt_touches_watched;
+        {
+            let mut set = self.target_pools.write().unwrap();
+            if set.insert(pool) {
+                self.metrics
+                    .watched_pools
+                    .store(set.len() as u64, Ordering::Relaxed);
+            }
+            // Membership check for the ALT uses the guard we ALREADY hold — no
+            // re-lock. A freshly-added pool is included via the insert above.
+            alt_touches_watched = alt
+                .as_ref()
+                .map(|(_, addrs)| addrs.iter().any(|m| set.contains(m)))
+                .unwrap_or(false);
+        } // target_pools write guard dropped here
         if let Some((alt_key, addrs)) = alt {
-            self.note_alt_members(alt_key, &addrs);
+            if alt_touches_watched {
+                self.pool_alts.write().unwrap().insert(alt_key);
+            }
             self.alt_map.write().unwrap().insert(alt_key, addrs);
         }
     }
