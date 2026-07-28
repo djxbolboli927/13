@@ -176,6 +176,9 @@ pub struct ShredMetrics {
     pub opaque_matched: AtomicU64,
     /// Number of target Pump pools being watched (set once at startup).
     pub watched_pools: AtomicU64,
+    /// Per-tx panics contained by `catch_unwind` (should stay 0; nonzero means a
+    /// tx shape is hitting a bug — the consumer survives and keeps processing).
+    pub scan_panics: AtomicU64,
 }
 
 pub struct ShredConsumer {
@@ -303,6 +306,31 @@ impl ShredConsumer {
     /// Background task: periodically fetch ALT account contents we don't yet
     /// know (harvested from observed Pump txns) and add them to `alt_map`, so
     /// pool accounts hidden behind those ALTs become resolvable.
+    /// Periodically log the raw shred-consumer counters, so it's visible whether
+    /// entries/txs are arriving, being decoded, matched, and forwarded — the
+    /// missing diagnostic when "no data is processed but a counter grows".
+    pub fn spawn_metrics_reporter(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let m = &self.metrics;
+                info!(
+                    entries = m.entries.load(Ordering::Relaxed),
+                    txns = m.txns.load(Ordering::Relaxed),
+                    pump_txns = m.pump_txns.load(Ordering::Relaxed),
+                    matched = m.matched.load(Ordering::Relaxed),
+                    opaque = m.opaque_matched.load(Ordering::Relaxed),
+                    signals_sent = m.signals_sent.load(Ordering::Relaxed),
+                    signals_dropped = m.signals_dropped.load(Ordering::Relaxed),
+                    unresolved_pool = m.unresolved_pool.load(Ordering::Relaxed),
+                    scan_panics = m.scan_panics.load(Ordering::Relaxed),
+                    watched = m.watched_pools.load(Ordering::Relaxed),
+                    "[shred-consumer 30s]"
+                );
+            }
+        });
+    }
+
     pub fn spawn_alt_fetcher(self: Arc<Self>) {
         tokio::spawn(async move {
             loop {
@@ -427,7 +455,15 @@ impl ShredConsumer {
                     // Stamp EVERY tx (in PoH order) with a monotonic sequence, so
                     // the pending-tx order is the leader's exact block order.
                     let order_seq = self.order_seq.fetch_add(1, Ordering::Relaxed);
-                    self.scan_tx(slot, order_seq, vtx, tx);
+                    // Contain any panic to THIS tx: a single malformed tx must
+                    // never kill the whole consumer task (which would silently
+                    // stop all shred processing while the proxy keeps sending).
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.scan_tx(slot, order_seq, vtx, tx)
+                    }));
+                    if r.is_err() {
+                        self.metrics.scan_panics.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -449,16 +485,25 @@ impl ShredConsumer {
         // KNOWN router (Jupiter/OKX/DFlow) that CPIs into our pools with the AMM
         // program ALT-hidden. Without the router clause every aggregator tx on a
         // watched pool was dropped here, leaving holes in the ordered sequence.
+        let learned_has = |k: &Pubkey| {
+            self.learned_routers
+                .read()
+                .map(|s| s.contains(k))
+                .unwrap_or_else(|e| e.into_inner().contains(k)) // survive poison
+        };
         let touches_known_program = static_keys.iter().any(|k| {
             *k == self.pumpfun
                 || *k == self.meteora
                 || self.router_programs.contains(k)
-                || self.learned_routers.read().unwrap().contains(k)
+                || learned_has(k)
         });
         // Cheap private-bot catch: does this tx reference an ALT we know holds a
         // watched pool? (Set lookup per ALT key — no full resolution.)
         let uses_pool_alt = || {
-            let palts = self.pool_alts.read().unwrap();
+            let palts = self
+                .pool_alts
+                .read()
+                .unwrap_or_else(|e| e.into_inner()); // survive poison
             if palts.is_empty() {
                 return false;
             }
