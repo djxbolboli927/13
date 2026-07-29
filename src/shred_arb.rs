@@ -2314,12 +2314,16 @@ impl ShredArbEngine {
                 ) = self.sim_ledger.snapshot();
                 eprintln!(
                     "\n[shred-arb 30s] watching_pools={}\n\
+                     INTAKE  : signals_received={} skip_no_pair={} skip_no_pump_state={}\n\
                      ENGINE  : evaluated={} profitable={} not_profitable={} (uncrossable={}) | arb_ignored={} burned_signals={} | skip[min_trig={} no_meteora_state={} stale_met={} bad_price={} thin_pool={} implausible={}] | opaque[seen={} dirty_skip={}]\n\
                      TX      : sent={} | on-chain[ok={} reverted={} dropped={} unknown={}]\n\
                      NOT-SENT: sim_only={} dedup={} quote_fail={} swapix_fail={} build_fail={} too_large={} too_locks={} send_err={} preempted={}\n\
                      SIM     : recorded={} reconcile_checks={} matched={} mismatched={} value_wrong={} unsimulated={} paused_dark={} skipped_revert={} pending={}\n\
                      ROUTE-RAM: hits={} misses={} cached_routes={}",
                     self.shred_metrics.watched_pools.load(Ordering::Relaxed),
+                    self.signals_received.load(Ordering::Relaxed),
+                    self.skip_no_pair.load(Ordering::Relaxed),
+                    self.skip_no_pump_state.load(Ordering::Relaxed),
                     self.evaluated.load(Ordering::Relaxed),
                     self.profitable.load(Ordering::Relaxed),
                     self.not_profitable.load(Ordering::Relaxed),
