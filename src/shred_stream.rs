@@ -755,14 +755,43 @@ impl ShredConsumer {
                 .map(|ls| ls.iter().any(|l| palts.contains(&l.account_key)))
                 .unwrap_or(false)
         };
-        if !touches_known_program && !static_has_watched_pool && !uses_pool_alt() {
+        let cheap_pass = touches_known_program || static_has_watched_pool || uses_pool_alt();
+        // A LEGACY tx (no ALTs) that failed the cheap static checks cannot possibly
+        // reference the Pump/Meteora program or a watched pool (everything is a
+        // static key), so drop it without resolving.
+        let has_alts = msg
+            .address_table_lookups()
+            .map(|ls| !ls.is_empty())
+            .unwrap_or(false);
+        if !cheap_pass && !has_alts {
             return;
         }
-        self.metrics.pump_txns.fetch_add(1, Ordering::Relaxed);
 
         // Resolve the full ordered account list (static + ALT writable + ALT
-        // readonly), filling unknown-ALT slots with a placeholder.
+        // readonly) ONCE — RPC-free, from the cached ALT map. We need it for the
+        // definitive filter below and for decoding.
         let full_keys = self.resolve_keys(msg);
+
+        // DEFINITIVE FILTER (operator's rule: the ONLY filters are pool + program).
+        // If the cheap static checks didn't already pass, process this v0 tx only
+        // when the Pump/Meteora PROGRAM or a WATCHED POOL actually appears in the
+        // RESOLVED keys. This catches DIRECT Pump swaps whose program/pool was
+        // hidden inside an ALT — the biggest missed class — with no static-key
+        // requirement and no ALT flagging needed.
+        if !cheap_pass {
+            let present = {
+                let targets = self.target_pools.read().unwrap_or_else(|e| e.into_inner());
+                full_keys.iter().any(|k| {
+                    *k == self.pumpfun
+                        || *k == self.meteora
+                        || (*k != Pubkey::default() && targets.contains(k))
+                })
+            };
+            if !present {
+                return;
+            }
+        }
+        self.metrics.pump_txns.fetch_add(1, Ordering::Relaxed);
 
         // Is there also a Meteora DAMM v2 `swap` in THIS tx? In a circular arb the
         // competitor's Meteora leg rides in the same tx as the Pump leg we detect,
