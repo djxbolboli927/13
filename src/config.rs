@@ -70,6 +70,12 @@ pub struct ShredArbConfig {
     /// Extra raw args passed through to the proxy verbatim.
     #[serde(default)]
     pub proxy_extra_args: Vec<String>,
+    /// DIAGNOSTIC: count-only mode. When true, the shred consumer applies NO
+    /// filter and does NO decoding — it just counts every transaction hash that
+    /// arrives from Jito and prints how many hashes landed in each block. Use it
+    /// to prove exactly how many shreds the bot receives per block.
+    #[serde(default)]
+    pub count_only: bool,
     /// Yellowstone gRPC endpoint for live pool state (narrow account filter).
     #[serde(default)]
     pub pool_state_endpoint: String,
@@ -417,6 +423,7 @@ impl Default for ShredArbConfig {
             proxy_bin: default_proxy_bin(),
             block_engine_url: default_block_engine_url(),
             desired_regions: default_desired_regions(),
+            count_only: false,
             proxy_dest_ip_ports: default_dest_ip_ports(),
             proxy_src_bind_port: default_src_bind_port(),
             proxy_extra_args: Vec::new(),

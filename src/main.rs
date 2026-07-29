@@ -536,6 +536,7 @@ fn spawn_shred_arb(
         tracing::info!(count = alt_rpcs.len(), "ALT-harvest RPC pool ready");
         consumer.set_alt_rpcs(alt_rpcs);
         consumer.set_alt_warmup(alt_warmup_secs);
+        consumer.set_count_only(sa.count_only);
         // Persisted ALT cache: load learned tables from previous runs so we don't
         // re-harvest from scratch (a table is fetched at most once, ever), and
         // keep saving new ones.

@@ -274,6 +274,9 @@ pub struct ShredConsumer {
     /// Warm-up window: while inside it, harvest EVERY tx's ALTs (build the broad
     /// cache); after it, only resolve_keys learns ALTs (txs on our pools).
     alt_warmup: std::sync::RwLock<Duration>,
+    /// DIAGNOSTIC count-only mode: no filter, no decode — just count every tx
+    /// hash per block and print it. Proves the raw shred receive rate.
+    count_only: std::sync::atomic::AtomicBool,
     pub metrics: Arc<ShredMetrics>,
 }
 
@@ -316,8 +319,14 @@ impl ShredConsumer {
             started: std::time::Instant::now(),
             slots_seen: std::sync::Mutex::new(HashSet::new()),
             alt_warmup: std::sync::RwLock::new(Duration::from_secs(1800)),
+            count_only: std::sync::atomic::AtomicBool::new(false),
             metrics,
         }
+    }
+
+    /// Enable/disable the diagnostic count-only mode (config `count_only`).
+    pub fn set_count_only(&self, on: bool) {
+        self.count_only.store(on, Ordering::Relaxed);
     }
 
     /// Set the broad-harvest warm-up window (from config `alt_warmup_secs`).
@@ -666,6 +675,17 @@ impl ShredConsumer {
 
         info!(endpoint = %self.endpoint, "shredstream subscription active");
 
+        let count_only = self.count_only.load(Ordering::Relaxed);
+        if count_only {
+            info!("[count-only] DIAGNOSTIC MODE: no filter, no decode — counting every tx hash per block");
+        }
+        // Per-block tallies for count-only mode. Slots arrive in PoH order, so we
+        // flush a block's total the moment a higher slot shows up.
+        let mut cur_slot: u64 = 0;
+        let mut cur_hashes: u64 = 0;
+        let mut cur_entries: u64 = 0;
+        let mut grand_total: u64 = 0;
+
         while let Some(msg) = stream.message().await? {
             self.metrics.entries.fetch_add(1, Ordering::Relaxed);
             let slot = msg.slot;
@@ -675,6 +695,34 @@ impl ShredConsumer {
                     Ok(e) => e,
                     Err(_) => continue, // partial / unrecoverable FEC set
                 };
+
+            if count_only {
+                // Flush the previous block when the slot advances.
+                if slot != cur_slot {
+                    if cur_slot != 0 {
+                        info!(
+                            slot = cur_slot,
+                            hashes = cur_hashes,
+                            entries = cur_entries,
+                            grand_total,
+                            "[count-only] block"
+                        );
+                    }
+                    cur_slot = slot;
+                    cur_hashes = 0;
+                    cur_entries = 0;
+                }
+                for entry in &entries {
+                    cur_entries += 1;
+                    for _vtx in &entry.transactions {
+                        cur_hashes += 1;
+                        grand_total += 1;
+                        self.metrics.txns.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                continue; // NO filter, NO decode — just counting.
+            }
+
             for entry in &entries {
                 for vtx in &entry.transactions {
                     self.metrics.txns.fetch_add(1, Ordering::Relaxed);
