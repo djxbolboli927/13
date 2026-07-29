@@ -119,17 +119,25 @@ pub struct PumpSwapSignal {
 /// completed blocks. This is how the operator verifies the bot READS every
 /// watched-pool tx of a block instead of jumping from tx 500 to tx 800 — a
 /// gap in the printed `pool_seq`/order means a tx was skipped upstream.
+type BlockRow = (u64, solana_sdk::signature::Signature, Pubkey);
+
 #[derive(Default)]
 struct BlockTracker {
-    /// slot → (global order_seq, sig) of every watched-pool tx seen in it.
-    open: std::collections::BTreeMap<u64, Vec<(u64, solana_sdk::signature::Signature)>>,
+    /// slot → (global order_seq, sig, pool) of every watched-pool tx seen in it.
+    open: std::collections::BTreeMap<u64, Vec<BlockRow>>,
     /// Completed blocks waiting to be printed (flushed in batches of 10).
-    done: Vec<(u64, Vec<(u64, solana_sdk::signature::Signature)>)>,
+    done: Vec<(u64, Vec<BlockRow>)>,
 }
 
 impl BlockTracker {
-    fn record(&mut self, slot: u64, order_seq: u64, sig: solana_sdk::signature::Signature) {
-        self.open.entry(slot).or_default().push((order_seq, sig));
+    fn record(
+        &mut self,
+        slot: u64,
+        order_seq: u64,
+        sig: solana_sdk::signature::Signature,
+        pool: Pubkey,
+    ) {
+        self.open.entry(slot).or_default().push((order_seq, sig, pool));
         // A slot more than 2 behind the newest one we've seen is complete
         // (shreds arrive roughly in slot order) → move it to `done`.
         if let Some(&newest) = self.open.keys().next_back() {
@@ -141,19 +149,36 @@ impl BlockTracker {
                 }
             }
         }
-        // Print once per 10 completed blocks.
+        // Print once per 10 completed blocks, GROUPED BY POOL so the operator can
+        // see, per pool (full address), exactly which txs were read and in what
+        // order — and by comparing to the chain, which were missed.
         while self.done.len() >= 10 {
-            let batch: Vec<(u64, Vec<(u64, solana_sdk::signature::Signature)>)> =
-                self.done.drain(..10).collect();
-            let mut out =
-                String::from("[block-read] last 10 blocks — watched-pool txs seen, in PoH order:");
-            for (s, mut txs) in batch {
-                txs.sort_by_key(|(o, _)| *o); // true leader order, not arrival order
-                out.push_str(&format!("\nblok:{}  count={}", s, txs.len()));
-                for (i, (oseq, sig)) in txs.iter().enumerate() {
-                    let h = sig.to_string();
-                    let head = &h[..h.len().min(5)];
-                    out.push_str(&format!("\n  {}:{} (seq {})", i + 1, head, oseq));
+            let batch: Vec<(u64, Vec<BlockRow>)> = self.done.drain(..10).collect();
+            let mut out = String::from(
+                "[block-read] last 10 blocks — watched-pool txs seen, grouped by pool:",
+            );
+            for (s, mut rows) in batch {
+                rows.sort_by_key(|(o, _, _)| *o); // true leader order
+                out.push_str(&format!("\nblok:{}  count={}", s, rows.len()));
+                // Distinct pools in first-seen (block) order.
+                let mut pools: Vec<Pubkey> = Vec::new();
+                for (_, _, p) in &rows {
+                    if !pools.contains(p) {
+                        pools.push(*p);
+                    }
+                }
+                for pool in pools {
+                    out.push_str(&format!("\n  pool {pool}:"));
+                    let mut i = 0;
+                    for (oseq, sig, p) in &rows {
+                        if *p != pool {
+                            continue;
+                        }
+                        i += 1;
+                        let h = sig.to_string();
+                        let head = &h[..h.len().min(5)];
+                        out.push_str(&format!("\n    {i}:{head} (seq {oseq})"));
+                    }
                 }
             }
             info!("{}", out);
@@ -422,6 +447,13 @@ impl ShredConsumer {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 let m = &self.metrics;
+                // ALT state: how many tables we know, how many are queued to
+                // fetch, and how many are recognised as containing a watched pool
+                // (pool_alts drives private-bot detection). This tells us whether
+                // the coverage gap is "few ALTs" or "pools not in the ALTs we have".
+                let alt_known = self.alt_map.read().unwrap().len();
+                let alt_pending = self.pending_alts.lock().unwrap().len();
+                let alt_with_pool = self.pool_alts.read().unwrap().len();
                 info!(
                     entries = m.entries.load(Ordering::Relaxed),
                     txns = m.txns.load(Ordering::Relaxed),
@@ -431,6 +463,9 @@ impl ShredConsumer {
                     signals_sent = m.signals_sent.load(Ordering::Relaxed),
                     signals_dropped = m.signals_dropped.load(Ordering::Relaxed),
                     unresolved_pool = m.unresolved_pool.load(Ordering::Relaxed),
+                    alt_known,
+                    alt_pending,
+                    alt_with_pool,
                     scan_panics = m.scan_panics.load(Ordering::Relaxed),
                     watched = m.watched_pools.load(Ordering::Relaxed),
                     "[shred-consumer 30s]"
@@ -847,7 +882,7 @@ impl ShredConsumer {
                 self.block_log
                     .lock()
                     .unwrap()
-                    .record(slot, order_seq, tx_sig);
+                    .record(slot, order_seq, tx_sig, pool);
                 // Non-blocking: if the engine is busy, drop (staleness makes an
                 // old signal worthless anyway).
                 match tx.try_send(signal) {
@@ -911,7 +946,7 @@ impl ShredConsumer {
                 if let Some(pool) = pool {
                     decoded_pools.push(pool);
                     self.metrics.matched.fetch_add(1, Ordering::Relaxed);
-                    self.block_log.lock().unwrap().record(slot, order_seq, tx_sig);
+                    self.block_log.lock().unwrap().record(slot, order_seq, tx_sig, pool);
                     let signal = PumpSwapSignal {
                         pool,
                         kind,
@@ -966,7 +1001,7 @@ impl ShredConsumer {
                 self.block_log
                     .lock()
                     .unwrap()
-                    .record(slot, order_seq, tx_sig);
+                    .record(slot, order_seq, tx_sig, *key);
                 let signal = PumpSwapSignal {
                     pool: *key,
                     kind: PumpIxKind::Opaque,

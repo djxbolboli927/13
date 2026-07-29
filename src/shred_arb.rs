@@ -805,8 +805,18 @@ impl ShredArbEngine {
             .map(|(s, _)| s.to_string())
             .unwrap_or_else(|| "none-yet".to_string());
         // THE correlation: which tx produced the reserves we are pricing on.
-        let acct_state_tx = pump_token_vault
-            .and_then(|v| self.pool_state.acct_state_tx(&v))
+        // RACE-PROOF GUARD: read the confirmed producer HERE (the account-update
+        // may have landed since apply_signal's earlier check). If THIS very tx
+        // produced the state we'd price on, skip — never re-simulate the hash that
+        // caused the account-update (the meaningless sig==acct_state_tx case). Hold
+        // the overlay (None) since the account-update already set the true state.
+        let acct_state_sig = pump_token_vault.and_then(|v| self.pool_state.acct_state_tx(&v));
+        if let Some((Some(state_sig), _, _)) = acct_state_sig {
+            if state_sig == sig.sig {
+                return None;
+            }
+        }
+        let acct_state_tx = acct_state_sig
             .map(|(s, _, _)| s.map(|s| s.to_string()).unwrap_or_else(|| "no-sig".into()))
             .unwrap_or_else(|| "none-yet".to_string());
         self.sim_ledger.record(
