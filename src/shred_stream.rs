@@ -733,6 +733,14 @@ impl ShredConsumer {
                 || self.router_programs.contains(k)
                 || learned_has(k)
         });
+        // Cheap watched-pool catch: does a WATCHED POOL appear directly as a
+        // STATIC key? Aggregators/private bots keep the pool's real state accounts
+        // as static keys (only repeated infra accounts go in ALTs), so this is the
+        // biggest missed class and it needs no ALT resolution at all.
+        let static_has_watched_pool = {
+            let targets = self.target_pools.read().unwrap_or_else(|e| e.into_inner());
+            static_keys.iter().any(|k| targets.contains(k))
+        };
         // Cheap private-bot catch: does this tx reference an ALT we know holds a
         // watched pool? (Set lookup per ALT key — no full resolution.)
         let uses_pool_alt = || {
@@ -747,7 +755,7 @@ impl ShredConsumer {
                 .map(|ls| ls.iter().any(|l| palts.contains(&l.account_key)))
                 .unwrap_or(false)
         };
-        if !touches_known_program && !uses_pool_alt() {
+        if !touches_known_program && !static_has_watched_pool && !uses_pool_alt() {
             return;
         }
         self.metrics.pump_txns.fetch_add(1, Ordering::Relaxed);
