@@ -266,6 +266,11 @@ pub struct ShredConsumer {
     alt_rpcs: std::sync::RwLock<Vec<Arc<solana_client::rpc_client::RpcClient>>>,
     /// When the consumer started — used to bound the broad ALT warm-up window.
     started: std::time::Instant,
+    /// Distinct slots seen since the last metrics report — proves whether we are
+    /// actually receiving most of the cluster's blocks from the shred proxy (a
+    /// 30s window spans ~75 slots at 2.5 slots/s; far fewer means the proxy is
+    /// delivering only a fraction of shreds and we can never see those txs).
+    slots_seen: std::sync::Mutex<HashSet<u64>>,
     /// Warm-up window: while inside it, harvest EVERY tx's ALTs (build the broad
     /// cache); after it, only resolve_keys learns ALTs (txs on our pools).
     alt_warmup: std::sync::RwLock<Duration>,
@@ -309,6 +314,7 @@ impl ShredConsumer {
             learned_routers: std::sync::RwLock::new(HashSet::new()),
             alt_rpcs: std::sync::RwLock::new(Vec::new()),
             started: std::time::Instant::now(),
+            slots_seen: std::sync::Mutex::new(HashSet::new()),
             alt_warmup: std::sync::RwLock::new(Duration::from_secs(1800)),
             metrics,
         }
@@ -454,7 +460,16 @@ impl ShredConsumer {
                 let alt_known = self.alt_map.read().unwrap().len();
                 let alt_pending = self.pending_alts.lock().unwrap().len();
                 let alt_with_pool = self.pool_alts.read().unwrap().len();
+                // Distinct slots seen in the last 30s (~75 expected). Far fewer =
+                // the proxy is only delivering a fraction of the cluster's shreds.
+                let slots_30s = {
+                    let mut s = self.slots_seen.lock().unwrap();
+                    let n = s.len();
+                    s.clear();
+                    n
+                };
                 info!(
+                    slots_30s,
                     entries = m.entries.load(Ordering::Relaxed),
                     txns = m.txns.load(Ordering::Relaxed),
                     pump_txns = m.pump_txns.load(Ordering::Relaxed),
@@ -487,9 +502,10 @@ impl ShredConsumer {
                         pool.clone()
                     }
                 };
-                // Take up to ~10 unknown ALTs per RPC per second (each get_account
-                // is ~50-100ms, so one RPC does ~10/s sequentially).
-                let per_rpc = 10usize;
+                // getMultipleAccounts fetches up to 100 tables in ONE request, so
+                // each RPC does ~100/call not ~10/s — 100x faster cache fill. Take
+                // up to 100 unknown tables per RPC this tick.
+                let per_rpc = 100usize;
                 let want = per_rpc * rpcs.len();
                 let batch: Vec<Pubkey> = {
                     let mut pending = self.pending_alts.lock().unwrap();
@@ -511,9 +527,8 @@ impl ShredConsumer {
                 if batch.is_empty() {
                     continue;
                 }
-                // Split the batch across the RPC pool and fetch each chunk in
-                // parallel (one blocking worker per RPC → ~10/s × pool size).
-                let chunk_size = batch.len().div_ceil(rpcs.len()).max(1);
+                // One getMultipleAccounts (≤100 keys) per RPC, in parallel.
+                let chunk_size = batch.len().div_ceil(rpcs.len()).max(1).min(100);
                 let mut handles = Vec::new();
                 for (i, chunk) in batch.chunks(chunk_size).enumerate() {
                     let rpc = rpcs[i % rpcs.len()].clone();
@@ -522,24 +537,29 @@ impl ShredConsumer {
                     handles.push(tokio::task::spawn_blocking(move || {
                         let mut added = 0usize;
                         let mut failed: Vec<Pubkey> = Vec::new();
-                        for alt in chunk {
-                            match rpc.get_account(&alt) {
-                                Ok(acct) => {
-                                    match crate::transaction::deserialize_alt_addresses(&acct.data)
-                                    {
-                                        Ok(addrs) => {
-                                            me.note_alt_members(alt, &addrs);
-                                            me.alt_map.write().unwrap().insert(alt, addrs);
-                                            added += 1;
+                        match rpc.get_multiple_accounts(&chunk) {
+                            Ok(accts) => {
+                                for (alt, maybe) in chunk.iter().zip(accts) {
+                                    match maybe {
+                                        Some(acct) => {
+                                            if let Ok(addrs) =
+                                                crate::transaction::deserialize_alt_addresses(
+                                                    &acct.data,
+                                                )
+                                            {
+                                                me.note_alt_members(*alt, &addrs);
+                                                me.alt_map.write().unwrap().insert(*alt, addrs);
+                                                added += 1;
+                                            }
+                                            // else: not an ALT / malformed → drop (never parses)
                                         }
-                                        // Not an ALT account (or malformed) → do NOT
-                                        // retry; it will never parse.
-                                        Err(_) => {}
+                                        // Account doesn't exist → don't retry.
+                                        None => {}
                                     }
                                 }
-                                // RPC error (429/timeout) → keep it for a later retry.
-                                Err(_) => failed.push(alt),
                             }
+                            // Whole request failed (429/timeout) → retry the chunk.
+                            Err(_) => failed.extend(chunk),
                         }
                         (added, failed)
                     }));
@@ -649,6 +669,7 @@ impl ShredConsumer {
         while let Some(msg) = stream.message().await? {
             self.metrics.entries.fetch_add(1, Ordering::Relaxed);
             let slot = msg.slot;
+            self.slots_seen.lock().unwrap().insert(slot);
             let entries: Vec<solana_entry::entry::Entry> =
                 match bincode::deserialize(&msg.entries) {
                     Ok(e) => e,
