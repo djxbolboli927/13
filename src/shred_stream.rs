@@ -933,21 +933,25 @@ impl ShredConsumer {
                 meteora_exact_out,
                 order_seq,
             };
-            // Only forward WATCHED pools — see the firehose note above.
-            if watched {
-                // Record for the per-block diagnostic BEFORE the try_send drop:
-                // we want to prove the tx was READ, regardless of channel pressure.
-                self.block_log
-                    .lock()
-                    .unwrap()
-                    .record(slot, order_seq, tx_sig, pool);
-                // Non-blocking: if the engine is busy, drop (staleness makes an
-                // old signal worthless anyway).
-                match tx.try_send(signal) {
-                    Ok(()) => self.metrics.signals_sent.fetch_add(1, Ordering::Relaxed),
-                    Err(_) => self.metrics.signals_dropped.fetch_add(1, Ordering::Relaxed),
-                };
-            }
+            // Forward EVERY decodable Pump swap — this is the known-good f3c4103
+            // behavior. The engine advances live state for any pool it knows;
+            // watched-only side effects (ALT harvest, rug close) stay gated on
+            // `watched` above. Gating the forward on `watched` (the regression we
+            // introduced in the "upgrade") silently dropped the vast majority of
+            // txs the bot used to read.
+            //
+            // Record for the per-block diagnostic BEFORE the try_send drop: we
+            // want to prove the tx was READ, regardless of channel pressure.
+            self.block_log
+                .lock()
+                .unwrap()
+                .record(slot, order_seq, tx_sig, pool);
+            // Non-blocking: if the engine is busy, drop (staleness makes an old
+            // signal worthless anyway).
+            match tx.try_send(signal) {
+                Ok(()) => self.metrics.signals_sent.fetch_add(1, Ordering::Relaxed),
+                Err(_) => self.metrics.signals_dropped.fetch_add(1, Ordering::Relaxed),
+            };
         }
 
         // ── Aggregator path: a KNOWN router whose first hop is a Pump SELL we
